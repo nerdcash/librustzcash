@@ -2,9 +2,6 @@ use std::convert::Infallible;
 use std::fmt;
 use std::num::NonZeroU32;
 
-#[cfg(feature = "unstable")]
-use std::fs::File;
-
 use prost::Message;
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection};
@@ -949,21 +946,23 @@ impl TestCache for BlockCache {
 
 #[cfg(feature = "unstable")]
 pub(crate) struct FsBlockCache {
-    fsblockdb_root: TempDir,
     db_meta: FsBlockDb,
+    storage: crate::chain::DefaultCompactBlockStorage,
 }
 
 #[cfg(feature = "unstable")]
 impl FsBlockCache {
     fn new() -> Self {
         let fsblockdb_root = tempfile::tempdir().unwrap();
-        let mut db_meta = FsBlockDb::for_path(&fsblockdb_root).unwrap();
+        let storage = crate::chain::DefaultCompactBlockStorage::new(
+            fsblockdb_root.path().to_path_buf().join("blocks"),
+        )
+        .unwrap();
+        let mut db_meta =
+            FsBlockDb::for_path_storage(&fsblockdb_root, Box::new(storage.clone())).unwrap();
         init_blockmeta_db(&mut db_meta).unwrap();
 
-        FsBlockCache {
-            fsblockdb_root,
-            db_meta,
-        }
+        FsBlockCache { db_meta, storage }
     }
 }
 
@@ -977,8 +976,6 @@ impl TestCache for FsBlockCache {
     }
 
     fn insert(&self, cb: &CompactBlock) -> Self::InsertResult {
-        use std::io::Write;
-
         let meta = BlockMeta {
             height: cb.height(),
             block_hash: cb.hash(),
@@ -987,12 +984,8 @@ impl TestCache for FsBlockCache {
             orchard_actions_count: cb.vtx.iter().map(|tx| tx.actions.len() as u32).sum(),
         };
 
-        let blocks_dir = self.fsblockdb_root.as_ref().join("blocks");
-        let block_path = meta.block_file_path(&blocks_dir);
-
-        File::create(block_path)
-            .unwrap()
-            .write_all(&cb.encode_to_vec())
+        self.storage
+            .put_compact_block(&meta, &cb.encode_to_vec())
             .unwrap();
 
         meta

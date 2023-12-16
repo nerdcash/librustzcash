@@ -105,13 +105,74 @@ pub struct BlockMeta {
 }
 
 #[cfg(feature = "unstable")]
-impl BlockMeta {
-    pub fn block_file_path<P: AsRef<Path>>(&self, blocks_dir: &P) -> PathBuf {
-        blocks_dir.as_ref().join(Path::new(&format!(
-            "{}-{}-compactblock",
-            self.height, self.block_hash
-        )))
+pub trait CompactBlockStorage {
+    fn get_compact_block(&self, block_meta: &BlockMeta) -> Result<Vec<u8>, FsBlockDbError>;
+    fn verify_compact_block_stored(&self, block_meta: &BlockMeta) -> Result<(), FsBlockDbError>;
+}
+
+/// Stores compact blocks in the filesystem with one file per compact block.
+#[derive(Clone, Debug)]
+#[cfg(feature = "unstable")]
+pub struct DefaultCompactBlockStorage {
+    blocks_dir: PathBuf,
+}
+
+#[cfg(feature = "unstable")]
+impl DefaultCompactBlockStorage {
+    /// This fn ensures that the specified directory exists.
+    pub fn new<P: AsRef<Path>>(blocks_dir: P) -> Result<Self, std::io::Error> {
+        std::fs::create_dir_all(&blocks_dir)?;
+
+        Ok(Self {
+            blocks_dir: blocks_dir.as_ref().to_owned(),
+        })
     }
+
+    pub fn put_compact_block(
+        &self,
+        blockmeta: &BlockMeta,
+        block: &[u8],
+    ) -> Result<(), FsBlockDbError> {
+        let block_path = block_file_path(blockmeta, &self.blocks_dir);
+        let mut file = File::create(&block_path)?;
+        std::io::Write::write_all(&mut file, block)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl CompactBlockStorage for DefaultCompactBlockStorage {
+    fn get_compact_block(&self, block_meta: &BlockMeta) -> Result<Vec<u8>, FsBlockDbError> {
+        let mut file = File::open(block_file_path(block_meta, &self.blocks_dir))?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    }
+
+    fn verify_compact_block_stored(&self, block_meta: &BlockMeta) -> Result<(), FsBlockDbError> {
+        let block_path = block_file_path(block_meta, &self.blocks_dir);
+        match std::fs::metadata(&block_path) {
+            Err(e) => Err(match e.kind() {
+                std::io::ErrorKind::NotFound => FsBlockDbError::MissingBlock(block_meta.to_owned()),
+                _ => FsBlockDbError::Fs(e),
+            }),
+            Ok(meta) => {
+                if !meta.is_file() {
+                    Err(FsBlockDbError::InvalidBlockPath(block_path))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "unstable")]
+fn block_file_path<P: AsRef<Path>>(meta: &BlockMeta, blocks_dir: &P) -> PathBuf {
+    blocks_dir.as_ref().join(Path::new(&format!(
+        "{}-{}-compactblock",
+        meta.height, meta.block_hash
+    )))
 }
 
 /// Inserts a batch of rows into the block metadata database.
@@ -291,11 +352,9 @@ where
             }
         }
 
-        let mut block_file =
-            File::open(cbr.block_file_path(&cache.blocks_dir)).map_err(to_chain_error)?;
-        let mut block_data = vec![];
-        block_file
-            .read_to_end(&mut block_data)
+        let block_data = cache
+            .compact_block_storage
+            .get_compact_block(&cbr)
             .map_err(to_chain_error)?;
 
         let block = CompactBlock::decode(&block_data[..]).map_err(to_chain_error)?;
