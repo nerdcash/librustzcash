@@ -59,7 +59,7 @@ proptest = { version = "1.0.0", optional = true }
 #   - `Error` type exposed
 hdwallet = { version = "0.4", optional = true }
 #   - `SecretKey` and `PublicKey` types exposed
-secp256k1 = { version = "0.26", optional = true }
+secp256k1 = { version = "0.28", optional = true }
 
 # - ZIP 339
 bip0039 = { version = "0.10", features = ["std", "all-languages"] }
