@@ -22,6 +22,24 @@ pub const MAX_MONEY: i64 = 21_000_000 * COIN;
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub struct Amount(i64);
 
+impl std::fmt::Display for Amount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (negative, value) = if self.0 < 0 {
+            (true, -self.0)
+        } else {
+            (false, self.0)
+        };
+
+        let zec = value / COIN;
+        let zat = value % COIN;
+
+        if negative {
+            write!(f, "-")?;
+        }
+        write!(f, "{}.{:08}", zec, zat)
+    }
+}
+
 memuse::impl_no_dynamic_usage!(Amount);
 
 impl Amount {

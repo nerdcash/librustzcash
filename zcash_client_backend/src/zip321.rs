@@ -45,6 +45,22 @@ pub enum Zip321Error {
     ParseError(String),
 }
 
+impl std::fmt::Display for Zip321Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Zip321Error::InvalidBase64(e) => write!(f, "Invalid base64: {}", e),
+            Zip321Error::MemoBytesError(e) => write!(f, "Invalid memo: {}", e),
+            Zip321Error::TooManyPayments(n) => write!(f, "Too many payments: {}", n),
+            Zip321Error::DuplicateParameter(p, i) => {
+                write!(f, "Duplicate parameter {:?} at index {}", p, i)
+            }
+            Zip321Error::TransparentMemo(i) => write!(f, "Transparent memo at index {}", i),
+            Zip321Error::RecipientMissing(i) => write!(f, "Recipient missing at index {}", i),
+            Zip321Error::ParseError(s) => write!(f, "Parse error: {}", s),
+        }
+    }
+}
+
 /// Converts a [`MemoBytes`] value to a ZIP 321 compatible base64-encoded string.
 ///
 /// [`MemoBytes`]: zcash_primitives::memo::MemoBytes
