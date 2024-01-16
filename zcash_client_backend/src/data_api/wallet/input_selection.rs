@@ -1,18 +1,16 @@
 //! Types related to the process of selecting inputs to be spent given a transaction request.
 
 use core::marker::PhantomData;
-use std::fmt;
-use std::num::NonZeroU32;
-use std::{collections::BTreeSet, fmt::Debug};
+use std::fmt::{self, Debug, Display};
 
+use nonempty::NonEmpty;
 use zcash_primitives::{
     consensus::{self, BlockHeight},
     legacy::TransparentAddress,
     transaction::{
         components::{
-            amount::{Amount, BalanceError, NonNegativeAmount},
-            sapling::fees as sapling,
-            OutPoint, TxOut,
+            amount::{BalanceError, NonNegativeAmount},
+            TxOut,
         },
         fees::FeeRule,
     },
@@ -20,12 +18,22 @@ use zcash_primitives::{
 };
 
 use crate::{
-    address::{RecipientAddress, UnifiedAddress},
-    data_api::WalletRead,
-    fees::{ChangeError, ChangeStrategy, DustOutputPolicy, TransactionBalance},
-    wallet::{ReceivedSaplingNote, WalletTransparentOutput},
+    address::{Address, UnifiedAddress},
+    data_api::InputSource,
+    fees::{sapling, ChangeError, ChangeStrategy, DustOutputPolicy, TransactionBalance},
+    wallet::{Note, ReceivedNote, WalletTransparentOutput},
     zip321::TransactionRequest,
+    ShieldedProtocol,
 };
+
+#[cfg(any(feature = "transparent-inputs", feature = "orchard"))]
+use std::convert::Infallible;
+
+#[cfg(feature = "transparent-inputs")]
+use {std::collections::BTreeSet, zcash_primitives::transaction::components::OutPoint};
+
+#[cfg(feature = "orchard")]
+use crate::fees::orchard as orchard_fees;
 
 /// The type of errors that may be produced in input selection.
 pub enum InputSelectorError<DbErrT, SelectorErrT> {
@@ -35,7 +43,10 @@ pub enum InputSelectorError<DbErrT, SelectorErrT> {
     Selection(SelectorErrT),
     /// Insufficient funds were available to satisfy the payment request that inputs were being
     /// selected to attempt to satisfy.
-    InsufficientFunds { available: Amount, required: Amount },
+    InsufficientFunds {
+        available: NonNegativeAmount,
+        required: NonNegativeAmount,
+    },
     /// The data source does not have enough information to choose an expiry height
     /// for the transaction.
     SyncRequired,
@@ -60,8 +71,8 @@ impl<DE: fmt::Display, SE: fmt::Display> fmt::Display for InputSelectorError<DE,
             } => write!(
                 f,
                 "Insufficient balance (have {}, need {} including fee)",
-                i64::from(*available),
-                i64::from(*required)
+                u64::from(*available),
+                u64::from(*required)
             ),
             InputSelectorError::SyncRequired => {
                 write!(f, "Insufficient chain data is available, sync required.")
@@ -70,20 +81,131 @@ impl<DE: fmt::Display, SE: fmt::Display> fmt::Display for InputSelectorError<DE,
     }
 }
 
-/// A data structure that describes the inputs to be consumed and outputs to
-/// be produced in a proposed transaction.
+/// The inputs to be consumed and outputs to be produced in a proposed transaction.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Proposal<FeeRuleT, NoteRef> {
     transaction_request: TransactionRequest,
     transparent_inputs: Vec<WalletTransparentOutput>,
-    sapling_inputs: Vec<ReceivedSaplingNote<NoteRef>>,
+    shielded_inputs: Option<ShieldedInputs<NoteRef>>,
     balance: TransactionBalance,
     fee_rule: FeeRuleT,
     min_target_height: BlockHeight,
-    min_anchor_height: BlockHeight,
     is_shielding: bool,
 }
 
+/// Errors that can occur in construction of a [`Proposal`].
+#[derive(Debug, Clone)]
+pub enum ProposalError {
+    /// The total output value of the transaction request is not a valid Zcash amount.
+    RequestTotalInvalid,
+    /// The total of transaction inputs overflows the valid range of Zcash values.
+    Overflow,
+    /// The input total and output total of the payment request are not equal to one another. The
+    /// sum of transaction outputs, change, and fees is required to be exactly equal to the value
+    /// of provided inputs.
+    BalanceError {
+        input_total: NonNegativeAmount,
+        output_total: NonNegativeAmount,
+    },
+    /// The `is_shielding` flag may only be set to `true` under the following conditions:
+    /// * The total of transparent inputs is nonzero
+    /// * There exist no Sapling inputs
+    /// * There provided transaction request is empty; i.e. the only output values specified
+    ///   are change and fee amounts.
+    ShieldingInvalid,
+}
+
+impl Display for ProposalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProposalError::RequestTotalInvalid => write!(
+                f,
+                "The total requested output value is not a valid Zcash amount."
+            ),
+            ProposalError::Overflow => write!(
+                f,
+                "The total of transaction inputs overflows the valid range of Zcash values."
+            ),
+            ProposalError::BalanceError {
+                input_total,
+                output_total,
+            } => write!(
+                f,
+                "Balance error: the output total {} was not equal to the input total {}",
+                u64::from(*output_total),
+                u64::from(*input_total)
+            ),
+            ProposalError::ShieldingInvalid => write!(
+                f,
+                "The proposal violates the rules for a shielding transaction."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProposalError {}
+
 impl<FeeRuleT, NoteRef> Proposal<FeeRuleT, NoteRef> {
+    /// Constructs a validated [`Proposal`] from its constituent parts.
+    ///
+    /// This operation validates the proposal for balance consistency and agreement between
+    /// the `is_shielding` flag and the structure of the proposal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        transaction_request: TransactionRequest,
+        transparent_inputs: Vec<WalletTransparentOutput>,
+        shielded_inputs: Option<ShieldedInputs<NoteRef>>,
+        balance: TransactionBalance,
+        fee_rule: FeeRuleT,
+        min_target_height: BlockHeight,
+        is_shielding: bool,
+    ) -> Result<Self, ProposalError> {
+        let transparent_input_total = transparent_inputs
+            .iter()
+            .map(|out| out.txout().value)
+            .fold(Ok(NonNegativeAmount::ZERO), |acc, a| {
+                (acc? + a).ok_or(ProposalError::Overflow)
+            })?;
+        let shielded_input_total = shielded_inputs
+            .iter()
+            .flat_map(|s_in| s_in.notes().iter())
+            .map(|out| out.note().value())
+            .fold(Some(NonNegativeAmount::ZERO), |acc, a| (acc? + a))
+            .ok_or(ProposalError::Overflow)?;
+        let input_total =
+            (transparent_input_total + shielded_input_total).ok_or(ProposalError::Overflow)?;
+
+        let request_total = transaction_request
+            .total()
+            .map_err(|_| ProposalError::RequestTotalInvalid)?;
+        let output_total = (request_total + balance.total()).ok_or(ProposalError::Overflow)?;
+
+        if is_shielding
+            && (transparent_input_total == NonNegativeAmount::ZERO
+                || shielded_input_total > NonNegativeAmount::ZERO
+                || request_total > NonNegativeAmount::ZERO)
+        {
+            return Err(ProposalError::ShieldingInvalid);
+        }
+
+        if input_total == output_total {
+            Ok(Self {
+                transaction_request,
+                transparent_inputs,
+                shielded_inputs,
+                balance,
+                fee_rule,
+                min_target_height,
+                is_shielding,
+            })
+        } else {
+            Err(ProposalError::BalanceError {
+                input_total,
+                output_total,
+            })
+        }
+    }
+
     /// Returns the transaction request that describes the payments to be made.
     pub fn transaction_request(&self) -> &TransactionRequest {
         &self.transaction_request
@@ -93,8 +215,8 @@ impl<FeeRuleT, NoteRef> Proposal<FeeRuleT, NoteRef> {
         &self.transparent_inputs
     }
     /// Returns the Sapling inputs that have been selected to fund the transaction.
-    pub fn sapling_inputs(&self) -> &[ReceivedSaplingNote<NoteRef>] {
-        &self.sapling_inputs
+    pub fn shielded_inputs(&self) -> Option<&ShieldedInputs<NoteRef>> {
+        self.shielded_inputs.as_ref()
     }
     /// Returns the change outputs to be added to the transaction and the fee to be paid.
     pub fn balance(&self) -> &TransactionBalance {
@@ -111,14 +233,6 @@ impl<FeeRuleT, NoteRef> Proposal<FeeRuleT, NoteRef> {
     pub fn min_target_height(&self) -> BlockHeight {
         self.min_target_height
     }
-    /// Returns the anchor height used in preparing the proposal.
-    ///
-    /// If, at the time that the proposal is executed, the anchor height required to satisfy
-    /// the minimum confirmation depth is less than this height, the proposal execution
-    /// API should return an error.
-    pub fn min_anchor_height(&self) -> BlockHeight {
-        self.min_anchor_height
-    }
     /// Returns a flag indicating whether or not the proposed transaction
     /// is exclusively wallet-internal (if it does not involve any external
     /// recipients).
@@ -132,13 +246,50 @@ impl<FeeRuleT, NoteRef> Debug for Proposal<FeeRuleT, NoteRef> {
         f.debug_struct("Proposal")
             .field("transaction_request", &self.transaction_request)
             .field("transparent_inputs", &self.transparent_inputs)
-            .field("sapling_inputs", &self.sapling_inputs.len())
+            .field(
+                "shielded_inputs",
+                &self.shielded_inputs().map(|i| i.notes.len()),
+            )
+            .field(
+                "anchor_height",
+                &self.shielded_inputs().map(|i| i.anchor_height),
+            )
             .field("balance", &self.balance)
             //.field("fee_rule", &self.fee_rule)
             .field("min_target_height", &self.min_target_height)
-            .field("min_anchor_height", &self.min_anchor_height)
             .field("is_shielding", &self.is_shielding)
             .finish_non_exhaustive()
+    }
+}
+
+/// The Sapling inputs to a proposed transaction.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ShieldedInputs<NoteRef> {
+    anchor_height: BlockHeight,
+    notes: NonEmpty<ReceivedNote<NoteRef, Note>>,
+}
+
+impl<NoteRef> ShieldedInputs<NoteRef> {
+    /// Constructs a [`ShieldedInputs`] from its constituent parts.
+    pub fn from_parts(
+        anchor_height: BlockHeight,
+        notes: NonEmpty<ReceivedNote<NoteRef, Note>>,
+    ) -> Self {
+        Self {
+            anchor_height,
+            notes,
+        }
+    }
+
+    /// Returns the anchor height for Sapling inputs that should be used when constructing the
+    /// proposed transaction.
+    pub fn anchor_height(&self) -> BlockHeight {
+        self.anchor_height
+    }
+
+    /// Returns the list of Sapling notes to be used as inputs to the proposed transaction.
+    pub fn notes(&self) -> &NonEmpty<ReceivedNote<NoteRef, Note>> {
+        &self.notes
     }
 }
 
@@ -150,12 +301,12 @@ impl<FeeRuleT, NoteRef> Debug for Proposal<FeeRuleT, NoteRef> {
 pub trait InputSelector {
     /// The type of errors that may be generated in input selection
     type Error;
-    /// The type of data source that the input selector expects to access to obtain input notes and
-    /// UTXOs. This associated type permits input selectors that may use specialized knowledge of
-    /// the internals of a particular backing data store, if the generic API of `WalletRead` does
-    /// not provide sufficiently fine-grained operations for a particular backing store to
-    /// optimally perform input selection.
-    type DataSource: WalletRead;
+    /// The type of data source that the input selector expects to access to obtain input Sapling
+    /// notes. This associated type permits input selectors that may use specialized knowledge of
+    /// the internals of a particular backing data store, if the generic API of
+    /// `InputSource` does not provide sufficiently fine-grained operations for a particular
+    /// backing store to optimally perform input selection.
+    type InputSource: InputSource;
     /// The type of the fee rule that this input selector uses when computing fees.
     type FeeRule: FeeRule;
 
@@ -173,21 +324,38 @@ pub trait InputSelector {
     ///
     /// If insufficient funds are available to satisfy the required outputs for the shielding
     /// request, this operation must fail and return [`InputSelectorError::InsufficientFunds`].
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn propose_transaction<ParamsT>(
         &self,
         params: &ParamsT,
-        wallet_db: &Self::DataSource,
+        wallet_db: &Self::InputSource,
+        target_height: BlockHeight,
+        anchor_height: BlockHeight,
         account: AccountId,
         transaction_request: TransactionRequest,
-        min_confirmations: NonZeroU32,
     ) -> Result<
-        Proposal<Self::FeeRule, <<Self as InputSelector>::DataSource as WalletRead>::NoteRef>,
-        InputSelectorError<<<Self as InputSelector>::DataSource as WalletRead>::Error, Self::Error>,
+        Proposal<Self::FeeRule, <Self::InputSource as InputSource>::NoteRef>,
+        InputSelectorError<<Self::InputSource as InputSource>::Error, Self::Error>,
     >
     where
         ParamsT: consensus::Parameters;
+}
+
+/// A strategy for selecting transaction inputs and proposing transaction outputs
+/// for shielding-only transactions (transactions which spend transparent UTXOs and
+/// send all transaction outputs to the wallet's shielded internal address(es)).
+#[cfg(feature = "transparent-inputs")]
+pub trait ShieldingSelector {
+    /// The type of errors that may be generated in input selection
+    type Error;
+    /// The type of data source that the input selector expects to access to obtain input
+    /// transparent UTXOs. This associated type permits input selectors that may use specialized
+    /// knowledge of the internals of a particular backing data store, if the generic API of
+    /// [`InputSource`] does not provide sufficiently fine-grained operations for a
+    /// particular backing store to optimally perform input selection.
+    type InputSource: InputSource;
+    /// The type of the fee rule that this input selector uses when computing fees.
+    type FeeRule: FeeRule;
 
     /// Performs input selection and returns a proposal for the construction of a shielding
     /// transaction.
@@ -197,18 +365,18 @@ pub trait InputSelector {
     /// specified source addresses. If insufficient funds are available to satisfy the required
     /// outputs for the shielding request, this operation must fail and return
     /// [`InputSelectorError::InsufficientFunds`].
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn propose_shielding<ParamsT>(
         &self,
         params: &ParamsT,
-        wallet_db: &Self::DataSource,
+        wallet_db: &Self::InputSource,
         shielding_threshold: NonNegativeAmount,
         source_addrs: &[TransparentAddress],
-        min_confirmations: NonZeroU32,
+        target_height: BlockHeight,
+        min_confirmations: u32,
     ) -> Result<
-        Proposal<Self::FeeRule, <<Self as InputSelector>::DataSource as WalletRead>::NoteRef>,
-        InputSelectorError<<<Self as InputSelector>::DataSource as WalletRead>::Error, Self::Error>,
+        Proposal<Self::FeeRule, Infallible>,
+        InputSelectorError<<Self::InputSource as InputSource>::Error, Self::Error>,
     >
     where
         ParamsT: consensus::Parameters;
@@ -270,17 +438,34 @@ impl<DbErrT, ChangeStrategyErrT, NoteRefT> From<BalanceError>
     }
 }
 
-pub(crate) struct SaplingPayment(Amount);
+pub(crate) struct SaplingPayment(NonNegativeAmount);
 
 #[cfg(test)]
 impl SaplingPayment {
-    pub(crate) fn new(amount: Amount) -> Self {
+    pub(crate) fn new(amount: NonNegativeAmount) -> Self {
         SaplingPayment(amount)
     }
 }
 
 impl sapling::OutputView for SaplingPayment {
-    fn value(&self) -> Amount {
+    fn value(&self) -> NonNegativeAmount {
+        self.0
+    }
+}
+
+pub(crate) struct OrchardPayment(NonNegativeAmount);
+
+// TODO: introduce this method when it is needed for testing.
+// #[cfg(test)]
+// impl OrchardPayment {
+//     pub(crate) fn new(amount: NonNegativeAmount) -> Self {
+//         OrchardPayment(amount)
+//     }
+// }
+
+#[cfg(feature = "orchard")]
+impl orchard_fees::OutputView for OrchardPayment {
+    fn value(&self) -> NonNegativeAmount {
         self.0
     }
 }
@@ -288,8 +473,8 @@ impl sapling::OutputView for SaplingPayment {
 /// An [`InputSelector`] implementation that uses a greedy strategy to select between available
 /// notes.
 ///
-/// This implementation performs input selection using methods available via the [`WalletRead`]
-/// interface.
+/// This implementation performs input selection using methods available via the
+/// [`InputSource`] interface.
 pub struct GreedyInputSelector<DbT, ChangeT> {
     change_strategy: ChangeT,
     dust_output_policy: DustOutputPolicy,
@@ -310,38 +495,35 @@ impl<DbT, ChangeT: ChangeStrategy> GreedyInputSelector<DbT, ChangeT> {
 
 impl<DbT, ChangeT> InputSelector for GreedyInputSelector<DbT, ChangeT>
 where
-    DbT: WalletRead,
+    DbT: InputSource,
     ChangeT: ChangeStrategy,
     ChangeT::FeeRule: Clone,
 {
     type Error = GreedyInputSelectorError<ChangeT::Error, DbT::NoteRef>;
-    type DataSource = DbT;
+    type InputSource = DbT;
     type FeeRule = ChangeT::FeeRule;
 
     #[allow(clippy::type_complexity)]
     fn propose_transaction<ParamsT>(
         &self,
         params: &ParamsT,
-        wallet_db: &Self::DataSource,
+        wallet_db: &Self::InputSource,
+        target_height: BlockHeight,
+        anchor_height: BlockHeight,
         account: AccountId,
         transaction_request: TransactionRequest,
-        min_confirmations: NonZeroU32,
-    ) -> Result<Proposal<Self::FeeRule, DbT::NoteRef>, InputSelectorError<DbT::Error, Self::Error>>
+    ) -> Result<
+        Proposal<Self::FeeRule, DbT::NoteRef>,
+        InputSelectorError<<DbT as InputSource>::Error, Self::Error>,
+    >
     where
         ParamsT: consensus::Parameters,
+        Self::InputSource: InputSource,
     {
-        // Target the next block, assuming we are up-to-date.
-        let (target_height, anchor_height) = wallet_db
-            .get_target_and_anchor_heights(min_confirmations)
-            .map_err(InputSelectorError::DataSource)
-            .and_then(|x| x.ok_or(InputSelectorError::SyncRequired))?;
-
         let mut transparent_outputs = vec![];
         let mut sapling_outputs = vec![];
-        let mut output_total = Amount::zero();
+        let mut orchard_outputs = vec![];
         for payment in transaction_request.payments() {
-            output_total = (output_total + payment.amount).ok_or(BalanceError::Overflow)?;
-
             let mut push_transparent = |taddr: TransparentAddress| {
                 transparent_outputs.push(TxOut {
                     value: payment.amount,
@@ -351,16 +533,26 @@ where
             let mut push_sapling = || {
                 sapling_outputs.push(SaplingPayment(payment.amount));
             };
+            let mut push_orchard = || {
+                orchard_outputs.push(OrchardPayment(payment.amount));
+            };
 
             match &payment.recipient_address {
-                RecipientAddress::Transparent(addr) => {
+                Address::Transparent(addr) => {
                     push_transparent(*addr);
                 }
-                RecipientAddress::Shielded(_) => {
+                Address::Sapling(_) => {
                     push_sapling();
                 }
-                RecipientAddress::Unified(addr) => {
-                    if addr.sapling().is_some() {
+                Address::Unified(addr) => {
+                    #[cfg(feature = "orchard")]
+                    let has_orchard = addr.orchard().is_some();
+                    #[cfg(not(feature = "orchard"))]
+                    let has_orchard = false;
+
+                    if has_orchard {
+                        push_orchard();
+                    } else if addr.sapling().is_some() {
                         push_sapling();
                     } else if let Some(addr) = addr.transparent() {
                         push_transparent(*addr);
@@ -373,9 +565,9 @@ where
             }
         }
 
-        let mut sapling_inputs: Vec<ReceivedSaplingNote<DbT::NoteRef>> = vec![];
-        let mut prior_available = Amount::zero();
-        let mut amount_required = Amount::zero();
+        let mut shielded_inputs: Vec<ReceivedNote<DbT::NoteRef, Note>> = vec![];
+        let mut prior_available = NonNegativeAmount::ZERO;
+        let mut amount_required = NonNegativeAmount::ZERO;
         let mut exclude: Vec<DbT::NoteRef> = vec![];
         // This loop is guaranteed to terminate because on each iteration we check that the amount
         // of funds selected is strictly increasing. The loop will either return a successful
@@ -386,8 +578,34 @@ where
                 target_height,
                 &Vec::<WalletTransparentOutput>::new(),
                 &transparent_outputs,
-                &sapling_inputs,
-                &sapling_outputs,
+                &(
+                    ::sapling::builder::BundleType::DEFAULT,
+                    &shielded_inputs
+                        .iter()
+                        .filter_map(|i| {
+                            i.clone().traverse_opt(|wn| match wn {
+                                Note::Sapling(n) => Some(n),
+                                #[cfg(feature = "orchard")]
+                                _ => None,
+                            })
+                        })
+                        .collect::<Vec<_>>()[..],
+                    &sapling_outputs[..],
+                ),
+                #[cfg(feature = "orchard")]
+                &(
+                    ::orchard::builder::BundleType::DEFAULT,
+                    &shielded_inputs
+                        .iter()
+                        .filter_map(|i| {
+                            i.clone().traverse_opt(|wn| match wn {
+                                Note::Orchard(n) => Some(n),
+                                _ => None,
+                            })
+                        })
+                        .collect::<Vec<_>>()[..],
+                    &orchard_outputs[..],
+                ),
                 &self.dust_output_policy,
             );
 
@@ -396,11 +614,15 @@ where
                     return Ok(Proposal {
                         transaction_request,
                         transparent_inputs: vec![],
-                        sapling_inputs,
+                        shielded_inputs: NonEmpty::from_vec(shielded_inputs).map(|notes| {
+                            ShieldedInputs {
+                                anchor_height,
+                                notes,
+                            }
+                        }),
                         balance,
                         fee_rule: (*self.change_strategy.fee_rule()).clone(),
                         min_target_height: target_height,
-                        min_anchor_height: anchor_height,
                         is_shielding: false,
                     });
                 }
@@ -413,14 +635,20 @@ where
                 Err(other) => return Err(other.into()),
             }
 
-            sapling_inputs = wallet_db
-                .select_spendable_sapling_notes(account, amount_required, anchor_height, &exclude)
+            shielded_inputs = wallet_db
+                .select_spendable_notes(
+                    account,
+                    amount_required.into(),
+                    &[ShieldedProtocol::Sapling, ShieldedProtocol::Orchard],
+                    anchor_height,
+                    &exclude,
+                )
                 .map_err(InputSelectorError::DataSource)?;
 
-            let new_available = sapling_inputs
+            let new_available = shielded_inputs
                 .iter()
-                .map(|n| n.note_value)
-                .sum::<Option<Amount>>()
+                .map(|n| n.note().value())
+                .sum::<Option<NonNegativeAmount>>()
                 .ok_or(BalanceError::Overflow)?;
 
             if new_available <= prior_available {
@@ -435,27 +663,44 @@ where
             }
         }
     }
+}
+
+#[cfg(feature = "transparent-inputs")]
+impl<DbT, ChangeT> ShieldingSelector for GreedyInputSelector<DbT, ChangeT>
+where
+    DbT: InputSource,
+    ChangeT: ChangeStrategy,
+    ChangeT::FeeRule: Clone,
+{
+    type Error = GreedyInputSelectorError<ChangeT::Error, Infallible>;
+    type InputSource = DbT;
+    type FeeRule = ChangeT::FeeRule;
 
     #[allow(clippy::type_complexity)]
     fn propose_shielding<ParamsT>(
         &self,
         params: &ParamsT,
-        wallet_db: &Self::DataSource,
+        wallet_db: &Self::InputSource,
         shielding_threshold: NonNegativeAmount,
         source_addrs: &[TransparentAddress],
-        min_confirmations: NonZeroU32,
-    ) -> Result<Proposal<Self::FeeRule, DbT::NoteRef>, InputSelectorError<DbT::Error, Self::Error>>
+        target_height: BlockHeight,
+        min_confirmations: u32,
+    ) -> Result<
+        Proposal<Self::FeeRule, Infallible>,
+        InputSelectorError<<DbT as InputSource>::Error, Self::Error>,
+    >
     where
         ParamsT: consensus::Parameters,
     {
-        let (target_height, latest_anchor) = wallet_db
-            .get_target_and_anchor_heights(min_confirmations)
-            .map_err(InputSelectorError::DataSource)
-            .and_then(|x| x.ok_or(InputSelectorError::SyncRequired))?;
-
         let mut transparent_inputs: Vec<WalletTransparentOutput> = source_addrs
             .iter()
-            .map(|taddr| wallet_db.get_unspent_transparent_outputs(taddr, latest_anchor, &[]))
+            .map(|taddr| {
+                wallet_db.get_unspent_transparent_outputs(
+                    taddr,
+                    target_height - min_confirmations,
+                    &[],
+                )
+            })
             .collect::<Result<Vec<Vec<_>>, _>>()
             .map_err(InputSelectorError::DataSource)?
             .into_iter()
@@ -467,8 +712,17 @@ where
             target_height,
             &transparent_inputs,
             &Vec::<TxOut>::new(),
-            &Vec::<ReceivedSaplingNote<DbT::NoteRef>>::new(),
-            &Vec::<SaplingPayment>::new(),
+            &(
+                ::sapling::builder::BundleType::DEFAULT,
+                &Vec::<Infallible>::new()[..],
+                &Vec::<Infallible>::new()[..],
+            ),
+            #[cfg(feature = "orchard")]
+            &(
+                orchard::builder::BundleType::DEFAULT,
+                &Vec::<Infallible>::new()[..],
+                &Vec::<Infallible>::new()[..],
+            ),
             &self.dust_output_policy,
         );
 
@@ -483,8 +737,17 @@ where
                     target_height,
                     &transparent_inputs,
                     &Vec::<TxOut>::new(),
-                    &Vec::<ReceivedSaplingNote<DbT::NoteRef>>::new(),
-                    &Vec::<SaplingPayment>::new(),
+                    &(
+                        ::sapling::builder::BundleType::DEFAULT,
+                        &Vec::<Infallible>::new()[..],
+                        &Vec::<Infallible>::new()[..],
+                    ),
+                    #[cfg(feature = "orchard")]
+                    &(
+                        orchard::builder::BundleType::DEFAULT,
+                        &Vec::<Infallible>::new()[..],
+                        &Vec::<Infallible>::new()[..],
+                    ),
                     &self.dust_output_policy,
                 )?
             }
@@ -493,21 +756,20 @@ where
             }
         };
 
-        if balance.total() >= shielding_threshold.into() {
+        if balance.total() >= shielding_threshold {
             Ok(Proposal {
                 transaction_request: TransactionRequest::empty(),
                 transparent_inputs,
-                sapling_inputs: vec![],
+                shielded_inputs: None,
                 balance,
                 fee_rule: (*self.change_strategy.fee_rule()).clone(),
                 min_target_height: target_height,
-                min_anchor_height: latest_anchor,
                 is_shielding: true,
             })
         } else {
             Err(InputSelectorError::InsufficientFunds {
                 available: balance.total(),
-                required: shielding_threshold.into(),
+                required: shielding_threshold,
             })
         }
     }

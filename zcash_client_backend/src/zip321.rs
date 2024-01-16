@@ -5,7 +5,10 @@
 //!
 //! The specification for ZIP 321 URIs may be found at <https://zips.z.cash/zip-0321>
 use core::fmt::Debug;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fmt::{self, Display},
+};
 
 use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
 use nom::{
@@ -15,16 +18,16 @@ use nom::{
 use zcash_primitives::{
     consensus,
     memo::{self, MemoBytes},
-    transaction::components::Amount,
+    transaction::components::amount::NonNegativeAmount,
 };
 
 #[cfg(any(test, feature = "test-dependencies"))]
 use std::cmp::Ordering;
 
-use crate::address::RecipientAddress;
+use crate::address::Address;
 
 /// Errors that may be produced in decoding of payment requests.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Zip321Error {
     /// A memo field in the ZIP 321 URI was not properly base-64 encoded
     InvalidBase64(base64::DecodeError),
@@ -45,18 +48,47 @@ pub enum Zip321Error {
     ParseError(String),
 }
 
-impl std::fmt::Display for Zip321Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for Zip321Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Zip321Error::InvalidBase64(e) => write!(f, "Invalid base64: {}", e),
-            Zip321Error::MemoBytesError(e) => write!(f, "Invalid memo: {}", e),
-            Zip321Error::TooManyPayments(n) => write!(f, "Too many payments: {}", n),
-            Zip321Error::DuplicateParameter(p, i) => {
-                write!(f, "Duplicate parameter {:?} at index {}", p, i)
+            Zip321Error::InvalidBase64(err) => {
+                write!(f, "Memo value was not correctly base64-encoded: {:?}", err)
             }
-            Zip321Error::TransparentMemo(i) => write!(f, "Transparent memo at index {}", i),
-            Zip321Error::RecipientMissing(i) => write!(f, "Recipient missing at index {}", i),
-            Zip321Error::ParseError(s) => write!(f, "Parse error: {}", s),
+            Zip321Error::MemoBytesError(err) => write!(
+                f,
+                "Memo exceeded maximum length or violated UTF-8 encoding restrictions: {:?}",
+                err
+            ),
+            Zip321Error::TooManyPayments(n) => write!(
+                f,
+                "Cannot create a Zcash transaction containing {} payments",
+                n
+            ),
+            Zip321Error::DuplicateParameter(param, idx) => write!(
+                f,
+                "There is a duplicate {} parameter at index {}",
+                param.name(),
+                idx
+            ),
+            Zip321Error::TransparentMemo(idx) => write!(
+                f,
+                "Payment {} is invalid: cannot send a memo to a transparent recipient address",
+                idx
+            ),
+            Zip321Error::RecipientMissing(idx) => {
+                write!(f, "Payment {} is missing its recipient address", idx)
+            }
+            Zip321Error::ParseError(s) => write!(f, "Parse failure: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for Zip321Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Zip321Error::InvalidBase64(err) => Some(err),
+            Zip321Error::MemoBytesError(err) => Some(err),
+            _ => None,
         }
     }
 }
@@ -79,12 +111,12 @@ pub fn memo_from_base64(s: &str) -> Result<MemoBytes, Zip321Error> {
 }
 
 /// A single payment being requested.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Payment {
     /// The payment address to which the payment should be sent.
-    pub recipient_address: RecipientAddress,
+    pub recipient_address: Address,
     /// The amount of the payment that is being requested.
-    pub amount: Amount,
+    pub amount: NonNegativeAmount,
     /// A memo that, if included, must be provided with the payment.
     /// If a memo is present and [`recipient_address`] is not a shielded
     /// address, the wallet should report an error.
@@ -137,7 +169,7 @@ impl Payment {
 /// When constructing a transaction in response to such a request,
 /// a separate output should be added to the transaction for each
 /// payment value in the request.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionRequest {
     payments: Vec<Payment>,
 }
@@ -166,6 +198,21 @@ impl TransactionRequest {
     /// Returns the slice of payments that make up this request.
     pub fn payments(&self) -> &[Payment] {
         &self.payments[..]
+    }
+
+    /// Returns the total value of payments to be made.
+    ///
+    /// Returns `Err` in the case of overflow, or if the value is
+    /// outside the range `0..=MAX_MONEY` zatoshis.
+    pub fn total(&self) -> Result<NonNegativeAmount, ()> {
+        if self.payments.is_empty() {
+            Ok(NonNegativeAmount::ZERO)
+        } else {
+            self.payments
+                .iter()
+                .map(|p| p.amount)
+                .fold(Ok(NonNegativeAmount::ZERO), |acc, a| (acc? + a).ok_or(()))
+        }
     }
 
     /// A utility for use in tests to help check round-trip serialization properties.
@@ -314,10 +361,12 @@ mod render {
     use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
     use zcash_primitives::{
-        consensus, transaction::components::amount::COIN, transaction::components::Amount,
+        consensus,
+        transaction::components::amount::COIN,
+        transaction::components::{amount::NonNegativeAmount, Amount},
     };
 
-    use super::{memo_to_base64, MemoBytes, RecipientAddress};
+    use super::{memo_to_base64, Address, MemoBytes};
 
     /// The set of ASCII characters that must be percent-encoded according
     /// to the definition of ZIP 321. This is the complement of the subset of
@@ -359,7 +408,7 @@ mod render {
     /// at the specified parameter index.
     pub fn addr_param<P: consensus::Parameters>(
         params: &P,
-        addr: &RecipientAddress,
+        addr: &Address,
         idx: Option<usize>,
     ) -> String {
         format!("address{}={}", param_index(idx), addr.encode(params))
@@ -385,8 +434,8 @@ mod render {
 
     /// Constructs an "amount" key/value pair containing the encoded ZEC amount
     /// at the specified parameter index.
-    pub fn amount_param(amount: Amount, idx: Option<usize>) -> Option<String> {
-        amount_str(amount).map(|s| format!("amount{}={}", param_index(idx), s))
+    pub fn amount_param(amount: NonNegativeAmount, idx: Option<usize>) -> Option<String> {
+        amount_str(amount.into()).map(|s| format!("amount{}={}", param_index(idx), s))
     }
 
     /// Constructs a "memo" key/value pair containing the base64URI-encoded memo
@@ -419,27 +468,43 @@ mod parse {
     };
     use percent_encoding::percent_decode;
     use zcash_primitives::{
-        consensus, transaction::components::amount::COIN, transaction::components::Amount,
+        consensus,
+        transaction::components::amount::COIN,
+        transaction::components::{amount::NonNegativeAmount, Amount},
     };
 
-    use crate::address::RecipientAddress;
+    use crate::address::Address;
 
     use super::{memo_from_base64, MemoBytes, Payment, Zip321Error};
 
     /// A data type that defines the possible parameter types which may occur within a
     /// ZIP 321 URI.
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Param {
-        Addr(Box<RecipientAddress>),
-        Amount(Amount),
+        Addr(Box<Address>),
+        Amount(NonNegativeAmount),
         Memo(MemoBytes),
         Label(String),
         Message(String),
         Other(String, String),
     }
 
+    impl Param {
+        /// Returns the name of the parameter from which this value was parsed.
+        pub fn name(&self) -> String {
+            match self {
+                Param::Addr(_) => "address".to_owned(),
+                Param::Amount(_) => "amount".to_owned(),
+                Param::Memo(_) => "memo".to_owned(),
+                Param::Label(_) => "label".to_owned(),
+                Param::Message(_) => "message".to_owned(),
+                Param::Other(name, _) => name.clone(),
+            }
+        }
+    }
+
     /// A [`Param`] value with its associated index.
-    #[derive(Debug)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct IndexedParam {
         pub param: Param,
         pub payment_index: usize,
@@ -478,7 +543,7 @@ mod parse {
 
         let mut payment = Payment {
             recipient_address: *addr.ok_or(Zip321Error::RecipientMissing(i))?,
-            amount: Amount::zero(),
+            amount: NonNegativeAmount::ZERO,
             memo: None,
             label: None,
             message: None,
@@ -489,12 +554,8 @@ mod parse {
             match v {
                 Param::Amount(a) => payment.amount = a,
                 Param::Memo(m) => match payment.recipient_address {
-                    RecipientAddress::Shielded(_) | RecipientAddress::Unified(_) => {
-                        payment.memo = Some(m)
-                    }
-                    RecipientAddress::Transparent(_) => {
-                        return Err(Zip321Error::TransparentMemo(i))
-                    }
+                    Address::Sapling(_) | Address::Unified(_) => payment.memo = Some(m),
+                    Address::Transparent(_) => return Err(Zip321Error::TransparentMemo(i)),
                 },
 
                 Param::Label(m) => payment.label = Some(m),
@@ -520,7 +581,7 @@ mod parse {
                     } else {
                         // `decode` returns `None` on error, which we want to
                         // then cause `map_opt` to fail.
-                        RecipientAddress::decode(params, addr_str).map(|a| {
+                        Address::decode(params, addr_str).map(|a| {
                             Some(IndexedParam {
                                 param: Param::Addr(Box::new(a)),
                                 payment_index: 0,
@@ -625,7 +686,7 @@ mod parse {
         ((name, iopt), value): ((&str, Option<&str>), &str),
     ) -> Result<IndexedParam, String> {
         let param = match name {
-            "address" => RecipientAddress::decode(params, value)
+            "address" => Address::decode(params, value)
                 .map(Box::new)
                 .map(Param::Addr)
                 .ok_or(format!(
@@ -634,8 +695,12 @@ mod parse {
                 )),
 
             "amount" => parse_amount(value)
-                .map(|(_, a)| Param::Amount(a))
-                .map_err(|e| e.to_string()),
+                .map_err(|e| e.to_string())
+                .and_then(|(_, a)| {
+                    NonNegativeAmount::try_from(a)
+                        .map_err(|_| "Payment amount must be nonnegative.".to_owned())
+                })
+                .map(Param::Amount),
 
             "label" => percent_decode(value.as_bytes())
                 .decode_utf8()
@@ -680,13 +745,13 @@ pub mod testing {
     use proptest::option;
     use proptest::prelude::{any, prop_compose, prop_oneof};
     use proptest::strategy::Strategy;
+    use sapling::testing::arb_payment_address;
     use zcash_primitives::{
         consensus::TEST_NETWORK, legacy::testing::arb_transparent_addr,
-        sapling::testing::arb_payment_address,
         transaction::components::amount::testing::arb_nonnegative_amount,
     };
 
-    use crate::address::{RecipientAddress, UnifiedAddress};
+    use crate::address::{Address, UnifiedAddress};
 
     use super::{MemoBytes, Payment, TransactionRequest};
 
@@ -695,15 +760,20 @@ pub mod testing {
             sapling in arb_payment_address(),
             transparent in option::of(arb_transparent_addr()),
         ) -> UnifiedAddress {
-            UnifiedAddress::from_receivers(None, Some(sapling), transparent).unwrap()
+            UnifiedAddress::from_receivers(
+                #[cfg(feature = "orchard")]
+                None,
+                Some(sapling),
+                transparent
+            ).unwrap()
         }
     }
 
-    pub fn arb_addr() -> impl Strategy<Value = RecipientAddress> {
+    pub fn arb_addr() -> impl Strategy<Value = Address> {
         prop_oneof![
-            arb_payment_address().prop_map(RecipientAddress::Shielded),
-            arb_transparent_addr().prop_map(RecipientAddress::Transparent),
-            arb_unified_addr().prop_map(RecipientAddress::Unified),
+            arb_payment_address().prop_map(Address::Sapling),
+            arb_transparent_addr().prop_map(Address::Transparent),
+            arb_unified_addr().prop_map(Address::Unified),
         ]
     }
 
@@ -724,11 +794,10 @@ pub mod testing {
             label in option::of(any::<String>()),
             // prevent duplicates by generating a set rather than a vec
             other_params in btree_map(VALID_PARAMNAME, any::<String>(), 0..3),
-            ) -> Payment {
-
+        ) -> Payment {
             let is_shielded = match recipient_address {
-                RecipientAddress::Transparent(_) => false,
-                RecipientAddress::Shielded(_) | RecipientAddress::Unified(_) => true,
+                Address::Transparent(_) => false,
+                Address::Sapling(_) | Address::Unified(_) => true,
             };
 
             Payment {
@@ -769,10 +838,10 @@ mod tests {
     use zcash_primitives::{
         consensus::{Parameters, TEST_NETWORK},
         memo::Memo,
-        transaction::components::Amount,
+        transaction::components::{amount::NonNegativeAmount, Amount},
     };
 
-    use crate::address::RecipientAddress;
+    use crate::address::Address;
 
     use super::{
         memo_from_base64, memo_to_base64,
@@ -830,8 +899,8 @@ mod tests {
         let expected = TransactionRequest {
             payments: vec![
                 Payment {
-                    recipient_address: RecipientAddress::Shielded(decode_payment_address(TEST_NETWORK.hrp_sapling_payment_address(), "ztestsapling1n65uaftvs2g7075q2x2a04shfk066u3lldzxsrprfrqtzxnhc9ps73v4lhx4l9yfxj46sl0q90k").unwrap()),
-                    amount: Amount::from_u64(376876902796286).unwrap(),
+                    recipient_address: Address::Sapling(decode_payment_address(TEST_NETWORK.hrp_sapling_payment_address(), "ztestsapling1n65uaftvs2g7075q2x2a04shfk066u3lldzxsrprfrqtzxnhc9ps73v4lhx4l9yfxj46sl0q90k").unwrap()),
+                    amount: NonNegativeAmount::const_from_u64(376876902796286),
                     memo: None,
                     label: None,
                     message: Some("".to_string()),
@@ -851,8 +920,8 @@ mod tests {
         let expected = TransactionRequest {
             payments: vec![
                 Payment {
-                    recipient_address: RecipientAddress::Shielded(decode_payment_address(TEST_NETWORK.hrp_sapling_payment_address(), "ztestsapling1n65uaftvs2g7075q2x2a04shfk066u3lldzxsrprfrqtzxnhc9ps73v4lhx4l9yfxj46sl0q90k").unwrap()),
-                    amount: Amount::from_u64(0).unwrap(),
+                    recipient_address: Address::Sapling(decode_payment_address(TEST_NETWORK.hrp_sapling_payment_address(), "ztestsapling1n65uaftvs2g7075q2x2a04shfk066u3lldzxsrprfrqtzxnhc9ps73v4lhx4l9yfxj46sl0q90k").unwrap()),
+                    amount: NonNegativeAmount::ZERO,
                     memo: None,
                     label: None,
                     message: None,
@@ -869,8 +938,8 @@ mod tests {
         let req = TransactionRequest {
             payments: vec![
                 Payment {
-                    recipient_address: RecipientAddress::Shielded(decode_payment_address(TEST_NETWORK.hrp_sapling_payment_address(), "ztestsapling1n65uaftvs2g7075q2x2a04shfk066u3lldzxsrprfrqtzxnhc9ps73v4lhx4l9yfxj46sl0q90k").unwrap()),
-                    amount: Amount::from_u64(0).unwrap(),
+                    recipient_address: Address::Sapling(decode_payment_address(TEST_NETWORK.hrp_sapling_payment_address(), "ztestsapling1n65uaftvs2g7075q2x2a04shfk066u3lldzxsrprfrqtzxnhc9ps73v4lhx4l9yfxj46sl0q90k").unwrap()),
+                    amount: NonNegativeAmount::ZERO,
                     memo: None,
                     label: None,
                     message: Some("".to_string()),
@@ -907,7 +976,7 @@ mod tests {
         let v1r = TransactionRequest::from_uri(&TEST_NETWORK, valid_1).unwrap();
         assert_eq!(
             v1r.payments.get(0).map(|p| p.amount),
-            Some(Amount::from_u64(100000000).unwrap())
+            Some(NonNegativeAmount::const_from_u64(100000000))
         );
 
         let valid_2 = "zcash:?address=tmEZhbWHTpdKMw5it8YDspUXSMGQyFwovpU&amount=123.456&address.1=ztestsapling10yy2ex5dcqkclhc7z7yrnjq2z6feyjad56ptwlfgmy77dmaqqrl9gyhprdx59qgmsnyfska2kez&amount.1=0.789&memo.1=VGhpcyBpcyBhIHVuaWNvZGUgbWVtbyDinKjwn6aE8J-PhvCfjok";
@@ -915,11 +984,11 @@ mod tests {
         v2r.normalize(&TEST_NETWORK);
         assert_eq!(
             v2r.payments.get(0).map(|p| p.amount),
-            Some(Amount::from_u64(12345600000).unwrap())
+            Some(NonNegativeAmount::const_from_u64(12345600000))
         );
         assert_eq!(
             v2r.payments.get(1).map(|p| p.amount),
-            Some(Amount::from_u64(78900000).unwrap())
+            Some(NonNegativeAmount::const_from_u64(78900000))
         );
 
         // valid; amount just less than MAX_MONEY
@@ -928,7 +997,7 @@ mod tests {
         let v3r = TransactionRequest::from_uri(&TEST_NETWORK, valid_3).unwrap();
         assert_eq!(
             v3r.payments.get(0).map(|p| p.amount),
-            Some(Amount::from_u64(2099999999999999u64).unwrap())
+            Some(NonNegativeAmount::const_from_u64(2099999999999999u64))
         );
 
         // valid; MAX_MONEY
@@ -937,7 +1006,7 @@ mod tests {
         let v4r = TransactionRequest::from_uri(&TEST_NETWORK, valid_4).unwrap();
         assert_eq!(
             v4r.payments.get(0).map(|p| p.amount),
-            Some(Amount::from_u64(2100000000000000u64).unwrap())
+            Some(NonNegativeAmount::const_from_u64(2100000000000000u64))
         );
     }
 
@@ -1010,17 +1079,18 @@ mod tests {
         #[test]
         fn prop_zip321_roundtrip_address(addr in arb_addr()) {
             let a = addr.encode(&TEST_NETWORK);
-            assert_eq!(RecipientAddress::decode(&TEST_NETWORK, &a), Some(addr));
+            assert_eq!(Address::decode(&TEST_NETWORK, &a), Some(addr));
         }
 
         #[test]
         fn prop_zip321_roundtrip_address_str(a in arb_addr_str()) {
-            let addr = RecipientAddress::decode(&TEST_NETWORK, &a).unwrap();
+            let addr = Address::decode(&TEST_NETWORK, &a).unwrap();
             assert_eq!(addr.encode(&TEST_NETWORK), a);
         }
 
         #[test]
-        fn prop_zip321_roundtrip_amount(amt in arb_nonnegative_amount()) {
+        fn prop_zip321_roundtrip_amount(nn_amt in arb_nonnegative_amount()) {
+            let amt = Amount::from(nn_amt);
             let amt_str = amount_str(amt).unwrap();
             assert_eq!(amt, parse_amount(&amt_str).unwrap().1);
         }

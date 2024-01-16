@@ -12,21 +12,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch path to Zcash parameters
-        working-directory: ./zcash_proofs
-        shell: bash
-        run: echo "ZCASH_PARAMS=$(cargo run --release --example get-params-path --features directories)" >> $GITHUB_ENV
-      - name: Cache Zcash parameters
-        id: cache-params
-        uses: actions/cache@v3.3.1
-        with:
-          path: ${{ env.ZCASH_PARAMS }}
-          key: ${{ runner.os }}-params
-      - name: Fetch Zcash parameters
-        if: steps.cache-params.outputs.cache-hit != 'true'
-        working-directory: ./zcash_proofs
-        run: cargo run --release --example download-params --features download-params
-
       - name: Run tests
         run: cargo test  --all-features --verbose --release --all
       - name: Run slow tests
@@ -62,15 +47,28 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: crates
+      # We use a synthetic crate to ensure no dev-dependencies are enabled, which can
+      # be incompatible with some of these targets.
+      - name: Create synthetic crate for testing
+        run: cargo init --lib ci-build
+      - name: Copy Rust version into synthetic crate
+        run: cp crates/rust-toolchain.toml ci-build/
+      - name: Add zcash_proofs as a dependency of the synthetic crate
+        working-directory: ./ci-build
+        run: cargo add --no-default-features --path ../crates/zcash_proofs
+      - name: Add zcash_client_backend as a dependency of the synthetic crate
+        working-directory: ./ci-build
+        run: cargo add --no-default-features --path ../crates/zcash_client_backend
+      - name: Copy pinned dependencies into synthetic crate
+        run: cp crates/Cargo.lock ci-build/
       - name: Add target
+        working-directory: ./ci-build
         run: rustup target add ${{ matrix.target }}
-      - run: cargo fetch
-      - name: Build zcash_proofs for target
-        working-directory: ./zcash_proofs
-        run: cargo build --verbose --no-default-features --target ${{ matrix.target }}
-      - name: Build zcash_client_backend for target
-        working-directory: ./zcash_client_backend
-        run: cargo build --verbose --no-default-features --target ${{ matrix.target }}
+      - name: Build for target
+        working-directory: ./ci-build
+        run: cargo build --verbose --target ${{ matrix.target }}
 
   bitrot:
     name: Bitrot check
@@ -121,23 +119,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch path to Zcash parameters
-        working-directory: ./zcash_proofs
-        shell: bash
-        run: echo "ZCASH_PARAMS=$(cargo run --release --example get-params-path --features directories)" >> $GITHUB_ENV
-      - name: Cache Zcash parameters
-        id: cache-params
-        uses: actions/cache@v3.3.1
-        with:
-          path: ${{ env.ZCASH_PARAMS }}
-          key: ${{ runner.os }}-params
-      - name: Fetch Zcash parameters
-        if: steps.cache-params.outputs.cache-hit != 'true'
-        working-directory: ./zcash_proofs
-        run: cargo run --release --example download-params --features download-params
-
       - name: Generate coverage report
-        run: cargo tarpaulin --engine llvm --all-features --release --timeout 600 --out Xml
+        run: cargo tarpaulin --engine llvm --all-features --release --timeout 600 --out xml
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3.1.4
 
@@ -149,7 +132,7 @@ jobs:
       - run: cargo fetch
       # Requires #![deny(rustdoc::broken_intra_doc_links)] in crates.
       - name: Check intra-doc links
-        run: cargo doc --all --document-private-items
+        run: cargo doc --all --all-features --document-private-items
 
   fmt:
     name: Rustfmt
@@ -159,6 +142,23 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  protobuf:
+    name: protobuf consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        uses: supplypike/setup-bin@v3
+        with:
+          uri: 'https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip'
+          name: 'protoc'
+          version: '25.1'
+          subPath: 'bin'
+      - name: Trigger protobuf regeneration
+        run: cargo check --workspace  --all-features
+      - name: Verify working directory is clean
+        run: git diff --exit-code
 
   uuid:
     name: UUID validity

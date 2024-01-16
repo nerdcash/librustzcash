@@ -4,8 +4,13 @@ use std::error;
 use std::fmt;
 
 use shardtree::error::ShardTreeError;
-use zcash_client_backend::encoding::{Bech32DecodeError, TransparentCodecError};
-use zcash_primitives::{consensus::BlockHeight, zip32::AccountId};
+use zcash_client_backend::{
+    encoding::{Bech32DecodeError, TransparentCodecError},
+    PoolType,
+};
+use zcash_primitives::{
+    consensus::BlockHeight, transaction::components::amount::BalanceError, zip32::AccountId,
+};
 
 use crate::wallet::commitment_tree;
 use crate::PRUNING_DEPTH;
@@ -98,6 +103,12 @@ pub enum SqliteClientError {
     /// [`WalletWrite::update_chain_tip`]:
     /// zcash_client_backend::data_api::WalletWrite::update_chain_tip
     ChainHeightUnknown,
+
+    /// Unsupported pool type
+    UnsupportedPoolType(PoolType),
+
+    /// An error occurred in computing wallet balance
+    BalanceError(BalanceError),
 }
 
 impl error::Error for SqliteClientError {
@@ -107,6 +118,7 @@ impl error::Error for SqliteClientError {
             SqliteClientError::Bech32DecodeError(Bech32DecodeError::Bech32Error(e)) => Some(e),
             SqliteClientError::DbError(e) => Some(e),
             SqliteClientError::Io(e) => Some(e),
+            SqliteClientError::BalanceError(e) => Some(e),
             _ => None,
         }
     }
@@ -144,7 +156,9 @@ impl fmt::Display for SqliteClientError {
             SqliteClientError::AddressNotRecognized(_) => write!(f, "The address associated with a received txo is not identifiable as belonging to the wallet."),
             SqliteClientError::CommitmentTree(err) => write!(f, "An error occurred accessing or updating note commitment tree data: {}.", err),
             SqliteClientError::CacheMiss(height) => write!(f, "Requested height {} does not exist in the block cache.", height),
-            SqliteClientError::ChainHeightUnknown => write!(f, "Chain height unknown; please call `update_chain_tip`")
+            SqliteClientError::ChainHeightUnknown => write!(f, "Chain height unknown; please call `update_chain_tip`"),
+            SqliteClientError::UnsupportedPoolType(t) => write!(f, "Pool type is not currently supported: {}", t),
+            SqliteClientError::BalanceError(e) => write!(f, "Balance error: {}", e),
         }
     }
 }
@@ -195,5 +209,11 @@ impl From<zcash_primitives::memo::Error> for SqliteClientError {
 impl From<ShardTreeError<commitment_tree::Error>> for SqliteClientError {
     fn from(e: ShardTreeError<commitment_tree::Error>) -> Self {
         SqliteClientError::CommitmentTree(e)
+    }
+}
+
+impl From<BalanceError> for SqliteClientError {
+    fn from(e: BalanceError) -> Self {
+        SqliteClientError::BalanceError(e)
     }
 }

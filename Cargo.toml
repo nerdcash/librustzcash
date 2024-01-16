@@ -4,7 +4,6 @@ members = [
     "components/f4jumble",
     "components/zcash_address",
     "components/zcash_encoding",
-    "components/zcash_note_encryption",
     "zcash_client_backend",
     "zcash_client_sqlite",
     "zcash_extensions",
@@ -13,7 +12,108 @@ members = [
     "zcash_proofs",
 ]
 
+[workspace.package]
+edition = "2021"
+rust-version = "1.65"
+repository = "https://github.com/zcash/librustzcash"
+license = "MIT OR Apache-2.0"
+categories = ["cryptography::cryptocurrencies"]
+
+# Common dependencies across all of our crates. Dependencies used only by a single crate
+# (and that don't have cross-crate versioning needs) are specified by the crate itself.
+#
+# See the individual crate `Cargo.toml` files for information about which dependencies are
+# part of a public API, and which can be updated without a SemVer bump.
+[workspace.dependencies]
+# Intra-workspace dependencies
+equihash = { version = "0.2", path = "components/equihash" }
+zcash_address = { version = "0.3", path = "components/zcash_address" }
+zcash_client_backend = { version = "0.10", path = "zcash_client_backend" }
+zcash_encoding = { version = "0.2", path = "components/zcash_encoding" }
+zcash_note_encryption = "0.4"
+zcash_primitives = { version = "0.13", path = "zcash_primitives", default-features = false }
+zcash_proofs = { version = "0.13", path = "zcash_proofs", default-features = false }
+
+# Shielded protocols
+ff = "0.13"
+group = "0.13"
+incrementalmerkletree = "0.5"
+shardtree = "0.2"
+zcash_spec = "0.1"
+
+# Payment protocols
+# - Sapling
+bitvec = "1"
+blake2s_simd = "1"
+bls12_381 = "0.8"
+jubjub = "0.10"
+sapling = { package = "sapling-crypto", version = "0.0" }
+
+# - Orchard
+nonempty = "0.7"
+orchard = { version = "0.6", default-features = false }
+
+# - Transparent
+hdwallet = "0.4"
+ripemd = "0.1"
+secp256k1 = "0.28"
+
+# CSPRNG
+rand = "0.8"
+rand_core = "0.6"
+
+# Digests
+blake2b_simd = "1"
+sha2 = "0.10"
+
+# Documentation
+document-features = "0.2"
+
+# Encodings
+base64 = "0.21"
+bech32 = "0.9"
+bs58 = { version = "0.5", features = ["check"] }
+byteorder = "1"
+hex = "0.4"
+percent-encoding = "2.1.0"
+
+# Logging and metrics
+memuse = "0.2.1"
+tracing = "0.1"
+
+# Parallel processing
+crossbeam-channel = "0.5"
+maybe-rayon = { version = "0.1.0", default-features = false }
+rayon = "1.5"
+
+# Protobuf and gRPC
+prost = "0.12"
+tonic = "0.10"
+tonic-build = "0.10"
+
+# Secret management
+secrecy = "0.8"
+subtle = "2.2.3"
+
+# Static constants
+lazy_static = "1"
+
+# Tests and benchmarks
+assert_matches = "1.5"
+criterion = "0.4"
+proptest = "1"
+rand_xorshift = "0.3"
+
+# ZIP 32
+aes = "0.8"
+fpe = "0.6"
+zip32 = "0.1"
+
 [profile.release]
 lto = true
 panic = 'abort'
 codegen-units = 1
+
+[patch.crates-io]
+sapling = { package = "sapling-crypto", git = "https://github.com/zcash/sapling-crypto.git", rev = "4ec6a48daab0af1fe6cb930f6a150030ce91d0e9" }
+orchard = { git = "https://github.com/zcash/orchard.git", rev = "189257391a5726d7f3f2568d547a5ef8603c7156" }

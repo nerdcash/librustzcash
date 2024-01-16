@@ -5,42 +5,47 @@ use incrementalmerkletree::Position;
 use rusqlite::{named_params, params, types::Value, Connection, Row};
 use std::rc::Rc;
 
+use sapling::{self, Diversifier, Nullifier, Rseed};
 use zcash_primitives::{
-    consensus::BlockHeight,
+    consensus::{self, BlockHeight},
     memo::MemoBytes,
-    sapling::{self, Diversifier, Note, Nullifier, Rseed},
-    transaction::components::Amount,
-    zip32::AccountId,
+    transaction::{
+        components::{amount::NonNegativeAmount, Amount},
+        TxId,
+    },
+    zip32::{AccountId, Scope},
 };
 
 use zcash_client_backend::{
-    wallet::{ReceivedSaplingNote, WalletSaplingOutput},
+    keys::UnifiedFullViewingKey,
+    wallet::{Note, ReceivedNote, WalletSaplingOutput},
     DecryptedOutput, TransferType,
 };
 
 use crate::{error::SqliteClientError, ReceivedNoteId};
 
-use super::{memo_repr, wallet_birthday};
+use super::{memo_repr, parse_scope, scope_code, wallet_birthday};
 
 /// This trait provides a generalization over shielded output representations.
 pub(crate) trait ReceivedSaplingOutput {
     fn index(&self) -> usize;
     fn account(&self) -> AccountId;
-    fn note(&self) -> &Note;
+    fn note(&self) -> &sapling::Note;
     fn memo(&self) -> Option<&MemoBytes>;
     fn is_change(&self) -> bool;
     fn nullifier(&self) -> Option<&sapling::Nullifier>;
     fn note_commitment_tree_position(&self) -> Option<Position>;
+    fn recipient_key_scope(&self) -> Scope;
 }
 
-impl ReceivedSaplingOutput for WalletSaplingOutput<sapling::Nullifier> {
+impl ReceivedSaplingOutput for WalletSaplingOutput<sapling::Nullifier, Scope> {
     fn index(&self) -> usize {
         self.index()
     }
     fn account(&self) -> AccountId {
         WalletSaplingOutput::account(self)
     }
-    fn note(&self) -> &Note {
+    fn note(&self) -> &sapling::Note {
         WalletSaplingOutput::note(self)
     }
     fn memo(&self) -> Option<&MemoBytes> {
@@ -55,16 +60,20 @@ impl ReceivedSaplingOutput for WalletSaplingOutput<sapling::Nullifier> {
     fn note_commitment_tree_position(&self) -> Option<Position> {
         Some(WalletSaplingOutput::note_commitment_tree_position(self))
     }
+
+    fn recipient_key_scope(&self) -> Scope {
+        *self.recipient_key_scope()
+    }
 }
 
-impl ReceivedSaplingOutput for DecryptedOutput<Note> {
+impl ReceivedSaplingOutput for DecryptedOutput<sapling::Note> {
     fn index(&self) -> usize {
         self.index
     }
     fn account(&self) -> AccountId {
         self.account
     }
-    fn note(&self) -> &Note {
+    fn note(&self) -> &sapling::Note {
         &self.note
     }
     fn memo(&self) -> Option<&MemoBytes> {
@@ -79,12 +88,24 @@ impl ReceivedSaplingOutput for DecryptedOutput<Note> {
     fn note_commitment_tree_position(&self) -> Option<Position> {
         None
     }
+    fn recipient_key_scope(&self) -> Scope {
+        if self.transfer_type == TransferType::WalletInternal {
+            Scope::Internal
+        } else {
+            Scope::External
+        }
+    }
 }
 
-fn to_spendable_note(row: &Row) -> Result<ReceivedSaplingNote<ReceivedNoteId>, SqliteClientError> {
+fn to_spendable_note<P: consensus::Parameters>(
+    params: &P,
+    row: &Row,
+) -> Result<ReceivedNote<ReceivedNoteId, Note>, SqliteClientError> {
     let note_id = ReceivedNoteId(row.get(0)?);
+    let txid = row.get::<_, [u8; 32]>(1).map(TxId::from_bytes)?;
+    let output_index = row.get(2)?;
     let diversifier = {
-        let d: Vec<_> = row.get(1)?;
+        let d: Vec<_> = row.get(3)?;
         if d.len() != 11 {
             return Err(SqliteClientError::CorruptedData(
                 "Invalid diversifier length".to_string(),
@@ -95,10 +116,12 @@ fn to_spendable_note(row: &Row) -> Result<ReceivedSaplingNote<ReceivedNoteId>, S
         Diversifier(tmp)
     };
 
-    let note_value = Amount::from_i64(row.get(2)?).unwrap();
+    let note_value = NonNegativeAmount::from_nonnegative_i64(row.get(4)?).map_err(|_e| {
+        SqliteClientError::CorruptedData("Note values must be nonnegative".to_string())
+    })?;
 
     let rseed = {
-        let rcm_bytes: Vec<_> = row.get(3)?;
+        let rcm_bytes: Vec<_> = row.get(5)?;
 
         // We store rcm directly in the data DB, regardless of whether the note
         // used a v1 or v2 note plaintext, so for the purposes of spending let's
@@ -113,17 +136,76 @@ fn to_spendable_note(row: &Row) -> Result<ReceivedSaplingNote<ReceivedNoteId>, S
     };
 
     let note_commitment_tree_position =
-        Position::from(u64::try_from(row.get::<_, i64>(4)?).map_err(|_| {
+        Position::from(u64::try_from(row.get::<_, i64>(6)?).map_err(|_| {
             SqliteClientError::CorruptedData("Note commitment tree position invalid.".to_string())
         })?);
 
-    Ok(ReceivedSaplingNote {
+    let ufvk_str: String = row.get(7)?;
+    let ufvk = UnifiedFullViewingKey::decode(params, &ufvk_str)
+        .map_err(SqliteClientError::CorruptedData)?;
+
+    let scope_code: i64 = row.get(8)?;
+    let spending_key_scope = parse_scope(scope_code).ok_or_else(|| {
+        SqliteClientError::CorruptedData(format!("Invalid key scope code {}", scope_code))
+    })?;
+
+    let recipient = match spending_key_scope {
+        Scope::Internal => ufvk
+            .sapling()
+            .and_then(|dfvk| dfvk.diversified_change_address(diversifier)),
+        Scope::External => ufvk
+            .sapling()
+            .and_then(|dfvk| dfvk.diversified_address(diversifier)),
+    }
+    .ok_or_else(|| SqliteClientError::CorruptedData("Diversifier invalid.".to_owned()))?;
+
+    Ok(ReceivedNote::from_parts(
         note_id,
-        diversifier,
-        note_value,
-        rseed,
+        txid,
+        output_index,
+        Note::Sapling(sapling::Note::from_parts(
+            recipient,
+            note_value.into(),
+            rseed,
+        )),
+        spending_key_scope,
         note_commitment_tree_position,
-    })
+    ))
+}
+
+// The `clippy::let_and_return` lint is explicitly allowed here because a bug in Clippy
+// (https://github.com/rust-lang/rust-clippy/issues/11308) means it fails to identify that the `result` temporary
+// is required in order to resolve the borrows involved in the `query_and_then` call.
+#[allow(clippy::let_and_return)]
+pub(crate) fn get_spendable_sapling_note<P: consensus::Parameters>(
+    conn: &Connection,
+    params: &P,
+    txid: &TxId,
+    index: u32,
+) -> Result<Option<ReceivedNote<ReceivedNoteId, Note>>, SqliteClientError> {
+    let mut stmt_select_note = conn.prepare_cached(
+        "SELECT id_note, txid, output_index, diversifier, value, rcm, commitment_tree_position,
+                accounts.ufvk, recipient_key_scope
+         FROM sapling_received_notes
+         INNER JOIN accounts on accounts.account = sapling_received_notes.account
+         INNER JOIN transactions ON transactions.id_tx = sapling_received_notes.tx
+         WHERE txid = :txid
+         AND output_index = :output_index
+         AND spent IS NULL",
+    )?;
+
+    let result = stmt_select_note
+        .query_and_then(
+            named_params![
+               ":txid": txid.as_ref(),
+               ":output_index": index,
+            ],
+            |r| to_spendable_note(params, r),
+        )?
+        .next()
+        .transpose();
+
+    result
 }
 
 /// Utility method for determining whether we have any spendable notes
@@ -141,8 +223,8 @@ fn unscanned_tip_exists(
         "SELECT EXISTS (
              SELECT 1 FROM v_sapling_shard_unscanned_ranges range
              WHERE range.block_range_start <= :anchor_height
-             AND :anchor_height BETWEEN 
-                range.subtree_start_height 
+             AND :anchor_height BETWEEN
+                range.subtree_start_height
                 AND IFNULL(range.subtree_end_height, :anchor_height)
          )",
         named_params![":anchor_height": u32::from(anchor_height),],
@@ -150,69 +232,14 @@ fn unscanned_tip_exists(
     )
 }
 
-pub(crate) fn get_spendable_sapling_notes(
+pub(crate) fn select_spendable_sapling_notes<P: consensus::Parameters>(
     conn: &Connection,
-    account: AccountId,
-    anchor_height: BlockHeight,
-    exclude: &[ReceivedNoteId],
-) -> Result<Vec<ReceivedSaplingNote<ReceivedNoteId>>, SqliteClientError> {
-    let birthday_height = match wallet_birthday(conn)? {
-        Some(birthday) => birthday,
-        None => {
-            // the wallet birthday can only be unknown if there are no accounts in the wallet; in
-            // such a case, the wallet has no notes to spend.
-            return Ok(vec![]);
-        }
-    };
-
-    if unscanned_tip_exists(conn, anchor_height)? {
-        return Ok(vec![]);
-    }
-
-    let mut stmt_select_notes = conn.prepare_cached(
-        "SELECT id_note, diversifier, value, rcm, commitment_tree_position
-         FROM sapling_received_notes
-         INNER JOIN transactions ON transactions.id_tx = sapling_received_notes.tx
-         WHERE account = :account
-         AND commitment_tree_position IS NOT NULL
-         AND spent IS NULL
-         AND transactions.block <= :anchor_height
-         AND id_note NOT IN rarray(:exclude)
-         AND NOT EXISTS (
-            SELECT 1 FROM v_sapling_shard_unscanned_ranges unscanned
-            -- select all the unscanned ranges involving the shard containing this note
-            WHERE sapling_received_notes.commitment_tree_position >= unscanned.start_position
-            AND sapling_received_notes.commitment_tree_position < unscanned.end_position_exclusive
-            -- exclude unscanned ranges that start above the anchor height (they don't affect spendability)
-            AND unscanned.block_range_start <= :anchor_height
-            -- exclude unscanned ranges that end below the wallet birthday
-            AND unscanned.block_range_end > :wallet_birthday
-         )",
-    )?;
-
-    let excluded: Vec<Value> = exclude.iter().map(|n| Value::from(n.0)).collect();
-    let excluded_ptr = Rc::new(excluded);
-
-    let notes = stmt_select_notes.query_and_then(
-        named_params![
-            ":account": u32::from(account),
-            ":anchor_height": u32::from(anchor_height),
-            ":exclude": &excluded_ptr,
-            ":wallet_birthday": u32::from(birthday_height)
-        ],
-        to_spendable_note,
-    )?;
-
-    notes.collect::<Result<_, _>>()
-}
-
-pub(crate) fn select_spendable_sapling_notes(
-    conn: &Connection,
+    params: &P,
     account: AccountId,
     target_value: Amount,
     anchor_height: BlockHeight,
     exclude: &[ReceivedNoteId],
-) -> Result<Vec<ReceivedSaplingNote<ReceivedNoteId>>, SqliteClientError> {
+) -> Result<Vec<ReceivedNote<ReceivedNoteId, Note>>, SqliteClientError> {
     let birthday_height = match wallet_birthday(conn)? {
         Some(birthday) => birthday,
         None => {
@@ -244,13 +271,16 @@ pub(crate) fn select_spendable_sapling_notes(
     // 4) Match the selected notes against the witnesses at the desired height.
     let mut stmt_select_notes = conn.prepare_cached(
         "WITH eligible AS (
-             SELECT id_note, diversifier, value, rcm, commitment_tree_position,
+             SELECT
+                 id_note, txid, output_index, diversifier, value, rcm, commitment_tree_position,
                  SUM(value)
-                    OVER (PARTITION BY account, spent ORDER BY id_note) AS so_far
+                    OVER (PARTITION BY sapling_received_notes.account, spent ORDER BY id_note) AS so_far,
+                 accounts.ufvk as ufvk, recipient_key_scope
              FROM sapling_received_notes
+             INNER JOIN accounts on accounts.account = sapling_received_notes.account
              INNER JOIN transactions
                 ON transactions.id_tx = sapling_received_notes.tx
-             WHERE account = :account
+             WHERE sapling_received_notes.account = :account
              AND commitment_tree_position IS NOT NULL
              AND spent IS NULL
              AND transactions.block <= :anchor_height
@@ -266,10 +296,10 @@ pub(crate) fn select_spendable_sapling_notes(
                 AND unscanned.block_range_end > :wallet_birthday
              )
          )
-         SELECT id_note, diversifier, value, rcm, commitment_tree_position
+         SELECT id_note, txid, output_index, diversifier, value, rcm, commitment_tree_position, ufvk, recipient_key_scope
          FROM eligible WHERE so_far < :target_value
          UNION
-         SELECT id_note, diversifier, value, rcm, commitment_tree_position
+         SELECT id_note, txid, output_index, diversifier, value, rcm, commitment_tree_position, ufvk, recipient_key_scope
          FROM (SELECT * from eligible WHERE so_far >= :target_value LIMIT 1)",
     )?;
 
@@ -284,7 +314,7 @@ pub(crate) fn select_spendable_sapling_notes(
             ":exclude": &excluded_ptr,
             ":wallet_birthday": u32::from(birthday_height)
         ],
-        to_spendable_note,
+        |r| to_spendable_note(params, r),
     )?;
 
     notes.collect::<Result<_, _>>()
@@ -308,13 +338,12 @@ pub(crate) fn get_sapling_nullifiers(
          WHERE block IS NULL
          AND nf IS NOT NULL",
     )?;
-    let nullifiers = stmt_fetch_nullifiers.query_map([], |row| {
+    let nullifiers = stmt_fetch_nullifiers.query_and_then([], |row| {
         let account: u32 = row.get(1)?;
         let nf_bytes: Vec<u8> = row.get(2)?;
-        Ok((
-            AccountId::from(account),
-            sapling::Nullifier::from_slice(&nf_bytes).unwrap(),
-        ))
+        AccountId::try_from(account)
+            .map_err(|_| SqliteClientError::AccountIdOutOfRange)
+            .map(|a| (a, sapling::Nullifier::from_slice(&nf_bytes).unwrap()))
     })?;
 
     let res: Vec<_> = nullifiers.collect::<Result<_, _>>()?;
@@ -331,13 +360,12 @@ pub(crate) fn get_all_sapling_nullifiers(
          FROM sapling_received_notes rn
          WHERE nf IS NOT NULL",
     )?;
-    let nullifiers = stmt_fetch_nullifiers.query_map([], |row| {
+    let nullifiers = stmt_fetch_nullifiers.query_and_then([], |row| {
         let account: u32 = row.get(1)?;
         let nf_bytes: Vec<u8> = row.get(2)?;
-        Ok((
-            AccountId::from(account),
-            sapling::Nullifier::from_slice(&nf_bytes).unwrap(),
-        ))
+        AccountId::try_from(account)
+            .map_err(|_| SqliteClientError::AccountIdOutOfRange)
+            .map(|a| (a, sapling::Nullifier::from_slice(&nf_bytes).unwrap()))
     })?;
 
     let res: Vec<_> = nullifiers.collect::<Result<_, _>>()?;
@@ -377,7 +405,9 @@ pub(crate) fn put_received_note<T: ReceivedSaplingOutput>(
 ) -> Result<(), SqliteClientError> {
     let mut stmt_upsert_received_note = conn.prepare_cached(
         "INSERT INTO sapling_received_notes
-        (tx, output_index, account, diversifier, value, rcm, memo, nf, is_change, spent, commitment_tree_position)
+        (tx, output_index, account, diversifier, value, rcm, memo, nf,
+         is_change, spent, commitment_tree_position,
+         recipient_key_scope)
         VALUES (
             :tx,
             :output_index,
@@ -389,7 +419,8 @@ pub(crate) fn put_received_note<T: ReceivedSaplingOutput>(
             :nf,
             :is_change,
             :spent,
-            :commitment_tree_position
+            :commitment_tree_position,
+            :recipient_key_scope
         )
         ON CONFLICT (tx, output_index) DO UPDATE
         SET account = :account,
@@ -400,7 +431,8 @@ pub(crate) fn put_received_note<T: ReceivedSaplingOutput>(
             memo = IFNULL(:memo, memo),
             is_change = IFNULL(:is_change, is_change),
             spent = IFNULL(:spent, spent),
-            commitment_tree_position = IFNULL(:commitment_tree_position, commitment_tree_position)",
+            commitment_tree_position = IFNULL(:commitment_tree_position, commitment_tree_position),
+            recipient_key_scope = :recipient_key_scope",
     )?;
 
     let rcm = output.note().rcm().to_repr();
@@ -419,6 +451,7 @@ pub(crate) fn put_received_note<T: ReceivedSaplingOutput>(
         ":is_change": output.is_change(),
         ":spent": spent_in,
         ":commitment_tree_position": output.note_commitment_tree_position().map(u64::from),
+        ":recipient_key_scope": scope_code(output.recipient_key_scope()),
     ];
 
     stmt_upsert_received_note
@@ -429,57 +462,59 @@ pub(crate) fn put_received_note<T: ReceivedSaplingOutput>(
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 pub(crate) mod tests {
     use std::{convert::Infallible, num::NonZeroU32};
 
     use incrementalmerkletree::Hashable;
+    use rusqlite::params;
     use secrecy::Secret;
     use zcash_proofs::prover::LocalTxProver;
 
+    use sapling::{
+        self,
+        note_encryption::try_sapling_output_recovery,
+        prover::{OutputProver, SpendProver},
+        zip32::ExtendedSpendingKey,
+        Node, PaymentAddress,
+    };
     use zcash_primitives::{
         block::BlockHash,
-        consensus::BranchId,
+        consensus::{sapling_zip212_enforcement, BranchId},
         legacy::TransparentAddress,
         memo::{Memo, MemoBytes},
-        sapling::{
-            note_encryption::try_sapling_output_recovery, prover::TxProver, Node, Note,
-            PaymentAddress,
-        },
         transaction::{
-            components::{
-                amount::{BalanceError, NonNegativeAmount},
-                Amount,
+            components::{amount::NonNegativeAmount, Amount},
+            fees::{
+                fixed::FeeRule as FixedFeeRule, zip317::FeeError as Zip317FeeError, StandardFeeRule,
             },
-            fees::{fixed::FeeRule as FixedFeeRule, zip317::FeeRule as Zip317FeeRule},
             Transaction,
         },
-        zip32::{sapling::ExtendedSpendingKey, Scope},
+        zip32::Scope,
     };
 
     use zcash_client_backend::{
-        address::RecipientAddress,
+        address::Address,
         data_api::{
             self,
             chain::CommitmentTreeRoot,
             error::Error,
             wallet::input_selection::{GreedyInputSelector, GreedyInputSelectorError},
-            AccountBirthday, Ratio, ShieldedProtocol, WalletCommitmentTrees, WalletRead,
-            WalletWrite,
+            AccountBirthday, Ratio, WalletCommitmentTrees, WalletRead, WalletWrite,
         },
         decrypt_transaction,
-        fees::{fixed, zip317, DustOutputPolicy},
+        fees::{fixed, standard, DustOutputPolicy},
         keys::UnifiedSpendingKey,
         wallet::OvkPolicy,
         zip321::{self, Payment, TransactionRequest},
+        ShieldedProtocol,
     };
 
     use crate::{
         error::SqliteClientError,
-        testing::{AddressType, BlockCache, TestBuilder, TestState},
+        testing::{input_selector, AddressType, BlockCache, TestBuilder, TestState},
         wallet::{
-            block_max_scanned, commitment_tree, sapling::select_spendable_sapling_notes,
-            scanning::tests::test_with_canopy_birthday,
+            block_max_scanned, commitment_tree, parse_scope,
+            sapling::select_spendable_sapling_notes, scanning::tests::test_with_canopy_birthday,
         },
         AccountId, NoteId, ReceivedNoteId,
     };
@@ -490,13 +525,8 @@ pub(crate) mod tests {
         zcash_primitives::transaction::components::{OutPoint, TxOut},
     };
 
-    pub(crate) fn test_prover() -> impl TxProver {
-        match LocalTxProver::with_default_location() {
-            Some(tx_prover) => tx_prover,
-            None => {
-                panic!("Cannot locate the Zcash parameters. Please run zcash-fetch-params or fetch-params.sh to download the parameters, and then re-run the tests.");
-            }
-        }
+    pub(crate) fn test_prover() -> impl SpendProver + OutputProver {
+        LocalTxProver::bundled()
     }
 
     #[test]
@@ -510,8 +540,8 @@ pub(crate) mod tests {
         let dfvk = st.test_account_sapling().unwrap();
 
         // Add funds to the wallet in a single note
-        let value = NonNegativeAmount::from_u64(60000).unwrap();
-        let (h, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value.into());
+        let value = NonNegativeAmount::const_from_u64(60000);
+        let (h, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
         st.scan_cached_blocks(h, 1);
 
         // Spendable balance matches total balance
@@ -519,7 +549,7 @@ pub(crate) mod tests {
         assert_eq!(st.get_spendable_balance(account, 1), value);
 
         assert_eq!(
-            block_max_scanned(&st.wallet().conn)
+            block_max_scanned(&st.wallet().conn, &st.wallet().params)
                 .unwrap()
                 .unwrap()
                 .block_height(),
@@ -527,10 +557,10 @@ pub(crate) mod tests {
         );
 
         let to_extsk = ExtendedSpendingKey::master(&[]);
-        let to: RecipientAddress = to_extsk.default_address().1.into();
+        let to: Address = to_extsk.default_address().1.into();
         let request = zip321::TransactionRequest::new(vec![Payment {
             recipient_address: to,
-            amount: Amount::from_u64(10000).unwrap(),
+            amount: NonNegativeAmount::const_from_u64(10000),
             memo: None, // this should result in the creation of an empty memo
             label: None,
             message: None,
@@ -538,26 +568,28 @@ pub(crate) mod tests {
         }])
         .unwrap();
 
-        let fee_rule = FixedFeeRule::standard();
-        let change_strategy = fixed::SingleOutputChangeStrategy::new(fee_rule);
-        let input_selector =
-            &GreedyInputSelector::new(change_strategy, DustOutputPolicy::default());
-        let proposal_result = st.propose_transfer(
-            account,
-            input_selector,
-            request,
-            NonZeroU32::new(1).unwrap(),
-        );
-        assert_matches!(proposal_result, Ok(_));
+        // TODO: This test was originally written to use the pre-zip-313 fee rule
+        // and has not yet been updated.
+        #[allow(deprecated)]
+        let fee_rule = StandardFeeRule::PreZip313;
 
         let change_memo = "Test change memo".parse::<Memo>().unwrap();
-        let create_proposed_result = st.create_proposed_transaction(
-            &usk,
-            OvkPolicy::Sender,
-            proposal_result.unwrap(),
-            NonZeroU32::new(1).unwrap(),
-            Some(change_memo.clone().into()),
-        );
+        let change_strategy =
+            standard::SingleOutputChangeStrategy::new(fee_rule, Some(change_memo.clone().into()));
+        let input_selector =
+            &GreedyInputSelector::new(change_strategy, DustOutputPolicy::default());
+
+        let proposal = st
+            .propose_transfer(
+                account,
+                input_selector,
+                request,
+                NonZeroU32::new(1).unwrap(),
+            )
+            .unwrap();
+
+        let create_proposed_result =
+            st.create_proposed_transaction::<Infallible, _>(&usk, OvkPolicy::Sender, &proposal);
         assert_matches!(create_proposed_result, Ok(_));
 
         let sent_tx_id = create_proposed_result.unwrap();
@@ -646,6 +678,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn create_to_address_fails_on_incorrect_usk() {
         let mut st = TestBuilder::new()
             .with_test_account(AccountBirthday::from_sapling_activation)
@@ -654,7 +687,7 @@ pub(crate) mod tests {
         let to = dfvk.default_address().1.into();
 
         // Create a USK that doesn't exist in the wallet
-        let acct1 = AccountId::from(1);
+        let acct1 = AccountId::try_from(1).unwrap();
         let usk1 = UnifiedSpendingKey::from_seed(&st.network(), &[1u8; 32], acct1).unwrap();
 
         // Attempting to spend with a USK that is not in the wallet results in an error
@@ -662,22 +695,24 @@ pub(crate) mod tests {
             st.create_spend_to_address(
                 &usk1,
                 &to,
-                Amount::from_u64(1).unwrap(),
+                NonNegativeAmount::const_from_u64(1),
                 None,
                 OvkPolicy::Sender,
                 NonZeroU32::new(1).unwrap(),
+                None
             ),
             Err(data_api::error::Error::KeyNotRecognized)
         );
     }
 
     #[test]
-    fn create_to_address_fails_with_no_blocks() {
+    #[allow(deprecated)]
+    fn proposal_fails_with_no_blocks() {
         let mut st = TestBuilder::new()
             .with_test_account(AccountBirthday::from_sapling_activation)
             .build();
 
-        let (_, usk, _) = st.test_account().unwrap();
+        let (account, _, _) = st.test_account().unwrap();
         let dfvk = st.test_account_sapling().unwrap();
         let to = dfvk.default_address().1.into();
 
@@ -686,20 +721,21 @@ pub(crate) mod tests {
 
         // We cannot do anything if we aren't synchronised
         assert_matches!(
-            st.create_spend_to_address(
-                &usk,
-                &to,
-                Amount::from_u64(1).unwrap(),
-                None,
-                OvkPolicy::Sender,
+            st.propose_standard_transfer::<Infallible>(
+                account,
+                StandardFeeRule::PreZip313,
                 NonZeroU32::new(1).unwrap(),
+                &to,
+                NonNegativeAmount::const_from_u64(1),
+                None,
+                None
             ),
             Err(data_api::error::Error::ScanRequired)
         );
     }
 
     #[test]
-    fn create_to_address_fails_on_unverified_notes() {
+    fn spend_fails_on_unverified_notes() {
         let mut st = TestBuilder::new()
             .with_block_cache()
             .with_test_account(AccountBirthday::from_sapling_activation)
@@ -709,8 +745,8 @@ pub(crate) mod tests {
         let dfvk = st.test_account_sapling().unwrap();
 
         // Add funds to the wallet in a single note
-        let value = NonNegativeAmount::from_u64(50000).unwrap();
-        let (h1, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value.into());
+        let value = NonNegativeAmount::const_from_u64(50000);
+        let (h1, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
         st.scan_cached_blocks(h1, 1);
 
         // Spendable balance matches total balance at 1 confirmation.
@@ -732,7 +768,7 @@ pub(crate) mod tests {
         );
 
         // Add more funds to the wallet in a second note
-        let (h2, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value.into());
+        let (h2, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
         st.scan_cached_blocks(h2, 1);
 
         // Verified balance does not include the second note
@@ -752,26 +788,27 @@ pub(crate) mod tests {
         let extsk2 = ExtendedSpendingKey::master(&[]);
         let to = extsk2.default_address().1.into();
         assert_matches!(
-            st.create_spend_to_address(
-                &usk,
+            st.propose_standard_transfer::<Infallible>(
+                account,
+                StandardFeeRule::Zip317,
+                NonZeroU32::new(2).unwrap(),
                 &to,
-                Amount::from_u64(70000).unwrap(),
+                NonNegativeAmount::const_from_u64(70000),
                 None,
-                OvkPolicy::Sender,
-                NonZeroU32::new(10).unwrap(),
+                None
             ),
             Err(data_api::error::Error::InsufficientFunds {
                 available,
                 required
             })
-            if available == Amount::from_u64(50000).unwrap()
-                && required == Amount::from_u64(80000).unwrap()
+            if available == NonNegativeAmount::const_from_u64(50000)
+                && required == NonNegativeAmount::const_from_u64(80000)
         );
 
         // Mine blocks SAPLING_ACTIVATION_HEIGHT + 2 to 9 until just before the second
         // note is verified
         for _ in 2..10 {
-            st.generate_next_block(&dfvk, AddressType::DefaultExternal, value.into());
+            st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
         }
         st.scan_cached_blocks(h2 + 1, 8);
 
@@ -780,24 +817,25 @@ pub(crate) mod tests {
 
         // Spend still fails
         assert_matches!(
-            st.create_spend_to_address(
-                &usk,
-                &to,
-                Amount::from_u64(70000).unwrap(),
-                None,
-                OvkPolicy::Sender,
+            st.propose_standard_transfer::<Infallible>(
+                account,
+                StandardFeeRule::Zip317,
                 NonZeroU32::new(10).unwrap(),
+                &to,
+                NonNegativeAmount::const_from_u64(70000),
+                None,
+                None
             ),
             Err(data_api::error::Error::InsufficientFunds {
                 available,
                 required
             })
-            if available == Amount::from_u64(50000).unwrap()
-                && required == Amount::from_u64(80000).unwrap()
+            if available == NonNegativeAmount::const_from_u64(50000)
+                && required == NonNegativeAmount::const_from_u64(80000)
         );
 
         // Mine block 11 so that the second note becomes verified
-        let (h11, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value.into());
+        let (h11, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
         st.scan_cached_blocks(h11, 1);
 
         // Total balance is value * number of blocks scanned (11).
@@ -809,17 +847,24 @@ pub(crate) mod tests {
             (value * 9).unwrap()
         );
 
-        // Spend should now succeed
+        // Should now be able to generate a proposal
         let amount_sent = NonNegativeAmount::from_u64(70000).unwrap();
-        let txid = st
-            .create_spend_to_address(
-                &usk,
+        let min_confirmations = NonZeroU32::new(10).unwrap();
+        let proposal = st
+            .propose_standard_transfer::<Infallible>(
+                account,
+                StandardFeeRule::Zip317,
+                min_confirmations,
                 &to,
-                amount_sent.into(),
+                amount_sent,
                 None,
-                OvkPolicy::Sender,
-                NonZeroU32::new(10).unwrap(),
+                None,
             )
+            .unwrap();
+
+        // Executing the proposal should succeed
+        let txid = st
+            .create_proposed_transaction::<Infallible, _>(&usk, OvkPolicy::Sender, &proposal)
             .unwrap();
 
         let (h, _) = st.generate_next_block_including(txid);
@@ -835,7 +880,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn create_to_address_fails_on_locked_notes() {
+    fn spend_fails_on_locked_notes() {
         let mut st = TestBuilder::new()
             .with_block_cache()
             .with_test_account(AccountBirthday::from_sapling_activation)
@@ -844,9 +889,14 @@ pub(crate) mod tests {
         let (account, usk, _) = st.test_account().unwrap();
         let dfvk = st.test_account_sapling().unwrap();
 
+        // TODO: This test was originally written to use the pre-zip-313 fee rule
+        // and has not yet been updated.
+        #[allow(deprecated)]
+        let fee_rule = StandardFeeRule::PreZip313;
+
         // Add funds to the wallet in a single note
-        let value = NonNegativeAmount::from_u64(50000).unwrap();
-        let (h1, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value.into());
+        let value = NonNegativeAmount::const_from_u64(50000);
+        let (h1, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
         st.scan_cached_blocks(h1, 1);
 
         // Spendable balance matches total balance at 1 confirmation.
@@ -856,33 +906,41 @@ pub(crate) mod tests {
         // Send some of the funds to another address, but don't mine the tx.
         let extsk2 = ExtendedSpendingKey::master(&[]);
         let to = extsk2.default_address().1.into();
-        assert_matches!(
-            st.create_spend_to_address(
-                &usk,
+        let min_confirmations = NonZeroU32::new(1).unwrap();
+        let proposal = st
+            .propose_standard_transfer::<Infallible>(
+                account,
+                fee_rule,
+                min_confirmations,
                 &to,
-                Amount::from_u64(15000).unwrap(),
+                NonNegativeAmount::const_from_u64(15000),
                 None,
-                OvkPolicy::Sender,
-                NonZeroU32::new(1).unwrap(),
-            ),
+                None,
+            )
+            .unwrap();
+
+        // Executing the proposal should succeed
+        assert_matches!(
+            st.create_proposed_transaction::<Infallible, _>(&usk, OvkPolicy::Sender, &proposal,),
             Ok(_)
         );
 
-        // A second spend fails because there are no usable notes
+        // A second proposal fails because there are no usable notes
         assert_matches!(
-            st.create_spend_to_address(
-                &usk,
-                &to,
-                Amount::from_u64(2000).unwrap(),
-                None,
-                OvkPolicy::Sender,
+            st.propose_standard_transfer::<Infallible>(
+                account,
+                fee_rule,
                 NonZeroU32::new(1).unwrap(),
+                &to,
+                NonNegativeAmount::const_from_u64(2000),
+                None,
+                None
             ),
             Err(data_api::error::Error::InsufficientFunds {
                 available,
                 required
             })
-            if available == Amount::zero() && required == Amount::from_u64(12000).unwrap()
+            if available == NonNegativeAmount::ZERO && required == NonNegativeAmount::const_from_u64(12000)
         );
 
         // Mine blocks SAPLING_ACTIVATION_HEIGHT + 1 to 41 (that don't send us funds)
@@ -891,33 +949,34 @@ pub(crate) mod tests {
             st.generate_next_block(
                 &ExtendedSpendingKey::master(&[i as u8]).to_diversifiable_full_viewing_key(),
                 AddressType::DefaultExternal,
-                value.into(),
+                value,
             );
         }
         st.scan_cached_blocks(h1 + 1, 41);
 
-        // Second spend still fails
+        // Second proposal still fails
         assert_matches!(
-            st.create_spend_to_address(
-                &usk,
-                &to,
-                Amount::from_u64(2000).unwrap(),
-                None,
-                OvkPolicy::Sender,
+            st.propose_standard_transfer::<Infallible>(
+                account,
+                fee_rule,
                 NonZeroU32::new(1).unwrap(),
+                &to,
+                NonNegativeAmount::const_from_u64(2000),
+                None,
+                None
             ),
             Err(data_api::error::Error::InsufficientFunds {
                 available,
                 required
             })
-            if available == Amount::zero() && required == Amount::from_u64(12000).unwrap()
+            if available == NonNegativeAmount::ZERO && required == NonNegativeAmount::const_from_u64(12000)
         );
 
         // Mine block SAPLING_ACTIVATION_HEIGHT + 42 so that the first transaction expires
         let (h43, _, _) = st.generate_next_block(
             &ExtendedSpendingKey::master(&[42]).to_diversifiable_full_viewing_key(),
             AddressType::DefaultExternal,
-            value.into(),
+            value,
         );
         st.scan_cached_blocks(h43, 1);
 
@@ -926,16 +985,22 @@ pub(crate) mod tests {
         assert_eq!(st.get_spendable_balance(account, 1), value);
 
         // Second spend should now succeed
-        let amount_sent2 = NonNegativeAmount::from_u64(2000).unwrap();
-        let txid2 = st
-            .create_spend_to_address(
-                &usk,
+        let amount_sent2 = NonNegativeAmount::const_from_u64(2000);
+        let min_confirmations = NonZeroU32::new(1).unwrap();
+        let proposal = st
+            .propose_standard_transfer::<Infallible>(
+                account,
+                fee_rule,
+                min_confirmations,
                 &to,
-                amount_sent2.into(),
+                amount_sent2,
                 None,
-                OvkPolicy::Sender,
-                NonZeroU32::new(1).unwrap(),
+                None,
             )
+            .unwrap();
+
+        let txid2 = st
+            .create_proposed_transaction::<Infallible, _>(&usk, OvkPolicy::Sender, &proposal)
             .unwrap();
 
         let (h, _) = st.generate_next_block_including(txid2);
@@ -960,8 +1025,8 @@ pub(crate) mod tests {
         let dfvk = st.test_account_sapling().unwrap();
 
         // Add funds to the wallet in a single note
-        let value = NonNegativeAmount::from_u64(50000).unwrap();
-        let (h1, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value.into());
+        let value = NonNegativeAmount::const_from_u64(50000);
+        let (h1, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
         st.scan_cached_blocks(h1, 1);
 
         // Spendable balance matches total balance at 1 confirmation.
@@ -972,27 +1037,36 @@ pub(crate) mod tests {
         let addr2 = extsk2.default_address().1;
         let to = addr2.into();
 
+        // TODO: This test was originally written to use the pre-zip-313 fee rule
+        // and has not yet been updated.
+        #[allow(deprecated)]
+        let fee_rule = StandardFeeRule::PreZip313;
+
         #[allow(clippy::type_complexity)]
         let send_and_recover_with_policy = |st: &mut TestState<BlockCache>,
                                             ovk_policy|
          -> Result<
-            Option<(Note, PaymentAddress, MemoBytes)>,
+            Option<(sapling::Note, PaymentAddress, MemoBytes)>,
             Error<
                 SqliteClientError,
                 commitment_tree::Error,
-                GreedyInputSelectorError<BalanceError, ReceivedNoteId>,
-                Infallible,
-                ReceivedNoteId,
+                GreedyInputSelectorError<Zip317FeeError, ReceivedNoteId>,
+                Zip317FeeError,
             >,
         > {
-            let txid = st.create_spend_to_address(
-                &usk,
+            let min_confirmations = NonZeroU32::new(1).unwrap();
+            let proposal = st.propose_standard_transfer(
+                account,
+                fee_rule,
+                min_confirmations,
                 &to,
-                Amount::from_u64(15000).unwrap(),
+                NonNegativeAmount::const_from_u64(15000),
                 None,
-                ovk_policy,
-                NonZeroU32::new(1).unwrap(),
+                None,
             )?;
+
+            // Executing the proposal should succeed
+            let txid = st.create_proposed_transaction(&usk, ovk_policy, &proposal)?;
 
             // Fetch the transaction from the database
             let raw_tx: Vec<_> = st
@@ -1010,14 +1084,19 @@ pub(crate) mod tests {
             for output in tx.sapling_bundle().unwrap().shielded_outputs() {
                 // Find the output that decrypts with the external OVK
                 let result = try_sapling_output_recovery(
-                    &st.network(),
-                    h1,
                     &dfvk.to_ovk(Scope::External),
                     output,
+                    sapling_zip212_enforcement(&st.network(), h1),
                 );
 
                 if result.is_some() {
-                    return Ok(result);
+                    return Ok(result.map(|(note, addr, memo)| {
+                        (
+                            note,
+                            addr,
+                            MemoBytes::from_bytes(&memo).expect("correct length"),
+                        )
+                    }));
                 }
             }
 
@@ -1037,7 +1116,7 @@ pub(crate) mod tests {
             st.generate_next_block(
                 &ExtendedSpendingKey::master(&[i as u8]).to_diversifiable_full_viewing_key(),
                 AddressType::DefaultExternal,
-                value.into(),
+                value,
             );
         }
         st.scan_cached_blocks(h1 + 1, 42);
@@ -1051,7 +1130,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn create_to_address_succeeds_to_t_addr_zero_change() {
+    fn spend_succeeds_to_t_addr_zero_change() {
         let mut st = TestBuilder::new()
             .with_block_cache()
             .with_test_account(AccountBirthday::from_sapling_activation)
@@ -1061,31 +1140,43 @@ pub(crate) mod tests {
         let dfvk = st.test_account_sapling().unwrap();
 
         // Add funds to the wallet in a single note
-        let value = NonNegativeAmount::from_u64(60000).unwrap();
-        let (h, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value.into());
+        let value = NonNegativeAmount::const_from_u64(60000);
+        let (h, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
         st.scan_cached_blocks(h, 1);
 
         // Spendable balance matches total balance at 1 confirmation.
         assert_eq!(st.get_total_balance(account), value);
         assert_eq!(st.get_spendable_balance(account, 1), value);
 
+        // TODO: This test was originally written to use the pre-zip-313 fee rule
+        // and has not yet been updated.
+        #[allow(deprecated)]
+        let fee_rule = StandardFeeRule::PreZip313;
+
         // TODO: generate_next_block_from_tx does not currently support transparent outputs.
         let to = TransparentAddress::PublicKey([7; 20]).into();
-        assert_matches!(
-            st.create_spend_to_address(
-                &usk,
+        let min_confirmations = NonZeroU32::new(1).unwrap();
+        let proposal = st
+            .propose_standard_transfer::<Infallible>(
+                account,
+                fee_rule,
+                min_confirmations,
                 &to,
-                Amount::from_u64(50000).unwrap(),
+                NonNegativeAmount::const_from_u64(50000),
                 None,
-                OvkPolicy::Sender,
-                NonZeroU32::new(1).unwrap(),
-            ),
+                None,
+            )
+            .unwrap();
+
+        // Executing the proposal should succeed
+        assert_matches!(
+            st.create_proposed_transaction::<Infallible, _>(&usk, OvkPolicy::Sender, &proposal),
             Ok(_)
         );
     }
 
     #[test]
-    fn create_to_address_spends_a_change_note() {
+    fn change_note_spends_succeed() {
         let mut st = TestBuilder::new()
             .with_block_cache()
             .with_test_account(AccountBirthday::from_sapling_activation)
@@ -1095,8 +1186,8 @@ pub(crate) mod tests {
         let dfvk = st.test_account_sapling().unwrap();
 
         // Add funds to the wallet in a single note owned by the internal spending key
-        let value = NonNegativeAmount::from_u64(60000).unwrap();
-        let (h, _, _) = st.generate_next_block(&dfvk, AddressType::Internal, value.into());
+        let value = NonNegativeAmount::const_from_u64(60000);
+        let (h, _, _) = st.generate_next_block(&dfvk, AddressType::Internal, value);
         st.scan_cached_blocks(h, 1);
 
         // Spendable balance matches total balance at 1 confirmation.
@@ -1110,17 +1201,38 @@ pub(crate) mod tests {
             NonNegativeAmount::ZERO
         );
 
+        let change_note_scope = st.wallet().conn.query_row(
+            "SELECT recipient_key_scope
+             FROM sapling_received_notes
+             WHERE value = ?",
+            params![u64::from(value)],
+            |row| Ok(parse_scope(row.get(0)?)),
+        );
+        assert_matches!(change_note_scope, Ok(Some(Scope::Internal)));
+
+        // TODO: This test was originally written to use the pre-zip-313 fee rule
+        // and has not yet been updated.
+        #[allow(deprecated)]
+        let fee_rule = StandardFeeRule::PreZip313;
+
         // TODO: generate_next_block_from_tx does not currently support transparent outputs.
         let to = TransparentAddress::PublicKey([7; 20]).into();
-        assert_matches!(
-            st.create_spend_to_address(
-                &usk,
+        let min_confirmations = NonZeroU32::new(1).unwrap();
+        let proposal = st
+            .propose_standard_transfer::<Infallible>(
+                account,
+                fee_rule,
+                min_confirmations,
                 &to,
-                Amount::from_u64(50000).unwrap(),
+                NonNegativeAmount::const_from_u64(50000),
                 None,
-                OvkPolicy::Sender,
-                NonZeroU32::new(1).unwrap(),
-            ),
+                None,
+            )
+            .unwrap();
+
+        // Executing the proposal should succeed
+        assert_matches!(
+            st.create_proposed_transaction::<Infallible, _>(&usk, OvkPolicy::Sender, &proposal),
             Ok(_)
         );
     }
@@ -1146,15 +1258,15 @@ pub(crate) mod tests {
 
         // Add funds to the wallet in a single note
         let value = NonNegativeAmount::from_u64(100000).unwrap();
-        let (h, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value.into());
+        let (h, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
         st.scan_cached_blocks(h, 1);
 
         // Spendable balance matches total balance
-        assert_eq!(st.get_total_balance(AccountId::from(0)), value);
-        assert_eq!(st.get_spendable_balance(AccountId::from(0), 1), value);
+        assert_eq!(st.get_total_balance(AccountId::ZERO), value);
+        assert_eq!(st.get_spendable_balance(AccountId::ZERO, 1), value);
         assert_eq!(
-            st.get_total_balance(AccountId::from(1)),
-            NonNegativeAmount::ZERO
+            st.get_total_balance(AccountId::try_from(1).unwrap()),
+            NonNegativeAmount::ZERO,
         );
 
         let amount_sent = NonNegativeAmount::from_u64(20000).unwrap();
@@ -1164,8 +1276,8 @@ pub(crate) mod tests {
         let req = TransactionRequest::new(vec![
             // payment to an external recipient
             Payment {
-                recipient_address: RecipientAddress::Shielded(addr2),
-                amount: amount_sent.into(),
+                recipient_address: Address::Sapling(addr2),
+                amount: amount_sent,
                 memo: None,
                 label: None,
                 message: None,
@@ -1173,8 +1285,8 @@ pub(crate) mod tests {
             },
             // payment back to the originating wallet, simulating legacy change
             Payment {
-                recipient_address: RecipientAddress::Shielded(addr),
-                amount: amount_legacy_change.into(),
+                recipient_address: Address::Sapling(addr),
+                amount: amount_legacy_change,
                 memo: None,
                 label: None,
                 message: None,
@@ -1183,9 +1295,10 @@ pub(crate) mod tests {
         ])
         .unwrap();
 
+        #[allow(deprecated)]
         let fee_rule = FixedFeeRule::standard();
         let input_selector = GreedyInputSelector::new(
-            fixed::SingleOutputChangeStrategy::new(fee_rule),
+            fixed::SingleOutputChangeStrategy::new(fee_rule, None),
             DustOutputPolicy::default(),
         );
 
@@ -1199,20 +1312,22 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        let amount_left =
-            (value - (amount_sent + fee_rule.fixed_fee().try_into().unwrap()).unwrap()).unwrap();
+        let amount_left = (value - (amount_sent + fee_rule.fixed_fee()).unwrap()).unwrap();
         let pending_change = (amount_left - amount_legacy_change).unwrap();
 
         // The "legacy change" is not counted by get_pending_change().
-        assert_eq!(st.get_pending_change(AccountId::from(0), 1), pending_change);
+        assert_eq!(st.get_pending_change(AccountId::ZERO, 1), pending_change);
         // We spent the only note so we only have pending change.
-        assert_eq!(st.get_total_balance(AccountId::from(0)), pending_change);
+        assert_eq!(st.get_total_balance(AccountId::ZERO), pending_change);
 
         let (h, _) = st.generate_next_block_including(txid);
         st.scan_cached_blocks(h, 1);
 
-        assert_eq!(st.get_total_balance(AccountId::from(1)), amount_sent);
-        assert_eq!(st.get_total_balance(AccountId::from(0)), amount_left);
+        assert_eq!(
+            st.get_total_balance(AccountId::try_from(1).unwrap()),
+            amount_sent,
+        );
+        assert_eq!(st.get_total_balance(AccountId::ZERO), amount_left);
 
         st.reset();
 
@@ -1240,8 +1355,11 @@ pub(crate) mod tests {
 
         st.scan_cached_blocks(st.sapling_activation_height(), 2);
 
-        assert_eq!(st.get_total_balance(AccountId::from(1)), amount_sent);
-        assert_eq!(st.get_total_balance(AccountId::from(0)), amount_left);
+        assert_eq!(
+            st.get_total_balance(AccountId::try_from(1).unwrap()),
+            amount_sent,
+        );
+        assert_eq!(st.get_total_balance(AccountId::ZERO), amount_left);
     }
 
     #[test]
@@ -1258,7 +1376,7 @@ pub(crate) mod tests {
         let (h1, _, _) = st.generate_next_block(
             &dfvk,
             AddressType::Internal,
-            Amount::from_u64(50000).unwrap(),
+            NonNegativeAmount::const_from_u64(50000),
         );
 
         // Add 10 dust notes to the wallet
@@ -1266,26 +1384,23 @@ pub(crate) mod tests {
             st.generate_next_block(
                 &dfvk,
                 AddressType::DefaultExternal,
-                Amount::from_u64(1000).unwrap(),
+                NonNegativeAmount::const_from_u64(1000),
             );
         }
 
         st.scan_cached_blocks(h1, 11);
 
         // Spendable balance matches total balance
-        let total = NonNegativeAmount::from_u64(60000).unwrap();
+        let total = NonNegativeAmount::const_from_u64(60000);
         assert_eq!(st.get_total_balance(account), total);
         assert_eq!(st.get_spendable_balance(account, 1), total);
 
-        let input_selector = GreedyInputSelector::new(
-            zip317::SingleOutputChangeStrategy::new(Zip317FeeRule::standard()),
-            DustOutputPolicy::default(),
-        );
+        let input_selector = input_selector(StandardFeeRule::Zip317, None);
 
         // This first request will fail due to insufficient non-dust funds
         let req = TransactionRequest::new(vec![Payment {
-            recipient_address: RecipientAddress::Shielded(dfvk.default_address().1),
-            amount: Amount::from_u64(50000).unwrap(),
+            recipient_address: Address::Sapling(dfvk.default_address().1),
+            amount: NonNegativeAmount::const_from_u64(50000),
             memo: None,
             label: None,
             message: None,
@@ -1302,15 +1417,15 @@ pub(crate) mod tests {
                 NonZeroU32::new(1).unwrap(),
             ),
             Err(Error::InsufficientFunds { available, required })
-                if available == Amount::from_u64(51000).unwrap()
-                && required == Amount::from_u64(60000).unwrap()
+                if available == NonNegativeAmount::const_from_u64(51000)
+                && required == NonNegativeAmount::const_from_u64(60000)
         );
 
         // This request will succeed, spending a single dust input to pay the 10000
         // ZAT fee in addition to the 41000 ZAT output to the recipient
         let req = TransactionRequest::new(vec![Payment {
-            recipient_address: RecipientAddress::Shielded(dfvk.default_address().1),
-            amount: Amount::from_u64(41000).unwrap(),
+            recipient_address: Address::Sapling(dfvk.default_address().1),
+            amount: NonNegativeAmount::const_from_u64(41000),
             memo: None,
             label: None,
             message: None,
@@ -1336,7 +1451,7 @@ pub(crate) mod tests {
         // in the total balance.
         assert_eq!(
             st.get_total_balance(account),
-            (total - NonNegativeAmount::from_u64(10000).unwrap()).unwrap()
+            (total - NonNegativeAmount::const_from_u64(10000)).unwrap()
         );
     }
 
@@ -1362,14 +1477,14 @@ pub(crate) mod tests {
         let (h, _, _) = st.generate_next_block(
             &dfvk,
             AddressType::Internal,
-            Amount::from_u64(50000).unwrap(),
+            NonNegativeAmount::const_from_u64(50000),
         );
         st.scan_cached_blocks(h, 1);
 
         let utxo = WalletTransparentOutput::from_parts(
             OutPoint::new([1u8; 32], 1),
             TxOut {
-                value: Amount::from_u64(10000).unwrap(),
+                value: NonNegativeAmount::const_from_u64(10000),
                 script_pubkey: taddr.script(),
             },
             h,
@@ -1379,8 +1494,13 @@ pub(crate) mod tests {
         let res0 = st.wallet_mut().put_received_transparent_utxo(&utxo);
         assert!(matches!(res0, Ok(_)));
 
+        // TODO: This test was originally written to use the pre-zip-313 fee rule
+        // and has not yet been updated.
+        #[allow(deprecated)]
+        let fee_rule = StandardFeeRule::PreZip313;
+
         let input_selector = GreedyInputSelector::new(
-            fixed::SingleOutputChangeStrategy::new(FixedFeeRule::standard()),
+            standard::SingleOutputChangeStrategy::new(fee_rule, None),
             DustOutputPolicy::default(),
         );
 
@@ -1390,8 +1510,7 @@ pub(crate) mod tests {
                 NonNegativeAmount::from_u64(10000).unwrap(),
                 &usk,
                 &[*taddr],
-                &MemoBytes::empty(),
-                NonZeroU32::new(1).unwrap()
+                1
             ),
             Ok(_)
         );
@@ -1428,7 +1547,7 @@ pub(crate) mod tests {
 
         // Generate 9 blocks that have no value for us, starting at the birthday height.
         let not_our_key = ExtendedSpendingKey::master(&[]).to_diversifiable_full_viewing_key();
-        let not_our_value = Amount::const_from_i64(10000);
+        let not_our_value = NonNegativeAmount::const_from_u64(10000);
         st.generate_block_at(
             birthday.height(),
             BlockHash([0; 32]),
@@ -1445,7 +1564,7 @@ pub(crate) mod tests {
         st.generate_next_block(
             &dfvk,
             AddressType::DefaultExternal,
-            Amount::const_from_i64(500000),
+            NonNegativeAmount::const_from_u64(500000),
         );
 
         // Generate some more blocks to get above our anchor height
@@ -1460,7 +1579,8 @@ pub(crate) mod tests {
         // Verify that the received note is not considered spendable
         let spendable = select_spendable_sapling_notes(
             &st.wallet().conn,
-            AccountId::from(0),
+            &st.wallet().params,
+            AccountId::ZERO,
             Amount::const_from_i64(300000),
             received_tx_height + 10,
             &[],
@@ -1475,7 +1595,8 @@ pub(crate) mod tests {
         // Verify that the received note is now considered spendable
         let spendable = select_spendable_sapling_notes(
             &st.wallet().conn,
-            AccountId::from(0),
+            &st.wallet().params,
+            AccountId::ZERO,
             Amount::const_from_i64(300000),
             received_tx_height + 10,
             &[],
@@ -1499,14 +1620,14 @@ pub(crate) mod tests {
         st.generate_next_block(
             &dfvk,
             AddressType::DefaultExternal,
-            Amount::const_from_i64(500000),
+            NonNegativeAmount::const_from_u64(500000),
         );
         st.scan_cached_blocks(birthday.height(), 1);
 
         // Create a gap of 10 blocks having no shielded outputs, then add a block that doesn't
         // belong to us so that we can get a checkpoint in the tree.
         let not_our_key = ExtendedSpendingKey::master(&[]).to_diversifiable_full_viewing_key();
-        let not_our_value = Amount::const_from_i64(10000);
+        let not_our_value = NonNegativeAmount::const_from_u64(10000);
         st.generate_block_at(
             birthday.height() + 10,
             BlockHash([0; 32]),
@@ -1528,6 +1649,7 @@ pub(crate) mod tests {
         // Verify that our note is considered spendable
         let spendable = select_spendable_sapling_notes(
             &st.wallet().conn,
+            &st.wallet().params,
             account,
             Amount::const_from_i64(300000),
             birthday.height() + 5,
@@ -1542,10 +1664,11 @@ pub(crate) mod tests {
             st.create_spend_to_address(
                 &usk,
                 &to,
-                Amount::from_u64(10000).unwrap(),
+                NonNegativeAmount::const_from_u64(10000),
                 None,
                 OvkPolicy::Sender,
                 NonZeroU32::new(5).unwrap(),
+                None
             ),
             Ok(_)
         );

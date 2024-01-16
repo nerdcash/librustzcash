@@ -168,16 +168,17 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use zcash_client_backend::{
-        address::RecipientAddress,
+        address::Address,
         data_api::scanning::ScanPriority,
         encoding::{encode_extended_full_viewing_key, encode_payment_address},
         keys::{sapling, UnifiedFullViewingKey, UnifiedSpendingKey},
     };
 
+    use ::sapling::zip32::ExtendedFullViewingKey;
     use zcash_primitives::{
         consensus::{self, BlockHeight, BranchId, Network, NetworkUpgrade, Parameters},
         transaction::{TransactionData, TxVersion},
-        zip32::{sapling::ExtendedFullViewingKey, AccountId},
+        zip32::AccountId,
     };
 
     use crate::{testing::TestBuilder, wallet::scanning::priority_code, WalletDb};
@@ -247,6 +248,7 @@ mod tests {
                 memo BLOB,
                 spent INTEGER,
                 commitment_tree_position INTEGER,
+                recipient_key_scope INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (tx) REFERENCES transactions(id_tx),
                 FOREIGN KEY (account) REFERENCES accounts(account),
                 FOREIGN KEY (spent) REFERENCES transactions(id_tx),
@@ -718,7 +720,7 @@ mod tests {
         let mut db_data = WalletDb::for_path(data_file.path(), Network::TestNetwork).unwrap();
 
         let seed = [0xab; 32];
-        let account = AccountId::from(0);
+        let account = AccountId::ZERO;
         let secret_key = sapling::spending_key(&seed, db_data.params.coin_type(), account);
         let extfvk = secret_key.to_extended_full_viewing_key();
 
@@ -889,7 +891,7 @@ mod tests {
         let mut db_data = WalletDb::for_path(data_file.path(), Network::TestNetwork).unwrap();
 
         let seed = [0xab; 32];
-        let account = AccountId::from(0);
+        let account = AccountId::ZERO;
         let secret_key = sapling::spending_key(&seed, db_data.params.coin_type(), account);
         let extfvk = secret_key.to_extended_full_viewing_key();
 
@@ -1003,8 +1005,7 @@ mod tests {
             )?;
 
             let ufvk_str = ufvk.encode(&wdb.params);
-            let address_str =
-                RecipientAddress::Unified(ufvk.default_address().0).encode(&wdb.params);
+            let address_str = Address::Unified(ufvk.default_address().0).encode(&wdb.params);
             wdb.conn.execute(
                 "INSERT INTO accounts (account, ufvk, address, transparent_address)
                 VALUES (?, ?, ?, '')",
@@ -1018,9 +1019,8 @@ mod tests {
             // add a transparent "sent note"
             #[cfg(feature = "transparent-inputs")]
             {
-                let taddr =
-                    RecipientAddress::Transparent(*ufvk.default_address().0.transparent().unwrap())
-                        .encode(&wdb.params);
+                let taddr = Address::Transparent(*ufvk.default_address().0.transparent().unwrap())
+                    .encode(&wdb.params);
                 wdb.conn.execute(
                     "INSERT INTO blocks (height, hash, time, sapling_tree) VALUES (0, 0, 0, x'000000')",
                     [],
@@ -1042,7 +1042,7 @@ mod tests {
         let mut db_data = WalletDb::for_path(data_file.path(), Network::TestNetwork).unwrap();
 
         let seed = [0xab; 32];
-        let account = AccountId::from(0);
+        let account = AccountId::ZERO;
         let secret_key = UnifiedSpendingKey::from_seed(&db_data.params, &seed, account).unwrap();
 
         init_main(
@@ -1060,7 +1060,7 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn account_produces_expected_ua_sequence() {
-        use zcash_client_backend::data_api::AccountBirthday;
+        use zcash_client_backend::{data_api::AccountBirthday, keys::UnifiedAddressRequest};
 
         let network = Network::MainNetwork;
         let data_file = NamedTempFile::new().unwrap();
@@ -1075,11 +1075,11 @@ mod tests {
         let (account, _usk) = db_data
             .create_account(&Secret::new(seed.to_vec()), birthday)
             .unwrap();
-        assert_eq!(account, AccountId::from(0u32));
+        assert_eq!(account, AccountId::ZERO);
 
         for tv in &test_vectors::UNIFIED[..3] {
-            if let Some(RecipientAddress::Unified(tvua)) =
-                RecipientAddress::decode(&Network::MainNetwork, tv.unified_addr)
+            if let Some(Address::Unified(tvua)) =
+                Address::decode(&Network::MainNetwork, tv.unified_addr)
             {
                 let (ua, di) = wallet::get_current_address(&db_data.conn, &db_data.params, account)
                     .unwrap()
@@ -1090,7 +1090,7 @@ mod tests {
                 assert_eq!(tv.unified_addr, ua.encode(&Network::MainNetwork));
 
                 db_data
-                    .get_next_available_address(account)
+                    .get_next_available_address(account, UnifiedAddressRequest::DEFAULT)
                     .unwrap()
                     .expect("get_next_available_address generated an address");
             } else {

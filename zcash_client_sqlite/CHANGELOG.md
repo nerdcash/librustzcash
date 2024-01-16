@@ -5,12 +5,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this library adheres to Rust's notion of
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- A new `orchard` feature flag has been added to make it possible to
+  build client code without `orchard` dependendencies.
+
+### Changed
+- `zcash_client_sqlite::error::SqliteClientError` has new error variants:
+  - `SqliteClientError::UnsupportedPoolType`
+  - `SqliteClientError::BalanceError`
+
 ## [0.8.1] - 2023-10-18
 
 ### Fixed
 - Fixed a bug in `v_transactions` that was omitting value from identically-valued notes
-
-## [Unreleased]
 
 ## [0.8.0] - 2023-09-25
 

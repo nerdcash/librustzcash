@@ -7,9 +7,230 @@ and this library adheres to Rust's notion of
 
 ## [Unreleased]
 
-## [0.10.0] - 2023-09-25
-### Notable Changes
+### Added
+- `zcash_client_backend::data_api`:
+  - `BlockMetadata::orchard_tree_size` (when the `orchard` feature is enabled).
+  - `InputSource`
+  - `ScannedBlock::{into_commitments, sapling}`
+  - `ScannedBlock::orchard` (when the `orchard` feature is enabled.)
+  - `ScannedBundles`
+  - `ScannedBlockCommitments`
+  - `Balance::{add_spendable_value, add_pending_change_value, add_pending_spendable_value}`
+  - `AccountBalance::{
+      with_sapling_balance_mut,
+      with_orchard_balance_mut,
+      add_unshielded_value
+    }`
+  - `wallet::propose_standard_transfer_to_address`
+  - `wallet::input_selection::Proposal::{from_parts, shielded_inputs}`
+  - `wallet::input_selection::ShieldedInputs`
+  - `wallet::input_selection::ShieldingSelector` has been
+    factored out from the `InputSelector` trait to separate out transparent
+    functionality and move it behind the `transparent-inputs` feature flag.
+- `zcash_client_backend::fees::{standard, orchard, sapling}`
+- `zcash_client_backend::fees::ChangeValue::{new, orchard}`
+- `zcash_client_backend::keys`:
+  - `AddressGenerationError`
+  - `UnifiedAddressRequest`
+- `zcash_client_backend::wallet`:
+  - `Note`
+  - `ReceivedNote`
+  - `WalletSaplingOutput::recipient_key_scope`
+- `zcash_client_backend::zip321::TransactionRequest::total`
+- `zcash_client_backend::zip321::parse::Param::name`
+- `zcash_client_backend::proto::`
+  - `PROPOSAL_SER_V1`
+  - `ProposalError`
+  - `proposal` module, for parsing and serializing transaction proposals.
+- `impl Clone for zcash_client_backend::{
+     zip321::{Payment, TransactionRequest, Zip321Error, parse::Param, parse::IndexedParam},
+     wallet::{ReceivedSaplingNote, WalletTransparentOutput},
+     wallet::input_selection::{Proposal, SaplingInputs},
+   }`
+- `impl {PartialEq, Eq} for zcash_client_backend::{
+     zip321::{Zip321Error, parse::Param, parse::IndexedParam},
+     wallet::{ReceivedSaplingNote, WalletTransparentOutput},
+     wallet::input_selection::{Proposal, SaplingInputs},
+   }`
+- A new `orchard` feature flag has been added to make it possible to
+  build client code without `orchard` dependendencies.
 
+### Moved
+- `zcash_client_backend::data_api::{PoolType, ShieldedProtocol}` have
+  been moved into the `zcash_client_backend` root module.
+- `zcash_client_backend::data_api::{NoteId, Recipient}` have
+  been moved into the `zcash_client_backend::wallet` module.
+- `ScannedBlock::{sapling_tree_size, sapling_nullifier_map, sapling_commitments}`
+  have been moved to `ScannedBlockSapling` and in that context are now
+  named `{tree_size, nullifier_map, commitments}` respectively.
+
+### Changed
+- `zcash_client_backend::data_api`:
+  - Arguments to `BlockMetadata::from_parts` have changed to include Orchard.
+  - `BlockMetadata::sapling_tree_size` now returns an `Option<u32>` instead of
+    a `u32` for consistency with Orchard.
+  - `WalletShieldedOutput` has an additional type parameter which is used for
+    key scope. `WalletShieldedOutput::from_parts` now takes an additional
+    argument of this type.
+  - `WalletTx` has an additional type parameter as a consequence of the
+    `WalletShieldedOutput` change.
+  - `ScannedBlock` has an additional type parameter as a consequence of the
+    `WalletTx` change.
+  - `ScannedBlock::metadata` has been renamed to `to_block_metadata` and now
+    returns an owned value rather than a reference.
+  - `ShieldedProtocol` has a new variant for `Orchard`, allowing for better
+    reporting to callers trying to perform actions using `Orchard` before it is
+    fully supported.
+  - Fields of `Balance` and `AccountBalance` have been made private and the values
+    of these fields have been made available via methods having the same names
+    as the previously-public fields.
+  - `WalletWrite::get_next_available_address` now takes an additional 
+    `UnifiedAddressRequest` argument.
+  - `chain::scan_cached_blocks` now returns a `ScanSummary` containing metadata
+    about the scanned blocks on success.
+  - `error::Error` enum changes:
+    - The `NoteMismatch` variant now wraps a `NoteId` instead of a
+      backend-specific note identifier. The related `NoteRef` type parameter has
+      been removed from `error::Error`.
+    - A new variant `UnsupportedPoolType` has been added.
+  - `wallet::shield_transparent_funds` no longer takes a `memo` argument;
+    instead, memos to be associated with the shielded outputs should be
+    specified in the construction of the value of the `input_selector`
+    argument, which is used to construct the proposed shielded values as
+    internal "change" outputs.
+  - `wallet::create_proposed_transaction` no longer takes a
+    `change_memo` argument; instead, change memos are represented in the
+    individual values of the `proposed_change` field of the `Proposal`'s
+    `TransactionBalance`.
+  - `wallet::create_proposed_transaction` now takes its `proposal` argument
+    by reference instead of as an owned value.
+  - `wallet::create_proposed_transaction` no longer takes a `min_confirmations`
+    argument. Instead, it uses the anchor height from its `proposal` argument.
+  - `wallet::create_spend_to_address` now takes an additional
+    `change_memo` argument.
+  - The error type of `wallet::create_spend_to_address` has been changed to use
+    `zcash_primitives::transaction::fees::zip317::FeeError` instead of
+    `zcash_primitives::transaction::components::amount::BalanceError`.
+  - The following methods now take `&impl SpendProver, &impl OutputProver`
+    instead of `impl TxProver`:
+    - `wallet::create_proposed_transaction`
+    - `wallet::create_spend_to_address`
+    - `wallet::shield_transparent_funds`
+    - `wallet::spend`
+  - `wallet::input_selection::InputSelector::propose_shielding`,
+    has been moved out to the newly-created `ShieldingSelector` trait.
+    - `ShieldingSelector::propose_shielding` has been altered such that it takes
+      an explicit `target_height` in order to minimize the capabilities that the
+      `data_api::InputSource` trait must expose. Also, it now takes its
+      `min_confirmations` argument as `u32` instead of `NonZeroU32`.
+  - The `wallet::input_selection::InputSelector::DataSource`
+    associated type has been renamed to `InputSource`.
+  - The signature of `wallet:input_selection::InputSelector::propose_transaction`
+    has been altered such that it longer takes `min_confirmations` as an
+    argument, instead taking explicit `target_height` and `anchor_height`
+    arguments. This helps to minimize the set of capabilities that the
+    `data_api::InputSource` must expose.
+  - Changes to the `WalletRead` trait:
+    - Added `get_orchard_nullifiers` (under the `orchard` feature flag.)
+    - `get_checkpoint_depth` has been removed without replacement. This
+      is no longer needed given the change to use the stored anchor height for transaction
+      proposal execution.
+    - `is_valid_account_extfvk` has been removed; it was unused in
+      the ECC mobile wallet SDKs and has been superseded by `get_account_for_ufvk`.
+    - `get_spendable_sapling_notes`, `select_spendable_sapling_notes`, and
+      `get_unspent_transparent_outputs` have been removed; use
+      `data_api::InputSource` instead.
+    - Added `get_account_ids`.
+  - `wallet::{propose_shielding, shield_transparent_funds}` now takes their
+    `min_confirmations` arguments as `u32` rather than a `NonZeroU32` to permit
+    implmentations to enable zero-conf shielding.
+  - `wallet::create_proposed_transaction` now forces implementations to ignore
+    the database identifiers for its contained notes by universally quantifying
+    the `NoteRef` type parameter.
+  - Arguments to `wallet::input_selection::Proposal::from_parts` have changed.
+  - `wallet::input_selection::Proposal::min_anchor_height` has been removed in
+    favor of storing this value in `SaplingInputs`.
+  - `wallet::input_selection::GreedyInputSelector` now has relaxed requirements
+    for its `InputSource` associated type.
+
+- `zcash_client_backend::fees`:
+  - `ChangeStrategy::compute_balance` arguments have changed.
+  - `ChangeValue` is now a struct. In addition to the existing change value, it
+    now also provides the output pool to which change should be sent and an
+    optional memo to be associated with the change output.
+  - `ChangeError` has a new `BundleError` variant.
+  - `fixed::SingleOutputChangeStrategy::new` and
+    `zip317::SingleOutputChangeStrategy::new` each now accept an additional
+    `change_memo` argument.
+- `zcash_client_backend::wallet`:
+  - The fields of `ReceivedSaplingNote` are now private. Use
+    `ReceivedSaplingNote::from_parts` for construction instead. Accessor methods
+    are provided for each previously public field.
+- `zcash_client_backend::scanning::ScanError` has a new variant, `TreeSizeInvalid`.
+- The following fields now have type `NonNegativeAmount` instead of `Amount`:
+  - `zcash_client_backend::data_api`:
+    - `error::Error::InsufficientFunds.{available, required}`
+    - `wallet::input_selection::InputSelectorError::InsufficientFunds.{available, required}`
+  - `zcash_client_backend::fees`:
+    - `ChangeError::InsufficientFunds.{available, required}`
+  - `zcash_client_backend::zip321::Payment.amount`
+- The following methods now take `NonNegativeAmount` instead of `Amount`:
+  - `zcash_client_backend::data_api`:
+    - `SentTransactionOutput::from_parts`
+    - `wallet::create_spend_to_address`
+    - `wallet::input_selection::InputSelector::propose_shielding`
+  - `zcash_client_backend::fees`:
+    - `ChangeValue::sapling`
+    - `DustOutputPolicy::new`
+    - `TransactionBalance::new`
+  - `zcash_client_backend::wallet::ReceivedSaplingNote::from_parts`
+- The following methods now return `NonNegativeAmount` instead of `Amount`:
+  - `zcash_client_backend::data_api::SentTransactionOutput::value`
+  - `zcash_client_backend::fees`:
+    - `ChangeValue::value`
+    - `DustOutputPolicy::dust_threshold`
+    - `TransactionBalance::{fee_required, total}`
+  - `zcash_client_backend::wallet`:
+    - `ReceivedSaplingNote::value`
+    - `WalletTransparentOutput::value`
+
+- `zcash_client_backend::address`:
+  - `RecipientAddress` has been renamed to `Address`
+  - `Address::Shielded` has been renamed to `Address::Sapling`
+  - `UnifiedAddress::from_receivers` no longer takes an Orchard receiver
+    argument unless the `orchard` feature is enabled.
+  - `UnifiedAddress::orchard` is now only available when the `orchard` feature
+    is enabled.
+
+- `zcash_client_backend::keys`:
+  - `DerivationError::Orchard` is now only available when the `orchard` feature
+    is enabled.
+  - `UnifiedSpendingKey::address` now takes an argument that specifies the
+    receivers to be generated in the resulting address. Also, it now returns
+    `Result<UnifiedAddress, AddressGenerationError>` instead of
+    `Option<UnifiedAddress>` so that we may better report to the user how
+    address generation has failed.
+  - `UnifiedSpendingKey::orchard` is now only available when the `orchard`
+    feature is enabled.
+  - `UnifiedSpendingKey::transparent` is now only available when the
+    `transparent-inputs` feature is enabled.
+  - `UnifiedFullViewingKey::new` no longer takes an Orchard full viewing key
+    argument unless the `orchard` feature is enabled.
+
+### Removed
+- `zcash_client_backend::wallet::ReceivedSaplingNote` has been replaced by
+  `zcash_client_backend::ReceivedNote`.
+- `zcash_client_backend::wallet::input_selection::Proposal::sapling_inputs` has
+  been replaced by `Proposal::shielded_inputs`
+- `zcash_client_backend::data_api`
+- `zcash_client_backend::data_api::ScannedBlock::from_parts` has been made crate-private.
+- `zcash_client_backend::data_api::ScannedBlock::into_sapling_commitments` has been
+  replaced by `into_commitments` which returns both Sapling and Orchard note commitments
+  and associated note commitment retention information for the block.
+
+## [0.10.0] - 2023-09-25
+
+### Notable Changes
 - `zcash_client_backend` now supports out-of-order scanning of blockchain history.
   See the module documentation for `zcash_client_backend::data_api::chain`
   for details on how to make use of the new scanning capabilities.

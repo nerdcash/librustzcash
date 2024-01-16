@@ -1,14 +1,11 @@
 use std::collections::HashMap;
 
+use sapling::note_encryption::{
+    try_sapling_note_decryption, try_sapling_output_recovery, PreparedIncomingViewingKey,
+};
 use zcash_primitives::{
     consensus::{self, BlockHeight},
     memo::MemoBytes,
-    sapling::{
-        self,
-        note_encryption::{
-            try_sapling_note_decryption, try_sapling_output_recovery, PreparedIncomingViewingKey,
-        },
-    },
     transaction::Transaction,
     zip32::{AccountId, Scope},
 };
@@ -44,7 +41,7 @@ pub struct DecryptedOutput<Note> {
     /// True if this output was recovered using an [`OutgoingViewingKey`], meaning that
     /// this is a logical output of the transaction.
     ///
-    /// [`OutgoingViewingKey`]: zcash_primitives::keys::OutgoingViewingKey
+    /// [`OutgoingViewingKey`]: sapling::keys::OutgoingViewingKey
     pub transfer_type: TransferType,
 }
 
@@ -56,6 +53,7 @@ pub fn decrypt_transaction<P: consensus::Parameters>(
     tx: &Transaction,
     ufvks: &HashMap<AccountId, UnifiedFullViewingKey>,
 ) -> Vec<DecryptedOutput<sapling::Note>> {
+    let zip212_enforcement = consensus::sapling_zip212_enforcement(params, height);
     tx.sapling_bundle()
         .iter()
         .flat_map(|bundle| {
@@ -76,19 +74,18 @@ pub fn decrypt_transaction<P: consensus::Parameters>(
                         .iter()
                         .enumerate()
                         .flat_map(move |(index, output)| {
-                            try_sapling_note_decryption(params, height, &ivk_external, output)
+                            try_sapling_note_decryption(&ivk_external, output, zip212_enforcement)
                                 .map(|ret| (ret, TransferType::Incoming))
                                 .or_else(|| {
                                     try_sapling_note_decryption(
-                                        params,
-                                        height,
                                         &ivk_internal,
                                         output,
+                                        zip212_enforcement,
                                     )
                                     .map(|ret| (ret, TransferType::WalletInternal))
                                 })
                                 .or_else(|| {
-                                    try_sapling_output_recovery(params, height, &ovk, output)
+                                    try_sapling_output_recovery(&ovk, output, zip212_enforcement)
                                         .map(|ret| (ret, TransferType::Outgoing))
                                 })
                                 .into_iter()
@@ -96,7 +93,7 @@ pub fn decrypt_transaction<P: consensus::Parameters>(
                                     index,
                                     note,
                                     account,
-                                    memo,
+                                    memo: MemoBytes::from_bytes(&memo).expect("correct length"),
                                     transfer_type,
                                 })
                         })

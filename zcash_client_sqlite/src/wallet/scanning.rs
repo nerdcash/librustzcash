@@ -346,7 +346,7 @@ pub(crate) fn update_chain_tip<P: consensus::Parameters>(
     };
 
     // Read the previous max scanned height from the blocks table
-    let max_scanned = block_height_extrema(conn)?.map(|(_, max_scanned)| max_scanned);
+    let max_scanned = block_height_extrema(conn)?.map(|range| *range.end());
 
     // Read the wallet birthday (if known).
     let wallet_birthday = wallet_birthday(conn)?;
@@ -501,6 +501,7 @@ pub(crate) fn update_chain_tip<P: consensus::Parameters>(
 pub(crate) mod tests {
     use incrementalmerkletree::{frontier::Frontier, Hashable, Level, Position};
 
+    use sapling::{zip32::DiversifiableFullViewingKey, Node};
     use secrecy::SecretVec;
     use zcash_client_backend::data_api::{
         chain::CommitmentTreeRoot,
@@ -511,9 +512,7 @@ pub(crate) mod tests {
     use zcash_primitives::{
         block::BlockHash,
         consensus::{BlockHeight, NetworkUpgrade, Parameters},
-        sapling::Node,
-        transaction::components::Amount,
-        zip32::DiversifiableFullViewingKey,
+        transaction::components::amount::NonNegativeAmount,
     };
 
     use crate::{
@@ -564,7 +563,7 @@ pub(crate) mod tests {
         let initial_sapling_tree_size = (0x1 << 16) * 3 + 5;
         let initial_height = sapling_activation_height + 310;
 
-        let value = Amount::from_u64(50000).unwrap();
+        let value = NonNegativeAmount::const_from_u64(50000);
         st.generate_block_at(
             initial_height,
             BlockHash([0; 32]),
@@ -578,7 +577,7 @@ pub(crate) mod tests {
             st.generate_next_block(
                 &dfvk,
                 AddressType::DefaultExternal,
-                Amount::from_u64(10000).unwrap(),
+                NonNegativeAmount::const_from_u64(10000),
             );
         }
 
@@ -845,8 +844,8 @@ pub(crate) mod tests {
             BlockHash([0u8; 32]),
             &dfvk,
             AddressType::DefaultExternal,
-            Amount::const_from_i64(10000),
             // 1235 notes into into the second shard
+            NonNegativeAmount::const_from_u64(10000),
             u64::from(birthday.sapling_frontier().value().unwrap().position() + 1)
                 .try_into()
                 .unwrap(),
@@ -961,7 +960,7 @@ pub(crate) mod tests {
             BlockHash([0u8; 32]),
             &dfvk,
             AddressType::DefaultExternal,
-            Amount::const_from_i64(10000),
+            NonNegativeAmount::const_from_u64(10000),
             u64::from(birthday.sapling_frontier().value().unwrap().position() + 1)
                 .try_into()
                 .unwrap(),

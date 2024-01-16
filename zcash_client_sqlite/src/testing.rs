@@ -14,24 +14,34 @@ use tempfile::NamedTempFile;
 #[cfg(feature = "unstable")]
 use tempfile::TempDir;
 
-use zcash_client_backend::data_api::{AccountBalance, WalletRead};
+use sapling::{
+    note_encryption::{sapling_note_encryption, SaplingDomain},
+    util::generate_random_rseed,
+    value::NoteValue,
+    zip32::DiversifiableFullViewingKey,
+    Note, Nullifier, PaymentAddress,
+};
+use zcash_client_backend::fees::{standard, DustOutputPolicy};
 #[allow(deprecated)]
 use zcash_client_backend::{
-    address::RecipientAddress,
+    address::Address,
     data_api::{
         self,
-        chain::{scan_cached_blocks, BlockSource},
+        chain::{scan_cached_blocks, BlockSource, ScanSummary},
         wallet::{
             create_proposed_transaction, create_spend_to_address,
-            input_selection::{GreedyInputSelectorError, InputSelector, Proposal},
-            propose_transfer, spend,
+            input_selection::{
+                GreedyInputSelector, GreedyInputSelectorError, InputSelector, Proposal,
+            },
+            propose_standard_transfer_to_address, propose_transfer, spend,
         },
-        AccountBirthday, WalletSummary, WalletWrite,
+        AccountBalance, AccountBirthday, WalletRead, WalletSummary, WalletWrite,
     },
     keys::UnifiedSpendingKey,
     proto::compact_formats::{
         self as compact, CompactBlock, CompactSaplingOutput, CompactSaplingSpend, CompactTx,
     },
+    proto::proposal,
     wallet::OvkPolicy,
     zip321,
 };
@@ -39,22 +49,13 @@ use zcash_note_encryption::Domain;
 use zcash_primitives::{
     block::BlockHash,
     consensus::{self, BlockHeight, Network, NetworkUpgrade, Parameters},
-    memo::MemoBytes,
-    sapling::{
-        note_encryption::{sapling_note_encryption, SaplingDomain},
-        util::generate_random_rseed,
-        value::NoteValue,
-        Note, Nullifier, PaymentAddress,
-    },
+    memo::{Memo, MemoBytes},
     transaction::{
-        components::{
-            amount::{BalanceError, NonNegativeAmount},
-            Amount,
-        },
-        fees::FeeRule,
+        components::amount::NonNegativeAmount,
+        fees::{zip317::FeeError as Zip317FeeError, FeeRule, StandardFeeRule},
         Transaction, TxId,
     },
-    zip32::{sapling::DiversifiableFullViewingKey, DiversifierIndex},
+    zip32::DiversifierIndex,
 };
 
 use crate::{
@@ -71,7 +72,9 @@ use super::BlockDb;
 
 #[cfg(feature = "transparent-inputs")]
 use {
-    zcash_client_backend::data_api::wallet::{propose_shielding, shield_transparent_funds},
+    zcash_client_backend::data_api::wallet::{
+        input_selection::ShieldingSelector, propose_shielding, shield_transparent_funds,
+    },
     zcash_primitives::legacy::TransparentAddress,
 };
 
@@ -180,7 +183,7 @@ where
         &mut self,
         dfvk: &DiversifiableFullViewingKey,
         req: AddressType,
-        value: Amount,
+        value: NonNegativeAmount,
     ) -> (BlockHeight, Cache::InsertResult, Nullifier) {
         let (height, prev_hash, initial_sapling_tree_size) = self
             .latest_cached_block
@@ -210,7 +213,7 @@ where
         prev_hash: BlockHash,
         dfvk: &DiversifiableFullViewingKey,
         req: AddressType,
-        value: Amount,
+        value: NonNegativeAmount,
         initial_sapling_tree_size: u32,
     ) -> (Cache::InsertResult, Nullifier) {
         let (cb, nf) = fake_compact_block(
@@ -239,9 +242,9 @@ where
     pub(crate) fn generate_next_block_spending(
         &mut self,
         dfvk: &DiversifiableFullViewingKey,
-        note: (Nullifier, Amount),
+        note: (Nullifier, NonNegativeAmount),
         to: PaymentAddress,
-        value: Amount,
+        value: NonNegativeAmount,
     ) -> (BlockHeight, Cache::InsertResult) {
         let (height, prev_hash, initial_sapling_tree_size) = self
             .latest_cached_block
@@ -326,8 +329,14 @@ where
     }
 
     /// Invokes [`scan_cached_blocks`] with the given arguments, expecting success.
-    pub(crate) fn scan_cached_blocks(&mut self, from_height: BlockHeight, limit: usize) {
-        assert_matches!(self.try_scan_cached_blocks(from_height, limit), Ok(_));
+    pub(crate) fn scan_cached_blocks(
+        &mut self,
+        from_height: BlockHeight,
+        limit: usize,
+    ) -> ScanSummary {
+        let result = self.try_scan_cached_blocks(from_height, limit);
+        assert_matches!(result, Ok(_));
+        result.unwrap()
     }
 
     /// Invokes [`scan_cached_blocks`] with the given arguments.
@@ -336,7 +345,7 @@ where
         from_height: BlockHeight,
         limit: usize,
     ) -> Result<
-        (),
+        ScanSummary,
         data_api::chain::error::Error<
             SqliteClientError,
             <Cache::BlockSource as BlockSource>::Error,
@@ -423,35 +432,39 @@ impl<Cache> TestState<Cache> {
     /// Invokes [`create_spend_to_address`] with the given arguments.
     #[allow(deprecated)]
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_spend_to_address(
         &mut self,
         usk: &UnifiedSpendingKey,
-        to: &RecipientAddress,
-        amount: Amount,
+        to: &Address,
+        amount: NonNegativeAmount,
         memo: Option<MemoBytes>,
         ovk_policy: OvkPolicy,
         min_confirmations: NonZeroU32,
+        change_memo: Option<MemoBytes>,
     ) -> Result<
         TxId,
         data_api::error::Error<
             SqliteClientError,
             commitment_tree::Error,
-            GreedyInputSelectorError<BalanceError, ReceivedNoteId>,
-            Infallible,
-            ReceivedNoteId,
+            GreedyInputSelectorError<Zip317FeeError, ReceivedNoteId>,
+            Zip317FeeError,
         >,
     > {
         let params = self.network();
+        let prover = test_prover();
         create_spend_to_address(
             &mut self.db_data,
             &params,
-            test_prover(),
+            &prover,
+            &prover,
             usk,
             to,
             amount,
             memo,
             ovk_policy,
             min_confirmations,
+            change_memo,
         )
     }
 
@@ -471,17 +484,18 @@ impl<Cache> TestState<Cache> {
             commitment_tree::Error,
             InputsT::Error,
             <InputsT::FeeRule as FeeRule>::Error,
-            ReceivedNoteId,
         >,
     >
     where
-        InputsT: InputSelector<DataSource = WalletDb<Connection, Network>>,
+        InputsT: InputSelector<InputSource = WalletDb<Connection, Network>>,
     {
         let params = self.network();
+        let prover = test_prover();
         spend(
             &mut self.db_data,
             &params,
-            test_prover(),
+            &prover,
+            &prover,
             input_selector,
             usk,
             request,
@@ -505,11 +519,10 @@ impl<Cache> TestState<Cache> {
             Infallible,
             InputsT::Error,
             <InputsT::FeeRule as FeeRule>::Error,
-            ReceivedNoteId,
         >,
     >
     where
-        InputsT: InputSelector<DataSource = WalletDb<Connection, Network>>,
+        InputsT: InputSelector<InputSource = WalletDb<Connection, Network>>,
     {
         let params = self.network();
         propose_transfer::<_, _, _, Infallible>(
@@ -522,6 +535,47 @@ impl<Cache> TestState<Cache> {
         )
     }
 
+    /// Invokes [`propose_standard_transfer`] with the given arguments.
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn propose_standard_transfer<CommitmentTreeErrT>(
+        &mut self,
+        spend_from_account: AccountId,
+        fee_rule: StandardFeeRule,
+        min_confirmations: NonZeroU32,
+        to: &Address,
+        amount: NonNegativeAmount,
+        memo: Option<MemoBytes>,
+        change_memo: Option<MemoBytes>,
+    ) -> Result<
+        Proposal<StandardFeeRule, ReceivedNoteId>,
+        data_api::error::Error<
+            SqliteClientError,
+            CommitmentTreeErrT,
+            GreedyInputSelectorError<Zip317FeeError, ReceivedNoteId>,
+            Zip317FeeError,
+        >,
+    > {
+        let params = self.network();
+        let result = propose_standard_transfer_to_address::<_, _, CommitmentTreeErrT>(
+            &mut self.db_data,
+            &params,
+            fee_rule,
+            spend_from_account,
+            min_confirmations,
+            to,
+            amount,
+            memo,
+            change_memo,
+        );
+
+        if let Ok(proposal) = &result {
+            check_proposal_serialization_roundtrip(self.wallet(), proposal);
+        }
+
+        result
+    }
+
     /// Invokes [`propose_shielding`] with the given arguments.
     #[cfg(feature = "transparent-inputs")]
     #[allow(clippy::type_complexity)]
@@ -531,19 +585,18 @@ impl<Cache> TestState<Cache> {
         input_selector: &InputsT,
         shielding_threshold: NonNegativeAmount,
         from_addrs: &[TransparentAddress],
-        min_confirmations: NonZeroU32,
+        min_confirmations: u32,
     ) -> Result<
-        Proposal<InputsT::FeeRule, ReceivedNoteId>,
+        Proposal<InputsT::FeeRule, Infallible>,
         data_api::error::Error<
             SqliteClientError,
             Infallible,
             InputsT::Error,
             <InputsT::FeeRule as FeeRule>::Error,
-            ReceivedNoteId,
         >,
     >
     where
-        InputsT: InputSelector<DataSource = WalletDb<Connection, Network>>,
+        InputsT: ShieldingSelector<InputSource = WalletDb<Connection, Network>>,
     {
         let params = self.network();
         propose_shielding::<_, _, _, Infallible>(
@@ -557,36 +610,33 @@ impl<Cache> TestState<Cache> {
     }
 
     /// Invokes [`create_proposed_transaction`] with the given arguments.
-    pub(crate) fn create_proposed_transaction<FeeRuleT>(
+    pub(crate) fn create_proposed_transaction<InputsErrT, FeeRuleT>(
         &mut self,
         usk: &UnifiedSpendingKey,
         ovk_policy: OvkPolicy,
-        proposal: Proposal<FeeRuleT, ReceivedNoteId>,
-        min_confirmations: NonZeroU32,
-        change_memo: Option<MemoBytes>,
+        proposal: &Proposal<FeeRuleT, ReceivedNoteId>,
     ) -> Result<
         TxId,
         data_api::error::Error<
             SqliteClientError,
             commitment_tree::Error,
-            Infallible,
+            InputsErrT,
             FeeRuleT::Error,
-            ReceivedNoteId,
         >,
     >
     where
         FeeRuleT: FeeRule,
     {
         let params = self.network();
-        create_proposed_transaction::<_, _, Infallible, _>(
+        let prover = test_prover();
+        create_proposed_transaction(
             &mut self.db_data,
             &params,
-            test_prover(),
+            &prover,
+            &prover,
             usk,
             ovk_policy,
             proposal,
-            min_confirmations,
-            change_memo,
         )
     }
 
@@ -599,8 +649,7 @@ impl<Cache> TestState<Cache> {
         shielding_threshold: NonNegativeAmount,
         usk: &UnifiedSpendingKey,
         from_addrs: &[TransparentAddress],
-        memo: &MemoBytes,
-        min_confirmations: NonZeroU32,
+        min_confirmations: u32,
     ) -> Result<
         TxId,
         data_api::error::Error<
@@ -608,22 +657,22 @@ impl<Cache> TestState<Cache> {
             commitment_tree::Error,
             InputsT::Error,
             <InputsT::FeeRule as FeeRule>::Error,
-            ReceivedNoteId,
         >,
     >
     where
-        InputsT: InputSelector<DataSource = WalletDb<Connection, Network>>,
+        InputsT: ShieldingSelector<InputSource = WalletDb<Connection, Network>>,
     {
         let params = self.network();
+        let prover = test_prover();
         shield_transparent_funds(
             &mut self.db_data,
             &params,
-            test_prover(),
+            &prover,
+            &prover,
             input_selector,
             shielding_threshold,
             usk,
             from_addrs,
-            memo,
             min_confirmations,
         )
     }
@@ -634,10 +683,14 @@ impl<Cache> TestState<Cache> {
         min_confirmations: u32,
         f: F,
     ) -> T {
-        let binding =
-            get_wallet_summary(&self.wallet().conn, min_confirmations, &SubtreeScanProgress)
-                .unwrap()
-                .unwrap();
+        let binding = get_wallet_summary(
+            &self.wallet().conn,
+            &self.wallet().params,
+            min_confirmations,
+            &SubtreeScanProgress,
+        )
+        .unwrap()
+        .unwrap();
 
         f(binding.account_balances().get(&account).unwrap())
     }
@@ -652,7 +705,7 @@ impl<Cache> TestState<Cache> {
         min_confirmations: u32,
     ) -> NonNegativeAmount {
         self.with_account_balance(account, min_confirmations, |balance| {
-            balance.sapling_balance.spendable_value
+            balance.sapling_balance().spendable_value()
         })
     }
 
@@ -662,8 +715,8 @@ impl<Cache> TestState<Cache> {
         min_confirmations: u32,
     ) -> NonNegativeAmount {
         self.with_account_balance(account, min_confirmations, |balance| {
-            balance.sapling_balance.value_pending_spendability
-                + balance.sapling_balance.change_pending_confirmation
+            balance.sapling_balance().value_pending_spendability()
+                + balance.sapling_balance().change_pending_confirmation()
         })
         .unwrap()
     }
@@ -675,12 +728,18 @@ impl<Cache> TestState<Cache> {
         min_confirmations: u32,
     ) -> NonNegativeAmount {
         self.with_account_balance(account, min_confirmations, |balance| {
-            balance.sapling_balance.change_pending_confirmation
+            balance.sapling_balance().change_pending_confirmation()
         })
     }
 
     pub(crate) fn get_wallet_summary(&self, min_confirmations: u32) -> Option<WalletSummary> {
-        get_wallet_summary(&self.wallet().conn, min_confirmations, &SubtreeScanProgress).unwrap()
+        get_wallet_summary(
+            &self.wallet().conn,
+            &self.wallet().params,
+            min_confirmations,
+            &SubtreeScanProgress,
+        )
+        .unwrap()
     }
 }
 
@@ -699,7 +758,7 @@ pub(crate) fn fake_compact_block<P: consensus::Parameters>(
     prev_hash: BlockHash,
     dfvk: &DiversifiableFullViewingKey,
     req: AddressType,
-    value: Amount,
+    value: NonNegativeAmount,
     initial_sapling_tree_size: u32,
 ) -> (CompactBlock, Nullifier) {
     let to = match req {
@@ -710,18 +769,19 @@ pub(crate) fn fake_compact_block<P: consensus::Parameters>(
 
     // Create a fake Note for the account
     let mut rng = OsRng;
-    let rseed = generate_random_rseed(params, height, &mut rng);
-    let note = Note::from_parts(to, NoteValue::from_raw(value.into()), rseed);
-    let encryptor = sapling_note_encryption::<_, Network>(
+    let rseed = generate_random_rseed(
+        consensus::sapling_zip212_enforcement(params, height),
+        &mut rng,
+    );
+    let note = Note::from_parts(to, NoteValue::from(value), rseed);
+    let encryptor = sapling_note_encryption(
         Some(dfvk.fvk().ovk),
         note.clone(),
-        MemoBytes::empty(),
+        *MemoBytes::empty().as_array(),
         &mut rng,
     );
     let cmu = note.cmu().to_bytes().to_vec();
-    let ephemeral_key = SaplingDomain::<Network>::epk_bytes(encryptor.epk())
-        .0
-        .to_vec();
+    let ephemeral_key = SaplingDomain::epk_bytes(encryptor.epk()).0.to_vec();
     let enc_ciphertext = encryptor.encrypt_note_plaintext();
 
     // Create a fake CompactBlock containing the note
@@ -778,6 +838,8 @@ pub(crate) fn fake_compact_block_from_tx(
             ctx.outputs.push(output.into());
         }
     }
+
+    #[cfg(feature = "orchard")]
     if let Some(bundle) = tx.orchard_bundle() {
         for action in bundle.actions() {
             ctx.actions.push(action.into());
@@ -800,14 +862,15 @@ pub(crate) fn fake_compact_block_spending<P: consensus::Parameters>(
     params: &P,
     height: BlockHeight,
     prev_hash: BlockHash,
-    (nf, in_value): (Nullifier, Amount),
+    (nf, in_value): (Nullifier, NonNegativeAmount),
     dfvk: &DiversifiableFullViewingKey,
     to: PaymentAddress,
-    value: Amount,
+    value: NonNegativeAmount,
     initial_sapling_tree_size: u32,
 ) -> CompactBlock {
+    let zip212_enforcement = consensus::sapling_zip212_enforcement(params, height);
     let mut rng = OsRng;
-    let rseed = generate_random_rseed(params, height, &mut rng);
+    let rseed = generate_random_rseed(zip212_enforcement, &mut rng);
 
     // Create a fake CompactBlock containing the note
     let cspend = CompactSaplingSpend { nf: nf.to_vec() };
@@ -819,17 +882,15 @@ pub(crate) fn fake_compact_block_spending<P: consensus::Parameters>(
 
     // Create a fake Note for the payment
     ctx.outputs.push({
-        let note = Note::from_parts(to, NoteValue::from_raw(value.into()), rseed);
-        let encryptor = sapling_note_encryption::<_, Network>(
+        let note = Note::from_parts(to, NoteValue::from(value), rseed);
+        let encryptor = sapling_note_encryption(
             Some(dfvk.fvk().ovk),
             note.clone(),
-            MemoBytes::empty(),
+            *MemoBytes::empty().as_array(),
             &mut rng,
         );
         let cmu = note.cmu().to_bytes().to_vec();
-        let ephemeral_key = SaplingDomain::<Network>::epk_bytes(encryptor.epk())
-            .0
-            .to_vec();
+        let ephemeral_key = SaplingDomain::epk_bytes(encryptor.epk()).0.to_vec();
         let enc_ciphertext = encryptor.encrypt_note_plaintext();
 
         CompactSaplingOutput {
@@ -842,22 +903,20 @@ pub(crate) fn fake_compact_block_spending<P: consensus::Parameters>(
     // Create a fake Note for the change
     ctx.outputs.push({
         let change_addr = dfvk.default_address().1;
-        let rseed = generate_random_rseed(params, height, &mut rng);
+        let rseed = generate_random_rseed(zip212_enforcement, &mut rng);
         let note = Note::from_parts(
             change_addr,
-            NoteValue::from_raw((in_value - value).unwrap().into()),
+            NoteValue::from((in_value - value).unwrap()),
             rseed,
         );
-        let encryptor = sapling_note_encryption::<_, Network>(
+        let encryptor = sapling_note_encryption(
             Some(dfvk.fvk().ovk),
             note.clone(),
-            MemoBytes::empty(),
+            *MemoBytes::empty().as_array(),
             &mut rng,
         );
         let cmu = note.cmu().to_bytes().to_vec();
-        let ephemeral_key = SaplingDomain::<Network>::epk_bytes(encryptor.epk())
-            .0
-            .to_vec();
+        let ephemeral_key = SaplingDomain::epk_bytes(encryptor.epk()).0.to_vec();
         let enc_ciphertext = encryptor.encrypt_note_plaintext();
 
         CompactSaplingOutput {
@@ -997,4 +1056,30 @@ impl TestCache for FsBlockCache {
 
         meta
     }
+}
+
+pub(crate) fn input_selector(
+    fee_rule: StandardFeeRule,
+    change_memo: Option<&str>,
+) -> GreedyInputSelector<
+    WalletDb<rusqlite::Connection, Network>,
+    standard::SingleOutputChangeStrategy,
+> {
+    let change_memo = change_memo.map(|m| MemoBytes::from(m.parse::<Memo>().unwrap()));
+    let change_strategy = standard::SingleOutputChangeStrategy::new(fee_rule, change_memo);
+    GreedyInputSelector::new(change_strategy, DustOutputPolicy::default())
+}
+
+// Checks that a protobuf proposal serialized from the provided proposal value correctly parses to
+// the same proposal value.
+pub(crate) fn check_proposal_serialization_roundtrip(
+    db_data: &WalletDb<rusqlite::Connection, Network>,
+    proposal: &Proposal<StandardFeeRule, ReceivedNoteId>,
+) {
+    let proposal_proto = proposal::Proposal::from_standard_proposal(&db_data.params, proposal);
+    assert_matches!(proposal_proto, Some(_));
+    let deserialized_proposal = proposal_proto
+        .unwrap()
+        .try_into_standard_proposal(&db_data.params, db_data);
+    assert_matches!(deserialized_proposal, Ok(r) if &r == proposal);
 }
