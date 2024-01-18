@@ -44,12 +44,8 @@ pub mod sapling {
     /// # Examples
     ///
     /// ```
-    /// use zcash_primitives::{
-    ///     constants::testnet::COIN_TYPE,
-    /// };
-    /// use zcash_client_backend::{
-    ///     keys::sapling,
-    /// };
+    /// use zcash_primitives::constants::testnet::COIN_TYPE;
+    /// use zcash_keys::keys::sapling;
     /// use zip32::AccountId;
     ///
     /// let extsk = sapling::spending_key(&[0; 32][..], COIN_TYPE, AccountId::ZERO);
@@ -776,9 +772,11 @@ mod tests {
     #[cfg(feature = "unstable")]
     use {
         super::{testing::arb_unified_spending_key, Era, UnifiedSpendingKey},
-        subtle::ConstantTimeEq,
         zcash_primitives::consensus::Network,
     };
+
+    #[cfg(all(feature = "orchard", feature = "unstable"))]
+    use subtle::ConstantTimeEq;
 
     #[cfg(feature = "transparent-inputs")]
     fn seed() -> Vec<u8> {
@@ -949,10 +947,20 @@ mod tests {
         fn prop_usk_roundtrip(usk in arb_unified_spending_key(Network::MainNetwork)) {
             let encoded = usk.to_bytes(Era::Orchard);
 
-            #[cfg(not(feature = "transparent-inputs"))]
-            assert_eq!(encoded.len(), 4 + 2 + 32 + 2 + 169);
-            #[cfg(feature = "transparent-inputs")]
-            assert_eq!(encoded.len(), 4 + 2 + 32 + 2 + 169 + 2 + 64);
+            let encoded_len = {
+                let len = 4;
+
+                #[cfg(feature = "orchard")]
+                let len = len + 2 + 32;
+
+                let len = len + 2 + 169;
+
+                #[cfg(feature = "transparent-inputs")]
+                let len = len + 2 + 64;
+
+                len
+            };
+            assert_eq!(encoded.len(), encoded_len);
 
             let decoded = UnifiedSpendingKey::from_bytes(Era::Orchard, &encoded);
             let decoded = decoded.unwrap_or_else(|e| panic!("Error decoding USK: {:?}", e));
