@@ -1,9 +1,7 @@
 //! Encoding and decoding functions for Zcash key and address structs.
 //!
 //! Human-Readable Prefixes (HRPs) for Bech32 encodings are located in the
-//! [zcash_primitives::constants][constants] module.
-//!
-//! [constants]: zcash_primitives::constants
+//! [zcash_primitives::constants] module.
 
 use crate::address::UnifiedAddress;
 use bech32::{self, Error, FromBase32, ToBase32, Variant};
@@ -76,13 +74,24 @@ where
     }
 }
 
+/// A trait for encoding and decoding Zcash addresses.
 pub trait AddressCodec<P>
 where
     Self: std::marker::Sized,
 {
     type Error;
 
+    /// Encode a Zcash address.
+    ///
+    /// # Arguments
+    /// * `params` - The network the address is to be used on.
     fn encode(&self, params: &P) -> String;
+
+    /// Decodes a Zcash address from its string representation.
+    ///
+    /// # Arguments
+    /// * `params` - The network the address is to be used on.
+    /// * `address` - The string representation of the address.
     fn decode(params: &P, address: &str) -> Result<Self, Self::Error>;
 }
 
@@ -502,7 +511,7 @@ mod tests {
 
         let encoded_main = "zxviews1qqqqqqqqqqqqqq8n3zjjmvhhr854uy3qhpda3ml34haf0x388z5r7h4st4kpsf6qy3zw4wc246aw9rlfyg5ndlwvne7mwdq0qe6vxl42pqmcf8pvmmd5slmjxduqa9evgej6wa3th2505xq4nggrxdm93rxk4rpdjt5nmq2vn44e2uhm7h0hsagfvkk4n7n6nfer6u57v9cac84t7nl2zth0xpyfeg0w2p2wv2yn6jn923aaz0vdaml07l60ahapk6efchyxwysrvjsxmansf";
         let encoded_test = "zxviewtestsapling1qqqqqqqqqqqqqq8n3zjjmvhhr854uy3qhpda3ml34haf0x388z5r7h4st4kpsf6qy3zw4wc246aw9rlfyg5ndlwvne7mwdq0qe6vxl42pqmcf8pvmmd5slmjxduqa9evgej6wa3th2505xq4nggrxdm93rxk4rpdjt5nmq2vn44e2uhm7h0hsagfvkk4n7n6nfer6u57v9cac84t7nl2zth0xpyfeg0w2p2wv2yn6jn923aaz0vdaml07l60ahapk6efchyxwysrvjs8evfkz";
-
+        let encoded_regtest = "zxviewregtestsapling1qqqqqqqqqqqqqq8n3zjjmvhhr854uy3qhpda3ml34haf0x388z5r7h4st4kpsf6qy3zw4wc246aw9rlfyg5ndlwvne7mwdq0qe6vxl42pqmcf8pvmmd5slmjxduqa9evgej6wa3th2505xq4nggrxdm93rxk4rpdjt5nmq2vn44e2uhm7h0hsagfvkk4n7n6nfer6u57v9cac84t7nl2zth0xpyfeg0w2p2wv2yn6jn923aaz0vdaml07l60ahapk6efchyxwysrvjskjkzax";
         assert_eq!(
             encode_extended_full_viewing_key(
                 constants::mainnet::HRP_SAPLING_EXTENDED_FULL_VIEWING_KEY,
@@ -526,10 +535,19 @@ mod tests {
             ),
             encoded_test
         );
+
+        assert_eq!(
+            encode_extended_full_viewing_key(
+                constants::regtest::HRP_SAPLING_EXTENDED_FULL_VIEWING_KEY,
+                &extfvk
+            ),
+            encoded_regtest
+        );
+
         assert_eq!(
             decode_extended_full_viewing_key(
-                constants::testnet::HRP_SAPLING_EXTENDED_FULL_VIEWING_KEY,
-                encoded_test
+                constants::regtest::HRP_SAPLING_EXTENDED_FULL_VIEWING_KEY,
+                encoded_regtest
             )
             .unwrap(),
             extfvk
@@ -550,11 +568,14 @@ mod tests {
             "zs1qqqqqqqqqqqqqqqqqqcguyvaw2vjk4sdyeg0lc970u659lvhqq7t0np6hlup5lusxle75c8v35z";
         let encoded_test =
             "ztestsapling1qqqqqqqqqqqqqqqqqqcguyvaw2vjk4sdyeg0lc970u659lvhqq7t0np6hlup5lusxle75ss7jnk";
+        let encoded_regtest =
+            "zregtestsapling1qqqqqqqqqqqqqqqqqqcguyvaw2vjk4sdyeg0lc970u659lvhqq7t0np6hlup5lusxle7505hlz3";
 
         assert_eq!(
             encode_payment_address(constants::mainnet::HRP_SAPLING_PAYMENT_ADDRESS, &addr),
             encoded_main
         );
+
         assert_eq!(
             decode_payment_address(
                 constants::mainnet::HRP_SAPLING_PAYMENT_ADDRESS,
@@ -568,10 +589,25 @@ mod tests {
             encode_payment_address(constants::testnet::HRP_SAPLING_PAYMENT_ADDRESS, &addr),
             encoded_test
         );
+
+        assert_eq!(
+            encode_payment_address(constants::regtest::HRP_SAPLING_PAYMENT_ADDRESS, &addr),
+            encoded_regtest
+        );
+
         assert_eq!(
             decode_payment_address(
                 constants::testnet::HRP_SAPLING_PAYMENT_ADDRESS,
                 encoded_test
+            )
+            .unwrap(),
+            addr
+        );
+
+        assert_eq!(
+            decode_payment_address(
+                constants::regtest::HRP_SAPLING_PAYMENT_ADDRESS,
+                encoded_regtest
             )
             .unwrap(),
             addr
