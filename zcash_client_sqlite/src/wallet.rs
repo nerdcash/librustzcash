@@ -1502,6 +1502,50 @@ pub(crate) fn get_transparent_balances<P: consensus::Parameters>(
     Ok(res)
 }
 
+#[cfg(feature = "transparent-inputs")]
+pub(crate) fn get_transparent_addresses_and_sync_heights<P: consensus::Parameters>(
+    conn: &rusqlite::Connection,
+    params: &P,
+) -> Result<HashMap<TransparentAddress, Option<BlockHeight>>, SqliteClientError> {
+    let mut stmt = conn.prepare(
+        "SELECT cached_transparent_receiver_address, last_downloaded_transparent_block
+         FROM addresses",
+    )?;
+
+    let mut res = HashMap::new();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let taddr_str: String = row.get(0)?;
+        let taddr = TransparentAddress::decode(params, &taddr_str)?;
+        let height: Option<u32> = row.get(1)?;
+
+        res.insert(taddr, height.map(|h| BlockHeight::from(h)));
+    }
+
+    Ok(res)
+}
+
+#[cfg(feature = "transparent-inputs")]
+pub(crate) fn put_latest_scanned_block_for_transparent<P: consensus::Parameters>(
+    conn: &rusqlite::Connection,
+    params: &P,
+    address: &TransparentAddress,
+    block_height: BlockHeight,
+) -> Result<(), SqliteClientError> {
+    let mut stmt = conn.prepare(
+        "UPDATE addresses SET last_downloaded_transparent_block = :block_height
+         WHERE cached_transparent_receiver_address = :address",
+    )?;
+
+    let addr_str = address.encode(params);
+    stmt.execute(named_params![
+        ":address": addr_str,
+        ":block_height": u32::from(block_height),
+    ])?;
+
+    Ok(())
+}
+
 /// Returns a vector with the IDs of all accounts known to this wallet.
 pub(crate) fn get_account_ids(
     conn: &rusqlite::Connection,

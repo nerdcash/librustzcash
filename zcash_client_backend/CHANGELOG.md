@@ -22,6 +22,8 @@ and this library adheres to Rust's notion of
 - `zcash_client_backend::wallet`:
   - `Note::Orchard`
 - `WalletWrite::insert_address_with_diversifier_index`
+- `WalletWrite::put_latest_scanned_block_for_transparent`
+- `WalletRead::get_transparent_addresses_and_sync_heights`
 
 ### Changed
 - `zcash_client_backend::data_api`:

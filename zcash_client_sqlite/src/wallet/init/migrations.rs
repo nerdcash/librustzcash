@@ -1,5 +1,6 @@
 mod add_account_birthdays;
 mod add_transaction_views;
+mod add_transparent_sync_tracking;
 mod add_utxo_account;
 mod addresses_table;
 mod initial_setup;
@@ -33,11 +34,11 @@ pub(super) fn all_migrations<P: consensus::Parameters + 'static>(
     //                         /           \
     //                utxos_table         ufvk_support
     //                   |                 /         \
-    //                   |    addresses_table   sent_notes_to_internal
-    //                   |          /                /
-    //                 add_utxo_account             /
-    //                              \              /
-    //                           add_transaction_views
+    //                   |    addresses_table        sent_notes_to_internal
+    //                   |    /      \                                /
+    //          add_utxo_account    add_transparent_sync_tracking    /
+    //                       \                                      /
+    //                               add_transaction_views
     //                                     |
     //                             v_transactions_net
     //                                     |
@@ -90,5 +91,6 @@ pub(super) fn all_migrations<P: consensus::Parameters + 'static>(
         Box::new(receiving_key_scopes::Migration {
             params: params.clone(),
         }),
+        Box::new(add_transparent_sync_tracking::Migration),
     ]
 }

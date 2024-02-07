@@ -573,6 +573,15 @@ pub trait WalletRead {
 
     /// Returns a vector with the IDs of all accounts known to this wallet.
     fn get_account_ids(&self) -> Result<Vec<AccountId>, Self::Error>;
+
+    /// Gets the transparent addresses and their last sync heights
+    /// across all accounts, for purposes of scanning for new transactions.
+    ///
+    /// Use [`WalletWrite::put_latest_scanned_block_for_transparent`] during sync
+    /// to record updates to the block heights per address.
+    fn get_transparent_addresses_and_sync_heights(
+        &mut self,
+    ) -> Result<HashMap<TransparentAddress, Option<BlockHeight>>, Self::Error>;
 }
 
 /// Metadata describing the sizes of the zcash note commitment trees as of a particular block.
@@ -1087,6 +1096,13 @@ pub trait WalletWrite: WalletRead {
         &mut self,
         output: &WalletTransparentOutput,
     ) -> Result<Self::UtxoRef, Self::Error>;
+
+    /// Records the last block that was scanned for transparent transactions.
+    fn put_latest_scanned_block_for_transparent(
+        &mut self,
+        address: &TransparentAddress,
+        block_height: BlockHeight,
+    ) -> Result<(), Self::Error>;
 }
 
 /// This trait describes a capability for manipulating wallet note commitment trees.
@@ -1322,6 +1338,12 @@ pub mod testing {
         fn get_account_ids(&self) -> Result<Vec<AccountId>, Self::Error> {
             Ok(Vec::new())
         }
+
+        fn get_transparent_addresses_and_sync_heights(
+            &mut self,
+        ) -> Result<HashMap<TransparentAddress, Option<BlockHeight>>, Self::Error> {
+            Ok(HashMap::new())
+        }
     }
 
     impl WalletWrite for MockWalletDb {
@@ -1387,6 +1409,14 @@ pub mod testing {
             _output: &WalletTransparentOutput,
         ) -> Result<Self::UtxoRef, Self::Error> {
             Ok(0)
+        }
+
+        fn put_latest_scanned_block_for_transparent(
+            &mut self,
+            _address: &TransparentAddress,
+            _block_height: BlockHeight,
+        ) -> Result<(), Self::Error> {
+            Ok(())
         }
     }
 

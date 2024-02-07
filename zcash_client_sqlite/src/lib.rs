@@ -371,6 +371,21 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters> WalletRead for W
         );
     }
 
+    fn get_transparent_addresses_and_sync_heights(
+        &mut self,
+    ) -> Result<HashMap<TransparentAddress, Option<BlockHeight>>, Self::Error> {
+        #[cfg(feature = "transparent-inputs")]
+        return wallet::get_transparent_addresses_and_sync_heights(
+            self.conn.borrow(),
+            &self.params,
+        );
+
+        #[cfg(not(feature = "transparent-inputs"))]
+        panic!(
+            "The wallet must be compiled with the transparent-inputs feature to use this method."
+        );
+    }
+
     #[cfg(feature = "orchard")]
     fn get_orchard_nullifiers(
         &self,
@@ -817,6 +832,25 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
         panic!(
             "The wallet must be compiled with the transparent-inputs feature to use this method."
         );
+    }
+
+    fn put_latest_scanned_block_for_transparent(
+        &mut self,
+        _address: &TransparentAddress,
+        _block_height: BlockHeight,
+    ) -> Result<(), Self::Error> {
+        #[cfg(feature = "transparent-inputs")]
+        return wallet::put_latest_scanned_block_for_transparent(
+            &self.conn,
+            &self.params,
+            _address,
+            _block_height,
+        );
+
+        #[cfg(not(feature = "transparent-inputs"))]
+        panic!(
+            "The wallet must be compiled with the transparent-inputs feature to use this method."
+        )
     }
 }
 
