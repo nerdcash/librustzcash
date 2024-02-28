@@ -65,8 +65,8 @@ use zcash_client_backend::{
         chain::{BlockSource, CommitmentTreeRoot},
         scanning::{ScanPriority, ScanRange},
         AccountBirthday, BlockMetadata, DecryptedTransaction, InputSource, NullifierQuery,
-        ScannedBlock, SentTransaction, WalletCommitmentTrees, WalletRead, WalletSummary,
-        WalletWrite, SAPLING_SHARD_HEIGHT,
+        ScannedBlock, SentTransaction, TransparentAddressSyncInfo, WalletCommitmentTrees,
+        WalletRead, WalletSummary, WalletWrite, SAPLING_SHARD_HEIGHT,
     },
     keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
     proto::compact_formats::CompactBlock,
@@ -373,7 +373,7 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters> WalletRead for W
 
     fn get_transparent_addresses_and_sync_heights(
         &mut self,
-    ) -> Result<HashMap<TransparentAddress, Option<BlockHeight>>, Self::Error> {
+    ) -> Result<Vec<TransparentAddressSyncInfo>, Self::Error> {
         #[cfg(feature = "transparent-inputs")]
         return wallet::get_transparent_addresses_and_sync_heights(
             self.conn.borrow(),

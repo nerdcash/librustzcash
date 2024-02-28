@@ -112,7 +112,10 @@ use {
     crate::UtxoId,
     rusqlite::Row,
     std::collections::BTreeSet,
-    zcash_client_backend::{address::AddressMetadata, wallet::WalletTransparentOutput},
+    zcash_client_backend::{
+        address::AddressMetadata, data_api::TransparentAddressSyncInfo,
+        wallet::WalletTransparentOutput,
+    },
     zcash_primitives::{
         legacy::{keys::IncomingViewingKey, Script, TransparentAddress},
         transaction::components::{OutPoint, TxOut},
@@ -1506,20 +1509,40 @@ pub(crate) fn get_transparent_balances<P: consensus::Parameters>(
 pub(crate) fn get_transparent_addresses_and_sync_heights<P: consensus::Parameters>(
     conn: &rusqlite::Connection,
     params: &P,
-) -> Result<HashMap<TransparentAddress, Option<BlockHeight>>, SqliteClientError> {
+) -> Result<Vec<TransparentAddressSyncInfo>, SqliteClientError> {
     let mut stmt = conn.prepare(
-        "SELECT cached_transparent_receiver_address, last_downloaded_transparent_block
-         FROM addresses",
+        "SELECT cached_transparent_receiver_address, diversifier_index_be, last_downloaded_transparent_block, account
+         FROM addresses
+         WHERE cached_transparent_receiver_address IS NOT NULL",
     )?;
 
-    let mut res = HashMap::new();
+    let mut res = Vec::new();
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let taddr_str: String = row.get(0)?;
-        let taddr = TransparentAddress::decode(params, &taddr_str)?;
-        let height: Option<u32> = row.get(1)?;
+        let address = TransparentAddress::decode(params, &taddr_str)?;
 
-        res.insert(taddr, height.map(|h| BlockHeight::from(h)));
+        let di_vec: Vec<u8> = row.get(1)?;
+        let mut di_bytes: [u8; 11] = di_vec.try_into().map_err(|_| {
+            SqliteClientError::CorruptedData("Diversifier index is not an 11-byte value".to_owned())
+        })?;
+        di_bytes.reverse();
+        let di = DiversifierIndex::from(di_bytes);
+        let index = u32::try_from(di).map_err(|_| {
+            SqliteClientError::CorruptedData(
+                "Address index not within transparent range.".to_string(),
+            )
+        })?;
+
+        let height: Option<u32> = row.get(2)?;
+        let account_id: u32 = row.get(3)?;
+
+        res.push(TransparentAddressSyncInfo {
+            address,
+            index,
+            height: height.map(|h| BlockHeight::from(h)),
+            account_id,
+        });
     }
 
     Ok(res)
