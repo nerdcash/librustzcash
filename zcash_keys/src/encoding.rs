@@ -4,15 +4,20 @@
 //! [zcash_primitives::constants] module.
 
 use crate::address::UnifiedAddress;
-use bech32::{self, Error, FromBase32, ToBase32, Variant};
 use bs58::{self, decode::Error as Bs58Error};
 use std::fmt;
-use std::io::{self, Write};
 
-use sapling::zip32::{ExtendedFullViewingKey, ExtendedSpendingKey};
 use zcash_address::unified::{self, Encoding};
 use zcash_primitives::{consensus, legacy::TransparentAddress};
 
+#[cfg(feature = "sapling")]
+use {
+    bech32::{self, Error, FromBase32, ToBase32, Variant},
+    sapling::zip32::{ExtendedFullViewingKey, ExtendedSpendingKey},
+    std::io::{self, Write},
+};
+
+#[cfg(feature = "sapling")]
 fn bech32_encode<F>(hrp: &str, write: F) -> String
 where
     F: Fn(&mut dyn Write) -> io::Result<()>,
@@ -23,6 +28,7 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "sapling")]
 pub enum Bech32DecodeError {
     Bech32Error(Error),
     IncorrectVariant(Variant),
@@ -30,12 +36,14 @@ pub enum Bech32DecodeError {
     HrpMismatch { expected: String, actual: String },
 }
 
+#[cfg(feature = "sapling")]
 impl From<Error> for Bech32DecodeError {
     fn from(err: Error) -> Self {
         Bech32DecodeError::Bech32Error(err)
     }
 }
 
+#[cfg(feature = "sapling")]
 impl fmt::Display for Bech32DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self {
@@ -57,6 +65,7 @@ impl fmt::Display for Bech32DecodeError {
     }
 }
 
+#[cfg(feature = "sapling")]
 fn bech32_decode<T, F>(hrp: &str, s: &str, read: F) -> Result<T, Bech32DecodeError>
 where
     F: Fn(Vec<u8>) -> Option<T>,
@@ -140,6 +149,7 @@ impl<P: consensus::Parameters> AddressCodec<P> for TransparentAddress {
     }
 }
 
+#[cfg(feature = "sapling")]
 impl<P: consensus::Parameters> AddressCodec<P> for sapling::PaymentAddress {
     type Error = Bech32DecodeError;
 
@@ -193,6 +203,7 @@ impl<P: consensus::Parameters> AddressCodec<P> for UnifiedAddress {
 /// let encoded = encode_extended_spending_key(HRP_SAPLING_EXTENDED_SPENDING_KEY, &extsk);
 /// ```
 /// [`ExtendedSpendingKey`]: sapling::zip32::ExtendedSpendingKey
+#[cfg(feature = "sapling")]
 pub fn encode_extended_spending_key(hrp: &str, extsk: &ExtendedSpendingKey) -> String {
     bech32_encode(hrp, |w| extsk.write(w))
 }
@@ -200,6 +211,7 @@ pub fn encode_extended_spending_key(hrp: &str, extsk: &ExtendedSpendingKey) -> S
 /// Decodes an [`ExtendedSpendingKey`] from a Bech32-encoded string.
 ///
 /// [`ExtendedSpendingKey`]: sapling::zip32::ExtendedSpendingKey
+#[cfg(feature = "sapling")]
 pub fn decode_extended_spending_key(
     hrp: &str,
     s: &str,
@@ -227,6 +239,7 @@ pub fn decode_extended_spending_key(
 /// let encoded = encode_extended_full_viewing_key(HRP_SAPLING_EXTENDED_FULL_VIEWING_KEY, &extfvk);
 /// ```
 /// [`ExtendedFullViewingKey`]: sapling::zip32::ExtendedFullViewingKey
+#[cfg(feature = "sapling")]
 pub fn encode_extended_full_viewing_key(hrp: &str, extfvk: &ExtendedFullViewingKey) -> String {
     bech32_encode(hrp, |w| extfvk.write(w))
 }
@@ -234,6 +247,7 @@ pub fn encode_extended_full_viewing_key(hrp: &str, extfvk: &ExtendedFullViewingK
 /// Decodes an [`ExtendedFullViewingKey`] from a Bech32-encoded string.
 ///
 /// [`ExtendedFullViewingKey`]: sapling::zip32::ExtendedFullViewingKey
+#[cfg(feature = "sapling")]
 pub fn decode_extended_full_viewing_key(
     hrp: &str,
     s: &str,
@@ -269,6 +283,7 @@ pub fn decode_extended_full_viewing_key(
 /// );
 /// ```
 /// [`PaymentAddress`]: sapling::PaymentAddress
+#[cfg(feature = "sapling")]
 pub fn encode_payment_address(hrp: &str, addr: &sapling::PaymentAddress) -> String {
     bech32_encode(hrp, |w| w.write_all(&addr.to_bytes()))
 }
@@ -278,6 +293,7 @@ pub fn encode_payment_address(hrp: &str, addr: &sapling::PaymentAddress) -> Stri
 /// network parameters.
 ///
 /// [`PaymentAddress`]: sapling::PaymentAddress
+#[cfg(feature = "sapling")]
 pub fn encode_payment_address_p<P: consensus::Parameters>(
     params: &P,
     addr: &sapling::PaymentAddress,
@@ -316,6 +332,7 @@ pub fn encode_payment_address_p<P: consensus::Parameters>(
 /// );
 /// ```
 /// [`PaymentAddress`]: sapling::PaymentAddress
+#[cfg(feature = "sapling")]
 pub fn decode_payment_address(
     hrp: &str,
     s: &str,
@@ -348,7 +365,7 @@ pub fn decode_payment_address(
 ///     encode_transparent_address(
 ///         &TEST_NETWORK.b58_pubkey_address_prefix(),
 ///         &TEST_NETWORK.b58_script_address_prefix(),
-///         &TransparentAddress::PublicKey([0; 20]),
+///         &TransparentAddress::PublicKeyHash([0; 20]),
 ///     ),
 ///     "tm9iMLAuYMzJ6jtFLcA7rzUmfreGuKvr7Ma",
 /// );
@@ -357,7 +374,7 @@ pub fn decode_payment_address(
 ///     encode_transparent_address(
 ///         &TEST_NETWORK.b58_pubkey_address_prefix(),
 ///         &TEST_NETWORK.b58_script_address_prefix(),
-///         &TransparentAddress::Script([0; 20]),
+///         &TransparentAddress::ScriptHash([0; 20]),
 ///     ),
 ///     "t26YoyZ1iPgiMEWL4zGUm74eVWfhyDMXzY2",
 /// );
@@ -369,13 +386,13 @@ pub fn encode_transparent_address(
     addr: &TransparentAddress,
 ) -> String {
     let decoded = match addr {
-        TransparentAddress::PublicKey(key_id) => {
+        TransparentAddress::PublicKeyHash(key_id) => {
             let mut decoded = vec![0; pubkey_version.len() + 20];
             decoded[..pubkey_version.len()].copy_from_slice(pubkey_version);
             decoded[pubkey_version.len()..].copy_from_slice(key_id);
             decoded
         }
-        TransparentAddress::Script(script_id) => {
+        TransparentAddress::ScriptHash(script_id) => {
             let mut decoded = vec![0; script_version.len() + 20];
             decoded[..script_version.len()].copy_from_slice(script_version);
             decoded[script_version.len()..].copy_from_slice(script_id);
@@ -418,7 +435,7 @@ pub fn encode_transparent_address_p<P: consensus::Parameters>(
 ///         &TEST_NETWORK.b58_script_address_prefix(),
 ///         "tm9iMLAuYMzJ6jtFLcA7rzUmfreGuKvr7Ma",
 ///     ),
-///     Ok(Some(TransparentAddress::PublicKey([0; 20]))),
+///     Ok(Some(TransparentAddress::PublicKeyHash([0; 20]))),
 /// );
 ///
 /// assert_eq!(
@@ -427,7 +444,7 @@ pub fn encode_transparent_address_p<P: consensus::Parameters>(
 ///         &TEST_NETWORK.b58_script_address_prefix(),
 ///         "t26YoyZ1iPgiMEWL4zGUm74eVWfhyDMXzY2",
 ///     ),
-///     Ok(Some(TransparentAddress::Script([0; 20]))),
+///     Ok(Some(TransparentAddress::ScriptHash([0; 20]))),
 /// );
 /// ```
 /// [`TransparentAddress`]: zcash_primitives::legacy::TransparentAddress
@@ -441,12 +458,12 @@ pub fn decode_transparent_address(
             decoded[pubkey_version.len()..]
                 .try_into()
                 .ok()
-                .map(TransparentAddress::PublicKey)
+                .map(TransparentAddress::PublicKeyHash)
         } else if decoded.starts_with(script_version) {
             decoded[script_version.len()..]
                 .try_into()
                 .ok()
-                .map(TransparentAddress::Script)
+                .map(TransparentAddress::ScriptHash)
         } else {
             None
         }
@@ -454,15 +471,15 @@ pub fn decode_transparent_address(
 }
 
 #[cfg(test)]
-mod tests {
-    use sapling::{zip32::ExtendedSpendingKey, PaymentAddress};
-    use zcash_primitives::constants;
-
+#[cfg(feature = "sapling")]
+mod tests_sapling {
     use super::{
         decode_extended_full_viewing_key, decode_extended_spending_key, decode_payment_address,
         encode_extended_full_viewing_key, encode_extended_spending_key, encode_payment_address,
         Bech32DecodeError,
     };
+    use sapling::{zip32::ExtendedSpendingKey, PaymentAddress};
+    use zcash_primitives::constants;
 
     #[test]
     fn extended_spending_key() {

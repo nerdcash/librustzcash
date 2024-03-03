@@ -5,6 +5,7 @@ use std::num::NonZeroU32;
 #[cfg(feature = "unstable")]
 use std::fs::File;
 
+use nonempty::NonEmpty;
 use prost::Message;
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection};
@@ -21,7 +22,6 @@ use sapling::{
     zip32::DiversifiableFullViewingKey,
     Note, Nullifier, PaymentAddress,
 };
-use zcash_client_backend::fees::{standard, DustOutputPolicy};
 #[allow(deprecated)]
 use zcash_client_backend::{
     address::Address,
@@ -29,21 +29,24 @@ use zcash_client_backend::{
         self,
         chain::{scan_cached_blocks, BlockSource, ScanSummary},
         wallet::{
-            create_proposed_transaction, create_spend_to_address,
-            input_selection::{
-                GreedyInputSelector, GreedyInputSelectorError, InputSelector, Proposal,
-            },
+            create_proposed_transactions, create_spend_to_address,
+            input_selection::{GreedyInputSelector, GreedyInputSelectorError, InputSelector},
             propose_standard_transfer_to_address, propose_transfer, spend,
         },
         AccountBalance, AccountBirthday, WalletRead, WalletSummary, WalletWrite,
     },
     keys::UnifiedSpendingKey,
+    proposal::Proposal,
     proto::compact_formats::{
         self as compact, CompactBlock, CompactSaplingOutput, CompactSaplingSpend, CompactTx,
     },
     proto::proposal,
     wallet::OvkPolicy,
     zip321,
+};
+use zcash_client_backend::{
+    fees::{standard, DustOutputPolicy},
+    ShieldedProtocol,
 };
 use zcash_note_encryption::Domain;
 use zcash_primitives::{
@@ -442,8 +445,9 @@ impl<Cache> TestState<Cache> {
         ovk_policy: OvkPolicy,
         min_confirmations: NonZeroU32,
         change_memo: Option<MemoBytes>,
+        fallback_change_pool: ShieldedProtocol,
     ) -> Result<
-        TxId,
+        NonEmpty<TxId>,
         data_api::error::Error<
             SqliteClientError,
             commitment_tree::Error,
@@ -465,6 +469,7 @@ impl<Cache> TestState<Cache> {
             ovk_policy,
             min_confirmations,
             change_memo,
+            fallback_change_pool,
         )
     }
 
@@ -478,7 +483,7 @@ impl<Cache> TestState<Cache> {
         ovk_policy: OvkPolicy,
         min_confirmations: NonZeroU32,
     ) -> Result<
-        TxId,
+        NonEmpty<TxId>,
         data_api::error::Error<
             SqliteClientError,
             commitment_tree::Error,
@@ -489,6 +494,7 @@ impl<Cache> TestState<Cache> {
     where
         InputsT: InputSelector<InputSource = WalletDb<Connection, Network>>,
     {
+        #![allow(deprecated)]
         let params = self.network();
         let prover = test_prover();
         spend(
@@ -547,6 +553,7 @@ impl<Cache> TestState<Cache> {
         amount: NonNegativeAmount,
         memo: Option<MemoBytes>,
         change_memo: Option<MemoBytes>,
+        fallback_change_pool: ShieldedProtocol,
     ) -> Result<
         Proposal<StandardFeeRule, ReceivedNoteId>,
         data_api::error::Error<
@@ -567,6 +574,7 @@ impl<Cache> TestState<Cache> {
             amount,
             memo,
             change_memo,
+            fallback_change_pool,
         );
 
         if let Ok(proposal) = &result {
@@ -609,14 +617,14 @@ impl<Cache> TestState<Cache> {
         )
     }
 
-    /// Invokes [`create_proposed_transaction`] with the given arguments.
-    pub(crate) fn create_proposed_transaction<InputsErrT, FeeRuleT>(
+    /// Invokes [`create_proposed_transactions`] with the given arguments.
+    pub(crate) fn create_proposed_transactions<InputsErrT, FeeRuleT>(
         &mut self,
         usk: &UnifiedSpendingKey,
         ovk_policy: OvkPolicy,
         proposal: &Proposal<FeeRuleT, ReceivedNoteId>,
     ) -> Result<
-        TxId,
+        NonEmpty<TxId>,
         data_api::error::Error<
             SqliteClientError,
             commitment_tree::Error,
@@ -629,7 +637,7 @@ impl<Cache> TestState<Cache> {
     {
         let params = self.network();
         let prover = test_prover();
-        create_proposed_transaction(
+        create_proposed_transactions(
             &mut self.db_data,
             &params,
             &prover,
@@ -651,7 +659,7 @@ impl<Cache> TestState<Cache> {
         from_addrs: &[TransparentAddress],
         min_confirmations: u32,
     ) -> Result<
-        TxId,
+        NonEmpty<TxId>,
         data_api::error::Error<
             SqliteClientError,
             commitment_tree::Error,
@@ -724,7 +732,10 @@ impl<Cache> TestState<Cache> {
         })
     }
 
-    pub(crate) fn get_wallet_summary(&self, min_confirmations: u32) -> Option<WalletSummary> {
+    pub(crate) fn get_wallet_summary(
+        &self,
+        min_confirmations: u32,
+    ) -> Option<WalletSummary<AccountId>> {
         get_wallet_summary(
             &self.wallet().conn.unchecked_transaction().unwrap(),
             &self.wallet().params,
@@ -1053,12 +1064,14 @@ impl TestCache for FsBlockCache {
 pub(crate) fn input_selector(
     fee_rule: StandardFeeRule,
     change_memo: Option<&str>,
+    fallback_change_pool: ShieldedProtocol,
 ) -> GreedyInputSelector<
     WalletDb<rusqlite::Connection, Network>,
     standard::SingleOutputChangeStrategy,
 > {
     let change_memo = change_memo.map(|m| MemoBytes::from(m.parse::<Memo>().unwrap()));
-    let change_strategy = standard::SingleOutputChangeStrategy::new(fee_rule, change_memo);
+    let change_strategy =
+        standard::SingleOutputChangeStrategy::new(fee_rule, change_memo, fallback_change_pool);
     GreedyInputSelector::new(change_strategy, DustOutputPolicy::default())
 }
 

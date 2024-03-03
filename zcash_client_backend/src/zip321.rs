@@ -6,7 +6,7 @@
 //! The specification for ZIP 321 URIs may be found at <https://zips.z.cash/zip-0321>
 use core::fmt::Debug;
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     fmt::{self, Display},
 };
 
@@ -20,9 +20,6 @@ use zcash_primitives::{
     memo::{self, MemoBytes},
     transaction::components::amount::NonNegativeAmount,
 };
-
-#[cfg(any(test, feature = "test-dependencies"))]
-use std::cmp::Ordering;
 
 use crate::address::Address;
 
@@ -139,28 +136,6 @@ impl Payment {
     pub(in crate::zip321) fn normalize(&mut self) {
         self.other_params.sort();
     }
-
-    /// Returns a function which compares two normalized payments, with addresses sorted by their
-    /// string representation given the specified network. This does not perform normalization
-    /// internally, so payments must be normalized prior to being passed to the comparison function
-    /// returned from this method.
-    #[cfg(any(test, feature = "test-dependencies"))]
-    pub(in crate::zip321) fn compare_normalized<P: consensus::Parameters>(
-        params: &P,
-    ) -> impl Fn(&Payment, &Payment) -> Ordering + '_ {
-        move |a: &Payment, b: &Payment| {
-            let a_addr = a.recipient_address.encode(params);
-            let b_addr = b.recipient_address.encode(params);
-
-            a_addr
-                .cmp(&b_addr)
-                .then(a.amount.cmp(&b.amount))
-                .then(a.memo.cmp(&b.memo))
-                .then(a.label.cmp(&b.label))
-                .then(a.message.cmp(&b.message))
-                .then(a.other_params.cmp(&b.other_params))
-        }
-    }
 }
 
 /// A ZIP321 transaction request.
@@ -171,18 +146,27 @@ impl Payment {
 /// payment value in the request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionRequest {
-    payments: Vec<Payment>,
+    payments: BTreeMap<usize, Payment>,
 }
 
 impl TransactionRequest {
     /// Constructs a new empty transaction request.
     pub fn empty() -> Self {
-        Self { payments: vec![] }
+        Self {
+            payments: BTreeMap::new(),
+        }
     }
 
-    /// Constructs a new transaction request that obeys the ZIP-321 invariants
+    /// Constructs a new transaction request that obeys the ZIP-321 invariants.
     pub fn new(payments: Vec<Payment>) -> Result<TransactionRequest, Zip321Error> {
-        let request = TransactionRequest { payments };
+        // Payment indices are limited to 4 digits
+        if payments.len() > 9999 {
+            return Err(Zip321Error::TooManyPayments(payments.len()));
+        }
+
+        let request = TransactionRequest {
+            payments: payments.into_iter().enumerate().collect(),
+        };
 
         // Enforce validity requirements.
         if !request.payments.is_empty() {
@@ -195,9 +179,27 @@ impl TransactionRequest {
         Ok(request)
     }
 
-    /// Returns the slice of payments that make up this request.
-    pub fn payments(&self) -> &[Payment] {
-        &self.payments[..]
+    /// Constructs a new transaction request from the provided map from payment
+    /// index to payment.
+    ///
+    /// Payment index 0 will be mapped to the empty payment index.
+    pub fn from_indexed(
+        payments: BTreeMap<usize, Payment>,
+    ) -> Result<TransactionRequest, Zip321Error> {
+        if let Some(k) = payments.keys().find(|k| **k > 9999) {
+            // This is not quite the correct error, but close enough.
+            return Err(Zip321Error::TooManyPayments(*k));
+        }
+
+        Ok(TransactionRequest { payments })
+    }
+
+    /// Returns the map of payments that make up this request.
+    ///
+    /// This is a map from payment index to payment. Payment index `0` is used to denote
+    /// the empty payment index in the returned values.
+    pub fn payments(&self) -> &BTreeMap<usize, Payment> {
+        &self.payments
     }
 
     /// Returns the total value of payments to be made.
@@ -205,36 +207,29 @@ impl TransactionRequest {
     /// Returns `Err` in the case of overflow, or if the value is
     /// outside the range `0..=MAX_MONEY` zatoshis.
     pub fn total(&self) -> Result<NonNegativeAmount, ()> {
-        if self.payments.is_empty() {
-            Ok(NonNegativeAmount::ZERO)
-        } else {
-            self.payments
-                .iter()
-                .map(|p| p.amount)
-                .fold(Ok(NonNegativeAmount::ZERO), |acc, a| (acc? + a).ok_or(()))
-        }
+        self.payments
+            .values()
+            .map(|p| p.amount)
+            .fold(Ok(NonNegativeAmount::ZERO), |acc, a| (acc? + a).ok_or(()))
     }
 
     /// A utility for use in tests to help check round-trip serialization properties.
     #[cfg(any(test, feature = "test-dependencies"))]
-    pub(in crate::zip321) fn normalize<P: consensus::Parameters>(&mut self, params: &P) {
-        for p in &mut self.payments {
+    pub(in crate::zip321) fn normalize(&mut self) {
+        for p in self.payments.values_mut() {
             p.normalize();
         }
-
-        self.payments.sort_by(Payment::compare_normalized(params));
     }
 
     /// A utility for use in tests to help check round-trip serialization properties.
     /// by comparing a two transaction requests for equality after normalization.
-    #[cfg(all(test, feature = "test-dependencies"))]
-    pub(in crate::zip321) fn normalize_and_eq<P: consensus::Parameters>(
-        params: &P,
+    #[cfg(test)]
+    pub(in crate::zip321) fn normalize_and_eq(
         a: &mut TransactionRequest,
         b: &mut TransactionRequest,
     ) -> bool {
-        a.normalize(params);
-        b.normalize(params);
+        a.normalize();
+        b.normalize();
 
         a == b
     }
@@ -275,9 +270,10 @@ impl TransactionRequest {
                 )
         }
 
-        match &self.payments[..] {
-            [] => "zcash:".to_string(),
-            [payment] => {
+        match self.payments.len() {
+            0 => "zcash:".to_string(),
+            1 if *self.payments.iter().next().unwrap().0 == 0 => {
+                let (_, payment) = self.payments.iter().next().unwrap();
                 let query_params = payment_params(payment, None)
                     .into_iter()
                     .collect::<Vec<String>>();
@@ -293,12 +289,12 @@ impl TransactionRequest {
                 let query_params = self
                     .payments
                     .iter()
-                    .enumerate()
                     .flat_map(|(i, payment)| {
+                        let idx = if *i == 0 { None } else { Some(*i) };
                         let primary_address = payment.recipient_address.clone();
                         std::iter::empty()
-                            .chain(Some(render::addr_param(params, &primary_address, Some(i))))
-                            .chain(payment_params(payment, Some(i)))
+                            .chain(Some(render::addr_param(params, &primary_address, idx)))
+                            .chain(payment_params(payment, idx))
                     })
                     .collect::<Vec<String>>();
 
@@ -325,7 +321,7 @@ impl TransactionRequest {
         };
 
         // Construct sets of payment parameters, keyed by the payment index.
-        let mut params_by_index: HashMap<usize, Vec<parse::Param>> = HashMap::new();
+        let mut params_by_index: BTreeMap<usize, Vec<parse::Param>> = BTreeMap::new();
 
         // Add the primary address, if any, to the index.
         if let Some(p) = primary_addr_param {
@@ -352,8 +348,8 @@ impl TransactionRequest {
         // Build the actual payment values from the index.
         params_by_index
             .into_iter()
-            .map(|(i, params)| parse::to_payment(params, i))
-            .collect::<Result<Vec<_>, _>>()
+            .map(|(i, params)| parse::to_payment(params, i).map(|payment| (i, payment)))
+            .collect::<Result<BTreeMap<usize, Payment>, _>>()
             .map(|payments| TransactionRequest { payments })
     }
 }
@@ -739,7 +735,7 @@ mod parse {
     }
 }
 
-#[cfg(feature = "test-dependencies")]
+#[cfg(any(test, feature = "test-dependencies"))]
 pub mod testing {
     use proptest::collection::btree_map;
     use proptest::collection::vec;
@@ -756,6 +752,14 @@ pub mod testing {
     use super::{MemoBytes, Payment, TransactionRequest};
     pub const VALID_PARAMNAME: &str = "[a-zA-Z][a-zA-Z0-9+-]*";
 
+    #[cfg(feature = "transparent-inputs")]
+    const TRANSPARENT_INPUTS_ENABLED: bool = true;
+    #[cfg(not(feature = "transparent-inputs"))]
+    const TRANSPARENT_INPUTS_ENABLED: bool = false;
+
+    pub(crate) const UA_REQUEST: UnifiedAddressRequest =
+        UnifiedAddressRequest::unsafe_new(false, true, TRANSPARENT_INPUTS_ENABLED);
+
     prop_compose! {
         pub fn arb_valid_memo()(bytes in vec(any::<u8>(), 0..512)) -> MemoBytes {
             MemoBytes::from_bytes(&bytes).unwrap()
@@ -764,7 +768,7 @@ pub mod testing {
 
     prop_compose! {
         pub fn arb_zip321_payment()(
-            recipient_address in arb_addr(UnifiedAddressRequest::unsafe_new(false, true, true)),
+            recipient_address in arb_addr(UA_REQUEST),
             amount in arb_nonnegative_amount(),
             memo in option::of(arb_valid_memo()),
             message in option::of(any::<String>()),
@@ -789,9 +793,17 @@ pub mod testing {
     }
 
     prop_compose! {
-        pub fn arb_zip321_request()(payments in vec(arb_zip321_payment(), 1..10)) -> TransactionRequest {
-            let mut req = TransactionRequest { payments };
-            req.normalize(&TEST_NETWORK); // just to make test comparisons easier
+        pub fn arb_zip321_request()(payments in btree_map(0usize..10000, arb_zip321_payment(), 1..10)) -> TransactionRequest {
+            let mut req = TransactionRequest::from_indexed(payments).unwrap();
+            req.normalize(); // just to make test comparisons easier
+            req
+        }
+    }
+
+    prop_compose! {
+        pub fn arb_zip321_request_sequential()(payments in vec(arb_zip321_payment(), 1..10)) -> TransactionRequest {
+            let mut req = TransactionRequest::new(payments).unwrap();
+            req.normalize(); // just to make test comparisons easier
             req
         }
     }
@@ -804,7 +816,7 @@ pub mod testing {
 
     prop_compose! {
         pub fn arb_addr_str()(
-            recipient_address in arb_addr(UnifiedAddressRequest::unsafe_new(false, true, true))
+            recipient_address in arb_addr(UA_REQUEST)
         ) -> String {
             recipient_address.encode(&TEST_NETWORK)
         }
@@ -813,37 +825,29 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::{any, proptest};
     use std::str::FromStr;
-    use zcash_keys::{address::testing::arb_addr, keys::UnifiedAddressRequest};
+
+    use zcash_keys::address::testing::arb_addr;
     use zcash_primitives::{
         consensus::{Parameters, TEST_NETWORK},
         memo::Memo,
-        transaction::components::{amount::NonNegativeAmount, Amount},
+        transaction::components::amount::{
+            testing::arb_nonnegative_amount, Amount, NonNegativeAmount,
+        },
     };
 
     #[cfg(feature = "local-consensus")]
     use zcash_primitives::{local_consensus::LocalNetwork, BlockHeight};
 
-    use crate::address::Address;
+    use crate::{address::Address, encoding::decode_payment_address, zip321::testing::UA_REQUEST};
 
     use super::{
         memo_from_base64, memo_to_base64,
         parse::{parse_amount, zcashparam, Param},
-        render::amount_str,
-        MemoBytes, Payment, TransactionRequest,
-    };
-    use crate::encoding::decode_payment_address;
-
-    #[cfg(all(test, feature = "test-dependencies"))]
-    use proptest::prelude::{any, proptest};
-
-    #[cfg(all(test, feature = "test-dependencies"))]
-    use zcash_primitives::transaction::components::amount::testing::arb_nonnegative_amount;
-
-    #[cfg(all(test, feature = "test-dependencies"))]
-    use super::{
-        render::{memo_param, str_param},
+        render::{amount_str, memo_param, str_param},
         testing::{arb_addr_str, arb_valid_memo, arb_zip321_request, arb_zip321_uri},
+        MemoBytes, Payment, TransactionRequest,
     };
 
     fn check_roundtrip(req: TransactionRequest) {
@@ -876,8 +880,8 @@ mod tests {
         let uri = "zcash:ztestsapling1n65uaftvs2g7075q2x2a04shfk066u3lldzxsrprfrqtzxnhc9ps73v4lhx4l9yfxj46sl0q90k?amount=3768769.02796286&message=";
         let parse_result = TransactionRequest::from_uri(&TEST_NETWORK, uri).unwrap();
 
-        let expected = TransactionRequest {
-            payments: vec![
+        let expected = TransactionRequest::new(
+            vec![
                 Payment {
                     recipient_address: Address::Sapling(decode_payment_address(TEST_NETWORK.hrp_sapling_payment_address(), "ztestsapling1n65uaftvs2g7075q2x2a04shfk066u3lldzxsrprfrqtzxnhc9ps73v4lhx4l9yfxj46sl0q90k").unwrap()),
                     amount: NonNegativeAmount::const_from_u64(376876902796286),
@@ -887,7 +891,7 @@ mod tests {
                     other_params: vec![],
                 }
             ]
-        };
+        ).unwrap();
 
         assert_eq!(parse_result, expected);
     }
@@ -897,8 +901,8 @@ mod tests {
         let uri = "zcash:ztestsapling1n65uaftvs2g7075q2x2a04shfk066u3lldzxsrprfrqtzxnhc9ps73v4lhx4l9yfxj46sl0q90k";
         let parse_result = TransactionRequest::from_uri(&TEST_NETWORK, uri).unwrap();
 
-        let expected = TransactionRequest {
-            payments: vec![
+        let expected = TransactionRequest::new(
+            vec![
                 Payment {
                     recipient_address: Address::Sapling(decode_payment_address(TEST_NETWORK.hrp_sapling_payment_address(), "ztestsapling1n65uaftvs2g7075q2x2a04shfk066u3lldzxsrprfrqtzxnhc9ps73v4lhx4l9yfxj46sl0q90k").unwrap()),
                     amount: NonNegativeAmount::ZERO,
@@ -908,15 +912,15 @@ mod tests {
                     other_params: vec![],
                 }
             ]
-        };
+        ).unwrap();
 
         assert_eq!(parse_result, expected);
     }
 
     #[test]
     fn test_zip321_roundtrip_empty_message() {
-        let req = TransactionRequest {
-            payments: vec![
+        let req = TransactionRequest::new(
+            vec![
                 Payment {
                     recipient_address: Address::Sapling(decode_payment_address(TEST_NETWORK.hrp_sapling_payment_address(), "ztestsapling1n65uaftvs2g7075q2x2a04shfk066u3lldzxsrprfrqtzxnhc9ps73v4lhx4l9yfxj46sl0q90k").unwrap()),
                     amount: NonNegativeAmount::ZERO,
@@ -926,7 +930,7 @@ mod tests {
                     other_params: vec![]
                 }
             ]
-        };
+        ).unwrap();
 
         check_roundtrip(req);
     }
@@ -963,19 +967,19 @@ mod tests {
         let valid_1 = "zcash:ztestsapling10yy2ex5dcqkclhc7z7yrnjq2z6feyjad56ptwlfgmy77dmaqqrl9gyhprdx59qgmsnyfska2kez?amount=1&memo=VGhpcyBpcyBhIHNpbXBsZSBtZW1vLg&message=Thank%20you%20for%20your%20purchase";
         let v1r = TransactionRequest::from_uri(&TEST_NETWORK, valid_1).unwrap();
         assert_eq!(
-            v1r.payments.get(0).map(|p| p.amount),
+            v1r.payments.get(&0).map(|p| p.amount),
             Some(NonNegativeAmount::const_from_u64(100000000))
         );
 
         let valid_2 = "zcash:?address=tmEZhbWHTpdKMw5it8YDspUXSMGQyFwovpU&amount=123.456&address.1=ztestsapling10yy2ex5dcqkclhc7z7yrnjq2z6feyjad56ptwlfgmy77dmaqqrl9gyhprdx59qgmsnyfska2kez&amount.1=0.789&memo.1=VGhpcyBpcyBhIHVuaWNvZGUgbWVtbyDinKjwn6aE8J-PhvCfjok";
         let mut v2r = TransactionRequest::from_uri(&TEST_NETWORK, valid_2).unwrap();
-        v2r.normalize(&TEST_NETWORK);
+        v2r.normalize();
         assert_eq!(
-            v2r.payments.get(0).map(|p| p.amount),
+            v2r.payments.get(&0).map(|p| p.amount),
             Some(NonNegativeAmount::const_from_u64(12345600000))
         );
         assert_eq!(
-            v2r.payments.get(1).map(|p| p.amount),
+            v2r.payments.get(&1).map(|p| p.amount),
             Some(NonNegativeAmount::const_from_u64(78900000))
         );
 
@@ -984,7 +988,7 @@ mod tests {
         let valid_3 = "zcash:ztestsapling10yy2ex5dcqkclhc7z7yrnjq2z6feyjad56ptwlfgmy77dmaqqrl9gyhprdx59qgmsnyfska2kez?amount=20999999.99999999";
         let v3r = TransactionRequest::from_uri(&TEST_NETWORK, valid_3).unwrap();
         assert_eq!(
-            v3r.payments.get(0).map(|p| p.amount),
+            v3r.payments.get(&0).map(|p| p.amount),
             Some(NonNegativeAmount::const_from_u64(2099999999999999u64))
         );
 
@@ -993,7 +997,7 @@ mod tests {
         let valid_4 = "zcash:ztestsapling10yy2ex5dcqkclhc7z7yrnjq2z6feyjad56ptwlfgmy77dmaqqrl9gyhprdx59qgmsnyfska2kez?amount=21000000";
         let v4r = TransactionRequest::from_uri(&TEST_NETWORK, valid_4).unwrap();
         assert_eq!(
-            v4r.payments.get(0).map(|p| p.amount),
+            v4r.payments.get(&0).map(|p| p.amount),
             Some(NonNegativeAmount::const_from_u64(2100000000000000u64))
         );
     }
@@ -1014,7 +1018,7 @@ mod tests {
         let valid_1 = "zcash:zregtestsapling1qqqqqqqqqqqqqqqqqqcguyvaw2vjk4sdyeg0lc970u659lvhqq7t0np6hlup5lusxle7505hlz3?amount=1&memo=VGhpcyBpcyBhIHNpbXBsZSBtZW1vLg&message=Thank%20you%20for%20your%20purchase";
         let v1r = TransactionRequest::from_uri(&params, valid_1).unwrap();
         assert_eq!(
-            v1r.payments.get(0).map(|p| p.amount),
+            v1r.payments.get(&0).map(|p| p.amount),
             Some(NonNegativeAmount::const_from_u64(100000000))
         );
     }
@@ -1088,10 +1092,9 @@ mod tests {
         assert!(i10r.is_err());
     }
 
-    #[cfg(all(test, feature = "test-dependencies"))]
     proptest! {
         #[test]
-        fn prop_zip321_roundtrip_address(addr in arb_addr(UnifiedAddressRequest::unsafe_new(false, true, true))) {
+        fn prop_zip321_roundtrip_address(addr in arb_addr(UA_REQUEST)) {
             let a = addr.encode(&TEST_NETWORK);
             assert_eq!(Address::decode(&TEST_NETWORK, &a), Some(addr));
         }
@@ -1133,13 +1136,13 @@ mod tests {
         fn prop_zip321_roundtrip_request(mut req in arb_zip321_request()) {
             let req_uri = req.to_uri(&TEST_NETWORK);
             let mut parsed = TransactionRequest::from_uri(&TEST_NETWORK, &req_uri).unwrap();
-            assert!(TransactionRequest::normalize_and_eq(&TEST_NETWORK, &mut parsed, &mut req));
+            assert!(TransactionRequest::normalize_and_eq(&mut parsed, &mut req));
         }
 
         #[test]
         fn prop_zip321_roundtrip_uri(uri in arb_zip321_uri()) {
             let mut parsed = TransactionRequest::from_uri(&TEST_NETWORK, &uri).unwrap();
-            parsed.normalize(&TEST_NETWORK);
+            parsed.normalize();
             let serialized = parsed.to_uri(&TEST_NETWORK);
             assert_eq!(serialized, uri)
         }

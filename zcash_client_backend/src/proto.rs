@@ -1,15 +1,16 @@
 //! Generated code for handling light client protobuf structs.
 
+use incrementalmerkletree::frontier::CommitmentTree;
+use nonempty::NonEmpty;
 use std::{
     array::TryFromSliceError,
+    collections::BTreeMap,
     fmt::{self, Display},
     io,
 };
 
-use incrementalmerkletree::frontier::CommitmentTree;
-
-use nonempty::NonEmpty;
-use sapling::{self, note::ExtractedNoteCommitment, Node, Nullifier, NOTE_COMMITMENT_TREE_DEPTH};
+use sapling::{self, note::ExtractedNoteCommitment, Node};
+use zcash_note_encryption::{EphemeralKeyBytes, COMPACT_NOTE_SIZE};
 use zcash_primitives::{
     block::{BlockHash, BlockHeader},
     consensus::{self, BlockHeight, Parameters},
@@ -18,20 +19,19 @@ use zcash_primitives::{
     transaction::{components::amount::NonNegativeAmount, fees::StandardFeeRule, TxId},
 };
 
-use zcash_note_encryption::{EphemeralKeyBytes, COMPACT_NOTE_SIZE};
-
 use crate::{
-    data_api::{
-        wallet::input_selection::{Proposal, ProposalError, ShieldedInputs},
-        InputSource,
-    },
+    data_api::InputSource,
     fees::{ChangeValue, TransactionBalance},
+    proposal::{Proposal, ProposalError, ShieldedInputs, Step, StepOutput, StepOutputIndex},
     zip321::{TransactionRequest, Zip321Error},
     PoolType, ShieldedProtocol,
 };
 
 #[cfg(feature = "transparent-inputs")]
 use zcash_primitives::transaction::components::OutPoint;
+
+#[cfg(feature = "orchard")]
+use orchard::tree::MerkleHashOrchard;
 
 #[rustfmt::skip]
 #[allow(unknown_lints)]
@@ -161,17 +161,78 @@ impl TryFrom<compact_formats::CompactSaplingOutput>
     type Error = ();
 
     fn try_from(value: compact_formats::CompactSaplingOutput) -> Result<Self, Self::Error> {
+        (&value).try_into()
+    }
+}
+
+impl TryFrom<&compact_formats::CompactSaplingOutput>
+    for sapling::note_encryption::CompactOutputDescription
+{
+    type Error = ();
+
+    fn try_from(value: &compact_formats::CompactSaplingOutput) -> Result<Self, Self::Error> {
         Ok(sapling::note_encryption::CompactOutputDescription {
             cmu: value.cmu()?,
             ephemeral_key: value.ephemeral_key()?,
-            enc_ciphertext: value.ciphertext.try_into().map_err(|_| ())?,
+            enc_ciphertext: value.ciphertext[..].try_into().map_err(|_| ())?,
         })
     }
 }
 
 impl compact_formats::CompactSaplingSpend {
-    pub fn nf(&self) -> Result<Nullifier, ()> {
-        Nullifier::from_slice(&self.nf).map_err(|_| ())
+    pub fn nf(&self) -> Result<sapling::Nullifier, ()> {
+        sapling::Nullifier::from_slice(&self.nf).map_err(|_| ())
+    }
+}
+
+#[cfg(feature = "orchard")]
+impl TryFrom<&compact_formats::CompactOrchardAction> for orchard::note_encryption::CompactAction {
+    type Error = ();
+
+    fn try_from(value: &compact_formats::CompactOrchardAction) -> Result<Self, Self::Error> {
+        Ok(orchard::note_encryption::CompactAction::from_parts(
+            value.nf()?,
+            value.cmx()?,
+            value.ephemeral_key()?,
+            value.ciphertext[..].try_into().map_err(|_| ())?,
+        ))
+    }
+}
+
+#[cfg(feature = "orchard")]
+impl compact_formats::CompactOrchardAction {
+    /// Returns the note commitment for the output of this action.
+    ///
+    /// A convenience method that parses [`CompactOrchardAction.cmx`].
+    ///
+    /// [`CompactOrchardAction.cmx`]: #structfield.cmx
+    pub fn cmx(&self) -> Result<orchard::note::ExtractedNoteCommitment, ()> {
+        Option::from(orchard::note::ExtractedNoteCommitment::from_bytes(
+            &self.cmx[..].try_into().map_err(|_| ())?,
+        ))
+        .ok_or(())
+    }
+
+    /// Returns the nullifier for the spend of this action.
+    ///
+    /// A convenience method that parses [`CompactOrchardAction.nullifier`].
+    ///
+    /// [`CompactOrchardAction.nullifier`]: #structfield.nullifier
+    pub fn nf(&self) -> Result<orchard::note::Nullifier, ()> {
+        let nf_bytes: [u8; 32] = self.nullifier[..].try_into().map_err(|_| ())?;
+        Option::from(orchard::note::Nullifier::from_bytes(&nf_bytes)).ok_or(())
+    }
+
+    /// Returns the ephemeral public key for the output of this action.
+    ///
+    /// A convenience method that parses [`CompactOrchardAction.ephemeral_key`].
+    ///
+    /// [`CompactOrchardAction.ephemeral_key`]: #structfield.ephemeral_key
+    pub fn ephemeral_key(&self) -> Result<EphemeralKeyBytes, ()> {
+        self.ephemeral_key[..]
+            .try_into()
+            .map(EphemeralKeyBytes)
+            .map_err(|_| ())
     }
 }
 
@@ -199,14 +260,35 @@ impl<SpendAuth> From<&orchard::Action<SpendAuth>> for compact_formats::CompactOr
 
 impl service::TreeState {
     /// Deserializes and returns the Sapling note commitment tree field of the tree state.
-    pub fn sapling_tree(&self) -> io::Result<CommitmentTree<Node, NOTE_COMMITMENT_TREE_DEPTH>> {
+    pub fn sapling_tree(
+        &self,
+    ) -> io::Result<CommitmentTree<Node, { sapling::NOTE_COMMITMENT_TREE_DEPTH }>> {
         let sapling_tree_bytes = hex::decode(&self.sapling_tree).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Hex decoding of Sapling tree bytes failed: {:?}", e),
             )
         })?;
-        read_commitment_tree::<Node, _, NOTE_COMMITMENT_TREE_DEPTH>(&sapling_tree_bytes[..])
+        read_commitment_tree::<Node, _, { sapling::NOTE_COMMITMENT_TREE_DEPTH }>(
+            &sapling_tree_bytes[..],
+        )
+    }
+
+    /// Deserializes and returns the Sapling note commitment tree field of the tree state.
+    #[cfg(feature = "orchard")]
+    pub fn orchard_tree(
+        &self,
+    ) -> io::Result<CommitmentTree<MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>>
+    {
+        let orchard_tree_bytes = hex::decode(&self.orchard_tree).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Hex decoding of Orchard tree bytes failed: {:?}", e),
+            )
+        })?;
+        read_commitment_tree::<MerkleHashOrchard, _, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>(
+            &orchard_tree_bytes[..],
+        )
     }
 }
 
@@ -217,8 +299,12 @@ pub const PROPOSAL_SER_V1: u32 = 1;
 /// representation.
 #[derive(Debug, Clone)]
 pub enum ProposalDecodingError<DbError> {
+    /// The encoded proposal contained no steps
+    NoSteps,
     /// The ZIP 321 transaction request URI was invalid.
     Zip321(Zip321Error),
+    /// A proposed input was null.
+    NullInput(usize),
     /// A transaction identifier string did not decode to a valid transaction ID.
     TxIdInvalid(TryFromSliceError),
     /// An invalid value pool identifier was encountered.
@@ -253,7 +339,11 @@ impl<E> From<Zip321Error> for ProposalDecodingError<E> {
 impl<E: Display> Display for ProposalDecodingError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ProposalDecodingError::NoSteps => write!(f, "The proposal had no steps."),
             ProposalDecodingError::Zip321(err) => write!(f, "Transaction request invalid: {}", err),
+            ProposalDecodingError::NullInput(i) => {
+                write!(f, "Proposed input was null at index {}", i)
+            }
             ProposalDecodingError::TxIdInvalid(err) => {
                 write!(f, "Invalid transaction id: {:?}", err)
             }
@@ -312,13 +402,12 @@ fn pool_type<T>(pool_id: i32) -> Result<PoolType, ProposalDecodingError<T>> {
     match proposal::ValuePool::try_from(pool_id) {
         Ok(proposal::ValuePool::Transparent) => Ok(PoolType::Transparent),
         Ok(proposal::ValuePool::Sapling) => Ok(PoolType::Shielded(ShieldedProtocol::Sapling)),
-        #[cfg(zcash_unstable = "orchard")]
         Ok(proposal::ValuePool::Orchard) => Ok(PoolType::Shielded(ShieldedProtocol::Orchard)),
         _ => Err(ProposalDecodingError::ValuePoolNotSupported(pool_id)),
     }
 }
 
-impl proposal::ProposedInput {
+impl proposal::ReceivedOutput {
     pub fn parse_txid(&self) -> Result<TxId, TryFromSliceError> {
         Ok(TxId::from_bytes(self.txid[..].try_into()?))
     }
@@ -334,11 +423,19 @@ impl proposal::ChangeValue {
     }
 }
 
+impl From<PoolType> for proposal::ValuePool {
+    fn from(value: PoolType) -> Self {
+        match value {
+            PoolType::Transparent => proposal::ValuePool::Transparent,
+            PoolType::Shielded(p) => p.into(),
+        }
+    }
+}
+
 impl From<ShieldedProtocol> for proposal::ValuePool {
     fn from(value: ShieldedProtocol) -> Self {
         match value {
             ShieldedProtocol::Sapling => proposal::ValuePool::Sapling,
-            #[cfg(zcash_unstable = "orchard")]
             ShieldedProtocol::Orchard => proposal::ValuePool::Orchard,
         }
     }
@@ -351,54 +448,111 @@ impl proposal::Proposal {
         params: &P,
         value: &Proposal<StandardFeeRule, NoteRef>,
     ) -> Self {
-        let transaction_request = value.transaction_request().to_uri(params);
-
-        let anchor_height = value
-            .shielded_inputs()
-            .map_or_else(|| 0, |i| u32::from(i.anchor_height()));
-
-        let inputs = value
-            .transparent_inputs()
+        use proposal::proposed_input;
+        use proposal::{PriorStepChange, PriorStepOutput, ReceivedOutput};
+        let steps = value
+            .steps()
             .iter()
-            .map(|utxo| proposal::ProposedInput {
-                txid: utxo.outpoint().hash().to_vec(),
-                value_pool: proposal::ValuePool::Transparent.into(),
-                index: utxo.outpoint().n(),
-                value: utxo.txout().value.into(),
-            })
-            .chain(value.shielded_inputs().iter().flat_map(|s_in| {
-                s_in.notes().iter().map(|rec_note| proposal::ProposedInput {
-                    txid: rec_note.txid().as_ref().to_vec(),
-                    value_pool: proposal::ValuePool::from(rec_note.note().protocol()).into(),
-                    index: rec_note.output_index().into(),
-                    value: rec_note.note().value().into(),
-                })
-            }))
-            .collect();
+            .map(|step| {
+                let transaction_request = step.transaction_request().to_uri(params);
 
-        let balance = Some(proposal::TransactionBalance {
-            proposed_change: value
-                .balance()
-                .proposed_change()
-                .iter()
-                .map(|change| proposal::ChangeValue {
-                    value: change.value().into(),
-                    value_pool: proposal::ValuePool::from(change.output_pool()).into(),
-                    memo: change.memo().map(|memo_bytes| proposal::MemoBytes {
-                        value: memo_bytes.as_slice().to_vec(),
-                    }),
-                })
-                .collect(),
-            fee_required: value.balance().fee_required().into(),
-        });
+                let anchor_height = step
+                    .shielded_inputs()
+                    .map_or_else(|| 0, |i| u32::from(i.anchor_height()));
+
+                let inputs = step
+                    .transparent_inputs()
+                    .iter()
+                    .map(|utxo| proposal::ProposedInput {
+                        value: Some(proposed_input::Value::ReceivedOutput(ReceivedOutput {
+                            txid: utxo.outpoint().hash().to_vec(),
+                            value_pool: proposal::ValuePool::Transparent.into(),
+                            index: utxo.outpoint().n(),
+                            value: utxo.txout().value.into(),
+                        })),
+                    })
+                    .chain(step.shielded_inputs().iter().flat_map(|s_in| {
+                        s_in.notes().iter().map(|rec_note| proposal::ProposedInput {
+                            value: Some(proposed_input::Value::ReceivedOutput(ReceivedOutput {
+                                txid: rec_note.txid().as_ref().to_vec(),
+                                value_pool: proposal::ValuePool::from(rec_note.note().protocol())
+                                    .into(),
+                                index: rec_note.output_index().into(),
+                                value: rec_note.note().value().into(),
+                            })),
+                        })
+                    }))
+                    .chain(step.prior_step_inputs().iter().map(|p_in| {
+                        match p_in.output_index() {
+                            StepOutputIndex::Payment(i) => proposal::ProposedInput {
+                                value: Some(proposed_input::Value::PriorStepOutput(
+                                    PriorStepOutput {
+                                        step_index: p_in
+                                            .step_index()
+                                            .try_into()
+                                            .expect("Step index fits into a u32"),
+                                        payment_index: i
+                                            .try_into()
+                                            .expect("Payment index fits into a u32"),
+                                    },
+                                )),
+                            },
+                            StepOutputIndex::Change(i) => proposal::ProposedInput {
+                                value: Some(proposed_input::Value::PriorStepChange(
+                                    PriorStepChange {
+                                        step_index: p_in
+                                            .step_index()
+                                            .try_into()
+                                            .expect("Step index fits into a u32"),
+                                        change_index: i
+                                            .try_into()
+                                            .expect("Payment index fits into a u32"),
+                                    },
+                                )),
+                            },
+                        }
+                    }))
+                    .collect();
+
+                let payment_output_pools = step
+                    .payment_pools()
+                    .iter()
+                    .map(|(idx, pool_type)| proposal::PaymentOutputPool {
+                        payment_index: u32::try_from(*idx).expect("Payment index fits into a u32"),
+                        value_pool: proposal::ValuePool::from(*pool_type).into(),
+                    })
+                    .collect();
+
+                let balance = Some(proposal::TransactionBalance {
+                    proposed_change: step
+                        .balance()
+                        .proposed_change()
+                        .iter()
+                        .map(|change| proposal::ChangeValue {
+                            value: change.value().into(),
+                            value_pool: proposal::ValuePool::from(change.output_pool()).into(),
+                            memo: change.memo().map(|memo_bytes| proposal::MemoBytes {
+                                value: memo_bytes.as_slice().to_vec(),
+                            }),
+                        })
+                        .collect(),
+                    fee_required: step.balance().fee_required().into(),
+                });
+
+                proposal::ProposalStep {
+                    transaction_request,
+                    payment_output_pools,
+                    anchor_height,
+                    inputs,
+                    balance,
+                    is_shielding: step.is_shielding(),
+                }
+            })
+            .collect();
 
         #[allow(deprecated)]
         proposal::Proposal {
             proto_version: PROPOSAL_SER_V1,
-            transaction_request,
-            anchor_height,
-            inputs,
-            balance,
             fee_rule: match value.fee_rule() {
                 StandardFeeRule::PreZip313 => proposal::FeeRule::PreZip313,
                 StandardFeeRule::Zip313 => proposal::FeeRule::Zip313,
@@ -406,7 +560,7 @@ impl proposal::Proposal {
             }
             .into(),
             min_target_height: value.min_target_height().into(),
-            is_shielding: value.is_shielding(),
+            steps,
         }
     }
 
@@ -420,6 +574,7 @@ impl proposal::Proposal {
     where
         DbT: InputSource<Error = DbError>,
     {
+        use self::proposal::proposed_input::Value::*;
         match self.proto_version {
             PROPOSAL_SER_V1 => {
                 #[allow(deprecated)]
@@ -432,102 +587,166 @@ impl proposal::Proposal {
                     }
                 };
 
-                let transaction_request =
-                    TransactionRequest::from_uri(params, &self.transaction_request)?;
+                let mut steps = Vec::with_capacity(self.steps.len());
+                for step in &self.steps {
+                    let transaction_request =
+                        TransactionRequest::from_uri(params, &step.transaction_request)?;
 
-                #[cfg(not(feature = "transparent-inputs"))]
-                let transparent_inputs = vec![];
-                #[cfg(feature = "transparent-inputs")]
-                let mut transparent_inputs = vec![];
+                    let payment_pools = step
+                        .payment_output_pools
+                        .iter()
+                        .map(|pop| {
+                            Ok((
+                                usize::try_from(pop.payment_index)
+                                    .expect("Payment index fits into a usize"),
+                                pool_type(pop.value_pool)?,
+                            ))
+                        })
+                        .collect::<Result<BTreeMap<usize, PoolType>, ProposalDecodingError<DbError>>>()?;
 
-                let mut received_notes = vec![];
-                for input in self.inputs.iter() {
-                    let txid = input
-                        .parse_txid()
-                        .map_err(ProposalDecodingError::TxIdInvalid)?;
+                    #[cfg(not(feature = "transparent-inputs"))]
+                    let transparent_inputs = vec![];
+                    #[cfg(feature = "transparent-inputs")]
+                    let mut transparent_inputs = vec![];
+                    let mut received_notes = vec![];
+                    let mut prior_step_inputs = vec![];
+                    for (i, input) in step.inputs.iter().enumerate() {
+                        match input
+                            .value
+                            .as_ref()
+                            .ok_or(ProposalDecodingError::NullInput(i))?
+                        {
+                            ReceivedOutput(out) => {
+                                let txid = out
+                                    .parse_txid()
+                                    .map_err(ProposalDecodingError::TxIdInvalid)?;
 
-                    match input.pool_type()? {
-                        PoolType::Transparent => {
-                            #[cfg(not(feature = "transparent-inputs"))]
-                            return Err(ProposalDecodingError::ValuePoolNotSupported(1));
+                                match out.pool_type()? {
+                                    PoolType::Transparent => {
+                                        #[cfg(not(feature = "transparent-inputs"))]
+                                        return Err(ProposalDecodingError::ValuePoolNotSupported(
+                                            1,
+                                        ));
 
-                            #[cfg(feature = "transparent-inputs")]
-                            {
-                                let outpoint = OutPoint::new(txid.into(), input.index);
-                                transparent_inputs.push(
-                                    wallet_db
-                                        .get_unspent_transparent_output(&outpoint)
-                                        .map_err(ProposalDecodingError::InputRetrieval)?
-                                        .ok_or({
-                                            ProposalDecodingError::InputNotFound(
-                                                txid,
-                                                PoolType::Transparent,
-                                                input.index,
-                                            )
-                                        })?,
-                                );
+                                        #[cfg(feature = "transparent-inputs")]
+                                        {
+                                            let outpoint = OutPoint::new(txid.into(), out.index);
+                                            transparent_inputs.push(
+                                                wallet_db
+                                                    .get_unspent_transparent_output(&outpoint)
+                                                    .map_err(ProposalDecodingError::InputRetrieval)?
+                                                    .ok_or({
+                                                        ProposalDecodingError::InputNotFound(
+                                                            txid,
+                                                            PoolType::Transparent,
+                                                            out.index,
+                                                        )
+                                                    })?,
+                                            );
+                                        }
+                                    }
+                                    PoolType::Shielded(protocol) => received_notes.push(
+                                        wallet_db
+                                            .get_spendable_note(&txid, protocol, out.index)
+                                            .map_err(ProposalDecodingError::InputRetrieval)
+                                            .and_then(|opt| {
+                                                opt.ok_or({
+                                                    ProposalDecodingError::InputNotFound(
+                                                        txid,
+                                                        PoolType::Shielded(protocol),
+                                                        out.index,
+                                                    )
+                                                })
+                                            })?,
+                                    ),
+                                }
+                            }
+                            PriorStepOutput(s_ref) => {
+                                prior_step_inputs.push(StepOutput::new(
+                                    s_ref
+                                        .step_index
+                                        .try_into()
+                                        .expect("Step index fits into a usize"),
+                                    StepOutputIndex::Payment(
+                                        s_ref
+                                            .payment_index
+                                            .try_into()
+                                            .expect("Payment index fits into a usize"),
+                                    ),
+                                ));
+                            }
+                            PriorStepChange(s_ref) => {
+                                prior_step_inputs.push(StepOutput::new(
+                                    s_ref
+                                        .step_index
+                                        .try_into()
+                                        .expect("Step index fits into a usize"),
+                                    StepOutputIndex::Change(
+                                        s_ref
+                                            .change_index
+                                            .try_into()
+                                            .expect("Payment index fits into a usize"),
+                                    ),
+                                ));
                             }
                         }
-                        PoolType::Shielded(protocol) => received_notes.push(
-                            wallet_db
-                                .get_spendable_note(&txid, protocol, input.index)
-                                .map_err(ProposalDecodingError::InputRetrieval)
-                                .and_then(|opt| {
-                                    opt.ok_or({
-                                        ProposalDecodingError::InputNotFound(
-                                            txid,
-                                            PoolType::Shielded(protocol),
-                                            input.index,
-                                        )
-                                    })
-                                })?,
-                        ),
                     }
+
+                    let shielded_inputs = NonEmpty::from_vec(received_notes)
+                        .map(|notes| ShieldedInputs::from_parts(step.anchor_height.into(), notes));
+
+                    let proto_balance = step
+                        .balance
+                        .as_ref()
+                        .ok_or(ProposalDecodingError::BalanceInvalid)?;
+                    let balance = TransactionBalance::new(
+                        proto_balance
+                            .proposed_change
+                            .iter()
+                            .map(|cv| -> Result<ChangeValue, ProposalDecodingError<_>> {
+                                match cv.pool_type()? {
+                                    PoolType::Shielded(ShieldedProtocol::Sapling) => {
+                                        Ok(ChangeValue::sapling(
+                                            NonNegativeAmount::from_u64(cv.value).map_err(
+                                                |_| ProposalDecodingError::BalanceInvalid,
+                                            )?,
+                                            cv.memo
+                                                .as_ref()
+                                                .map(|bytes| {
+                                                    MemoBytes::from_bytes(&bytes.value)
+                                                        .map_err(ProposalDecodingError::MemoInvalid)
+                                                })
+                                                .transpose()?,
+                                        ))
+                                    }
+                                    t => Err(ProposalDecodingError::InvalidChangeRecipient(t)),
+                                }
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                        NonNegativeAmount::from_u64(proto_balance.fee_required)
+                            .map_err(|_| ProposalDecodingError::BalanceInvalid)?,
+                    )
+                    .map_err(|_| ProposalDecodingError::BalanceInvalid)?;
+
+                    let step = Step::from_parts(
+                        &steps,
+                        transaction_request,
+                        payment_pools,
+                        transparent_inputs,
+                        shielded_inputs,
+                        prior_step_inputs,
+                        balance,
+                        step.is_shielding,
+                    )
+                    .map_err(ProposalDecodingError::ProposalInvalid)?;
+
+                    steps.push(step);
                 }
 
-                let shielded_inputs = NonEmpty::from_vec(received_notes)
-                    .map(|notes| ShieldedInputs::from_parts(self.anchor_height.into(), notes));
-
-                let proto_balance = self
-                    .balance
-                    .as_ref()
-                    .ok_or(ProposalDecodingError::BalanceInvalid)?;
-                let balance = TransactionBalance::new(
-                    proto_balance
-                        .proposed_change
-                        .iter()
-                        .map(|cv| -> Result<ChangeValue, ProposalDecodingError<_>> {
-                            match cv.pool_type()? {
-                                PoolType::Shielded(ShieldedProtocol::Sapling) => {
-                                    Ok(ChangeValue::sapling(
-                                        NonNegativeAmount::from_u64(cv.value)
-                                            .map_err(|_| ProposalDecodingError::BalanceInvalid)?,
-                                        cv.memo
-                                            .as_ref()
-                                            .map(|bytes| {
-                                                MemoBytes::from_bytes(&bytes.value)
-                                                    .map_err(ProposalDecodingError::MemoInvalid)
-                                            })
-                                            .transpose()?,
-                                    ))
-                                }
-                                t => Err(ProposalDecodingError::InvalidChangeRecipient(t)),
-                            }
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                    NonNegativeAmount::from_u64(proto_balance.fee_required)
-                        .map_err(|_| ProposalDecodingError::BalanceInvalid)?,
-                )
-                .map_err(|_| ProposalDecodingError::BalanceInvalid)?;
-
-                Proposal::from_parts(
-                    transaction_request,
-                    transparent_inputs,
-                    shielded_inputs,
-                    balance,
+                Proposal::multi_step(
                     fee_rule,
                     self.min_target_height.into(),
-                    self.is_shielding,
+                    NonEmpty::from_vec(steps).ok_or(ProposalDecodingError::NoSteps)?,
                 )
                 .map_err(ProposalDecodingError::ProposalInvalid)
             }

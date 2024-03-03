@@ -67,41 +67,41 @@
 use incrementalmerkletree::Retention;
 use rusqlite::{self, named_params, OptionalExtension};
 use shardtree::{error::ShardTreeError, store::ShardStore, ShardTree};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{self, Cursor};
 use std::num::NonZeroU32;
 use std::ops::RangeInclusive;
 use tracing::debug;
-use zcash_client_backend::data_api::{AccountBalance, Ratio, WalletSummary};
-use zcash_primitives::transaction::components::amount::NonNegativeAmount;
-use zcash_primitives::zip32::Scope;
-
-use zcash_primitives::{
-    block::BlockHash,
-    consensus::{self, BlockHeight, BranchId, NetworkUpgrade, Parameters},
-    memo::{Memo, MemoBytes},
-    merkle_tree::read_commitment_tree,
-    transaction::{components::Amount, Transaction, TransactionData, TxId},
-    zip32::{AccountId, DiversifierIndex},
-};
 
 use zcash_client_backend::{
     address::{Address, UnifiedAddress},
     data_api::{
         scanning::{ScanPriority, ScanRange},
-        AccountBirthday, BlockMetadata, SentTransactionOutput, SAPLING_SHARD_HEIGHT,
+        AccountBalance, AccountBirthday, BlockMetadata, Ratio, SentTransactionOutput,
+        WalletSummary, SAPLING_SHARD_HEIGHT,
     },
     encoding::AddressCodec,
     keys::UnifiedFullViewingKey,
-    wallet::{NoteId, Recipient, WalletTx},
+    wallet::{Note, NoteId, Recipient, WalletTx},
     PoolType, ShieldedProtocol,
 };
+use zcash_primitives::{
+    block::BlockHash,
+    consensus::{self, BlockHeight, BranchId, NetworkUpgrade, Parameters},
+    memo::{Memo, MemoBytes},
+    merkle_tree::read_commitment_tree,
+    transaction::{
+        components::{amount::NonNegativeAmount, Amount},
+        Transaction, TransactionData, TxId,
+    },
+    zip32::{AccountId, DiversifierIndex, Scope},
+};
 
-use crate::wallet::commitment_tree::{get_max_checkpointed_height, SqliteShardStore};
-use crate::DEFAULT_UA_REQUEST;
 use crate::{
-    error::SqliteClientError, SqlTransaction, WalletCommitmentTrees, WalletDb, PRUNING_DEPTH,
+    error::SqliteClientError,
+    wallet::commitment_tree::{get_max_checkpointed_height, SqliteShardStore},
+    SqlTransaction, WalletCommitmentTrees, WalletDb, DEFAULT_UA_REQUEST, PRUNING_DEPTH,
     SAPLING_TABLES_PREFIX,
 };
 
@@ -112,9 +112,12 @@ use {
     crate::UtxoId,
     rusqlite::Row,
     std::collections::BTreeSet,
-    zcash_client_backend::{address::AddressMetadata, wallet::WalletTransparentOutput},
+    zcash_client_backend::wallet::{TransparentAddressMetadata, WalletTransparentOutput},
     zcash_primitives::{
-        legacy::{keys::IncomingViewingKey, Script, TransparentAddress},
+        legacy::{
+            keys::{IncomingViewingKey, NonHardenedChildIndex},
+            Script, TransparentAddress,
+        },
         transaction::components::{OutPoint, TxOut},
     },
 };
@@ -133,7 +136,6 @@ pub(crate) fn pool_code(pool_type: PoolType) -> i64 {
     match pool_type {
         PoolType::Transparent => 0i64,
         PoolType::Shielded(ShieldedProtocol::Sapling) => 2i64,
-        #[cfg(zcash_unstable = "orchard")]
         PoolType::Shielded(ShieldedProtocol::Orchard) => 3i64,
     }
 }
@@ -349,8 +351,8 @@ pub(crate) fn get_transparent_receivers<P: consensus::Parameters>(
     conn: &rusqlite::Connection,
     params: &P,
     account: AccountId,
-) -> Result<HashMap<TransparentAddress, AddressMetadata>, SqliteClientError> {
-    let mut ret = HashMap::new();
+) -> Result<HashMap<TransparentAddress, Option<TransparentAddressMetadata>>, SqliteClientError> {
+    let mut ret: HashMap<TransparentAddress, Option<TransparentAddressMetadata>> = HashMap::new();
 
     // Get all UAs derived
     let mut ua_query = conn
@@ -360,12 +362,12 @@ pub(crate) fn get_transparent_receivers<P: consensus::Parameters>(
     while let Some(row) = rows.next()? {
         let ua_str: String = row.get(0)?;
         let di_vec: Vec<u8> = row.get(1)?;
-        let mut di_be: [u8; 11] = di_vec.try_into().map_err(|_| {
+        let mut di: [u8; 11] = di_vec.try_into().map_err(|_| {
             SqliteClientError::CorruptedData(
                 "Diverisifier index is not an 11-byte value".to_owned(),
             )
         })?;
-        di_be.reverse();
+        di.reverse(); // BE -> LE conversion
 
         let ua = Address::decode(params, &ua_str)
             .ok_or_else(|| {
@@ -380,16 +382,37 @@ pub(crate) fn get_transparent_receivers<P: consensus::Parameters>(
             })?;
 
         if let Some(taddr) = ua.transparent() {
+            let index = NonHardenedChildIndex::from_index(
+                DiversifierIndex::from(di).try_into().map_err(|_| {
+                    SqliteClientError::CorruptedData(
+                        "Unable to get diversifier for transparent address.".to_string(),
+                    )
+                })?,
+            )
+            .ok_or_else(|| {
+                SqliteClientError::CorruptedData(
+                    "Unexpected hardened index for transparent address.".to_string(),
+                )
+            })?;
+
             ret.insert(
                 *taddr,
-                AddressMetadata::new(account, DiversifierIndex::from(di_be)),
+                Some(TransparentAddressMetadata::new(
+                    Scope::External.into(),
+                    index,
+                )),
             );
         }
     }
 
-    if let Some((taddr, diversifier_index)) = get_legacy_transparent_address(params, conn, account)?
-    {
-        ret.insert(taddr, AddressMetadata::new(account, diversifier_index));
+    if let Some((taddr, child_index)) = get_legacy_transparent_address(params, conn, account)? {
+        ret.insert(
+            taddr,
+            Some(TransparentAddressMetadata::new(
+                Scope::External.into(),
+                child_index,
+            )),
+        );
     }
 
     Ok(ret)
@@ -400,7 +423,7 @@ pub(crate) fn get_legacy_transparent_address<P: consensus::Parameters>(
     params: &P,
     conn: &rusqlite::Connection,
     account: AccountId,
-) -> Result<Option<(TransparentAddress, DiversifierIndex)>, SqliteClientError> {
+) -> Result<Option<(TransparentAddress, NonHardenedChildIndex)>, SqliteClientError> {
     // Get the UFVK for the account.
     let ufvk_str: Option<String> = conn
         .query_row(
@@ -418,10 +441,7 @@ pub(crate) fn get_legacy_transparent_address<P: consensus::Parameters>(
         ufvk.transparent()
             .map(|tfvk| {
                 tfvk.derive_external_ivk()
-                    .map(|tivk| {
-                        let (taddr, child_index) = tivk.default_address();
-                        (taddr, DiversifierIndex::from(child_index))
-                    })
+                    .map(|tivk| tivk.default_address())
                     .map_err(SqliteClientError::HdwalletError)
             })
             .transpose()
@@ -582,7 +602,7 @@ pub(crate) fn get_wallet_summary<P: consensus::Parameters>(
     params: &P,
     min_confirmations: u32,
     progress: &impl ScanProgress,
-) -> Result<Option<WalletSummary>, SqliteClientError> {
+) -> Result<Option<WalletSummary<AccountId>>, SqliteClientError> {
     let chain_tip_height = match scan_queue_extrema(tx)? {
         Some(range) => *range.end(),
         None => {
@@ -634,7 +654,7 @@ pub(crate) fn get_wallet_summary<P: consensus::Parameters>(
                 .map_err(|_| SqliteClientError::AccountIdOutOfRange)
                 .map(|a| (a, AccountBalance::ZERO))
         })
-        .collect::<Result<BTreeMap<AccountId, AccountBalance>, _>>()?;
+        .collect::<Result<HashMap<AccountId, AccountBalance>, _>>()?;
 
     let sapling_trace = tracing::info_span!("stmt_select_notes").entered();
     let mut stmt_select_notes = tx.prepare_cached(
@@ -796,7 +816,6 @@ pub(crate) fn get_received_memo(
             )
             .optional()?
             .flatten(),
-        #[cfg(zcash_unstable = "orchard")]
         _ => {
             return Err(SqliteClientError::UnsupportedPoolType(PoolType::Shielded(
                 note_id.protocol(),
@@ -1630,9 +1649,9 @@ pub(crate) fn put_block(
 
 /// Inserts information about a mined transaction that was observed to
 /// contain a note related to this wallet into the database.
-pub(crate) fn put_tx_meta<N, S>(
+pub(crate) fn put_tx_meta(
     conn: &rusqlite::Connection,
-    tx: &WalletTx<N, S>,
+    tx: &WalletTx<AccountId>,
     height: BlockHeight,
 ) -> Result<i64, SqliteClientError> {
     // It isn't there, so insert our transaction into the database.
@@ -1645,10 +1664,11 @@ pub(crate) fn put_tx_meta<N, S>(
         RETURNING id_tx",
     )?;
 
+    let txid_bytes = tx.txid();
     let tx_params = named_params![
-        ":txid": &tx.txid.as_ref()[..],
+        ":txid": &txid_bytes.as_ref()[..],
         ":block": u32::from(height),
-        ":tx_index": i64::try_from(tx.index).expect("transaction indices are representable as i64"),
+        ":tx_index": i64::try_from(tx.block_index()).expect("transaction indices are representable as i64"),
     ];
 
     stmt_upsert_tx_meta
@@ -1819,7 +1839,7 @@ pub(crate) fn update_expired_notes(
 // and `put_sent_output`
 fn recipient_params<P: consensus::Parameters>(
     params: &P,
-    to: &Recipient,
+    to: &Recipient<AccountId, Note>,
 ) -> (Option<String>, Option<u32>, PoolType) {
     match to {
         Recipient::Transparent(addr) => (Some(addr.encode(params)), None, PoolType::Transparent),
@@ -1829,7 +1849,11 @@ fn recipient_params<P: consensus::Parameters>(
             PoolType::Shielded(ShieldedProtocol::Sapling),
         ),
         Recipient::Unified(addr, pool) => (Some(addr.encode(params)), None, *pool),
-        Recipient::InternalAccount(id, pool) => (None, Some(u32::from(*id)), *pool),
+        Recipient::InternalAccount(id, note) => (
+            None,
+            Some(u32::from(*id)),
+            PoolType::Shielded(note.protocol()),
+        ),
     }
 }
 
@@ -1839,7 +1863,7 @@ pub(crate) fn insert_sent_output<P: consensus::Parameters>(
     params: &P,
     tx_ref: i64,
     from_account: AccountId,
-    output: &SentTransactionOutput,
+    output: &SentTransactionOutput<AccountId>,
 ) -> Result<(), SqliteClientError> {
     let mut stmt_insert_sent_output = conn.prepare_cached(
         "INSERT INTO sent_notes (
@@ -1885,7 +1909,7 @@ pub(crate) fn put_sent_output<P: consensus::Parameters>(
     from_account: AccountId,
     tx_ref: i64,
     output_index: usize,
-    recipient: &Recipient,
+    recipient: &Recipient<AccountId, Note>,
     value: NonNegativeAmount,
     memo: Option<&MemoBytes>,
 ) -> Result<(), SqliteClientError> {
@@ -2054,12 +2078,16 @@ pub(crate) fn query_nullifier_map<N: AsRef<[u8]>, S>(
     // change or explicit in-wallet recipient.
     put_tx_meta(
         conn,
-        &WalletTx::<N, S> {
+        &WalletTx::new(
             txid,
             index,
-            sapling_spends: vec![],
-            sapling_outputs: vec![],
-        },
+            vec![],
+            vec![],
+            #[cfg(feature = "orchard")]
+            vec![],
+            #[cfg(feature = "orchard")]
+            vec![],
+        ),
         height,
     )
     .map(Some)
@@ -2250,6 +2278,8 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn transparent_balance_across_shielding() {
+        use zcash_client_backend::ShieldedProtocol;
+
         let mut st = TestBuilder::new()
             .with_block_cache()
             .with_test_account(AccountBirthday::from_sapling_activation)
@@ -2334,12 +2364,13 @@ mod tests {
             fixed::SingleOutputChangeStrategy::new(
                 FixedFeeRule::non_standard(NonNegativeAmount::ZERO),
                 None,
+                ShieldedProtocol::Sapling,
             ),
             DustOutputPolicy::default(),
         );
         let txid = st
             .shield_transparent_funds(&input_selector, value, &usk, &[*taddr], 1)
-            .unwrap();
+            .unwrap()[0];
 
         // The wallet should have zero transparent balance, because the shielding
         // transaction can be mined.

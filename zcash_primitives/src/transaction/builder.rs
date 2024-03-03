@@ -950,6 +950,7 @@ mod tests {
     #[cfg(feature = "transparent-inputs")]
     fn binding_sig_absent_if_no_shielded_spend_or_output() {
         use crate::consensus::NetworkUpgrade;
+        use crate::legacy::keys::NonHardenedChildIndex;
         use crate::transaction::builder::{self, TransparentBuilder};
 
         let sapling_activation_height = TEST_NETWORK
@@ -984,13 +985,14 @@ mod tests {
                 .to_account_pubkey()
                 .derive_external_ivk()
                 .unwrap()
-                .derive_address(0)
+                .derive_address(NonHardenedChildIndex::ZERO)
                 .unwrap()
                 .script(),
         };
         builder
             .add_transparent_input(
-                tsk.derive_external_secret_key(0).unwrap(),
+                tsk.derive_external_secret_key(NonHardenedChildIndex::ZERO)
+                    .unwrap(),
                 OutPoint::new([0u8; 32], 1),
                 prev_coin,
             )
@@ -999,7 +1001,7 @@ mod tests {
         // Create a tx with only t output. No binding_sig should be present
         builder
             .add_transparent_output(
-                &TransparentAddress::PublicKey([0; 20]),
+                &TransparentAddress::PublicKeyHash([0; 20]),
                 NonNegativeAmount::const_from_u64(40000),
             )
             .unwrap();
@@ -1043,7 +1045,7 @@ mod tests {
 
         builder
             .add_transparent_output(
-                &TransparentAddress::PublicKey([0; 20]),
+                &TransparentAddress::PublicKeyHash([0; 20]),
                 NonNegativeAmount::const_from_u64(40000),
             )
             .unwrap();
@@ -1116,7 +1118,7 @@ mod tests {
             let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
             builder
                 .add_transparent_output(
-                    &TransparentAddress::PublicKey([0; 20]),
+                    &TransparentAddress::PublicKeyHash([0; 20]),
                     NonNegativeAmount::const_from_u64(50000),
                 )
                 .unwrap();
@@ -1157,7 +1159,7 @@ mod tests {
                 .unwrap();
             builder
                 .add_transparent_output(
-                    &TransparentAddress::PublicKey([0; 20]),
+                    &TransparentAddress::PublicKeyHash([0; 20]),
                     NonNegativeAmount::const_from_u64(20000),
                 )
                 .unwrap();
@@ -1200,7 +1202,7 @@ mod tests {
                 .unwrap();
             builder
                 .add_transparent_output(
-                    &TransparentAddress::PublicKey([0; 20]),
+                    &TransparentAddress::PublicKeyHash([0; 20]),
                     NonNegativeAmount::const_from_u64(20000),
                 )
                 .unwrap();

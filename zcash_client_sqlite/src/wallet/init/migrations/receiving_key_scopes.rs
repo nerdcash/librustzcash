@@ -284,7 +284,7 @@ mod tests {
         },
         decrypt_transaction,
         proto::compact_formats::{CompactBlock, CompactTx},
-        scanning::scan_block,
+        scanning::{scan_block, Nullifiers, ScanningKeys},
         wallet::Recipient,
         PoolType, ShieldedProtocol, TransferType,
     };
@@ -292,13 +292,13 @@ mod tests {
     use zcash_primitives::{
         block::BlockHash,
         consensus::{BlockHeight, Network, NetworkUpgrade, Parameters},
-        legacy::keys::IncomingViewingKey,
+        legacy::keys::{IncomingViewingKey, NonHardenedChildIndex},
         memo::MemoBytes,
         transaction::{
             builder::{BuildConfig, BuildResult, Builder},
-            components::amount::NonNegativeAmount,
+            components::{amount::NonNegativeAmount, transparent},
+            fees::fixed,
         },
-        transaction::{components::transparent, fees::fixed},
         zip32::{AccountId, Scope},
     };
     use zcash_proofs::prover::LocalTxProver;
@@ -354,7 +354,9 @@ mod tests {
         );
         builder
             .add_transparent_input(
-                usk0.transparent().derive_external_secret_key(0).unwrap(),
+                usk0.transparent()
+                    .derive_external_secret_key(NonHardenedChildIndex::ZERO)
+                    .unwrap(),
                 transparent::OutPoint::new([1; 32], 0),
                 transparent::TxOut {
                     value: NonNegativeAmount::const_from_u64(EXTERNAL_VALUE + INTERNAL_VALUE),
@@ -437,10 +439,11 @@ mod tests {
         let to = output.note().recipient();
         let diversifier = to.diversifier();
 
+        let account = output.account_id();
         let sql_args = named_params![
             ":tx": &tx_ref,
             ":output_index": i64::try_from(output.index()).expect("output indices are representable as i64"),
-            ":account": u32::from(output.account()),
+            ":account": u32::from(account),
             ":diversifier": &diversifier.0.as_ref(),
             ":value": output.note().value().inner(),
             ":rcm": &rcm.as_ref(),
@@ -597,11 +600,13 @@ mod tests {
             ..Default::default()
         };
         block.vtx.push(compact_tx);
+        let scanning_keys = ScanningKeys::from_account_ufvks([(AccountId::ZERO, ufvk0)]);
+
         let scanned_block = scan_block(
             &params,
             block,
-            &[(&AccountId::ZERO, ufvk0.sapling().unwrap())],
-            &[],
+            &scanning_keys,
+            &Nullifiers::empty(),
             Some(&BlockMetadata::from_parts(
                 height - 1,
                 prev_hash,
@@ -650,13 +655,13 @@ mod tests {
                     for tx in block.transactions() {
                         let tx_row = crate::wallet::put_tx_meta(wdb.conn.0, tx, block.height())?;
 
-                        for output in &tx.sapling_outputs {
+                        for output in tx.sapling_outputs() {
                             put_received_note_before_migration(wdb.conn.0, output, tx_row, None)?;
                         }
                     }
 
                     note_positions.extend(block.transactions().iter().flat_map(|wtx| {
-                        wtx.sapling_outputs
+                        wtx.sapling_outputs()
                             .iter()
                             .map(|out| out.note_commitment_tree_position())
                     }));

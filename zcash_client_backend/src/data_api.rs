@@ -1,43 +1,97 @@
-//! Interfaces for wallet data persistence & low-level wallet utilities.
+//! # Utilities for Zcash wallet construction
+//!
+//! This module defines a set of APIs for wallet data persistence, and provides a suite of methods
+//! based upon these APIs that can be used to implement a fully functional Zcash wallet. At
+//! present, the interfaces provided here are built primarily around the use of a source of
+//! [`CompactBlock`] data such as the Zcash Light Client Protocol as defined in
+//! [ZIP 307](https://zips.z.cash/zip-0307) but they may be generalized to full-block use cases in
+//! the future.
+//!
+//! ## Important Concepts
+//!
+//! There are several important operations that a Zcash wallet must perform that distinguish Zcash
+//! wallet design from wallets for other cryptocurrencies.
+//!
+//! * Viewing Keys: Wallets based upon this module are built around the capabilities of Zcash
+//!   [`UnifiedFullViewingKey`]s; the wallet backend provides no facilities for the storage
+//!   of spending keys, and spending keys must be provided by the caller in order to perform
+//!   transaction creation operations.
+//! * Blockchain Scanning: A Zcash wallet must download and trial-decrypt each transaction on the
+//!   Zcash blockchain using one or more Viewing Keys in order to find new shielded transaction
+//!   outputs (generally termed "notes") belonging to the wallet. The primary entrypoint for this
+//!   functionality is the [`scan_cached_blocks`] method. See the [`chain`] module for additional
+//!   details.
+//! * Witness Updates: In order to spend a shielded note, the wallet must be able to compute the
+//!   Merkle path to that note in the global note commitment tree. When [`scan_cached_blocks`] is
+//!   used to process a range of blocks, the note commitment tree is updated with the note
+//!   commitments for the blocks in that range.
+//! * Transaction Construction: The [`wallet`] module provides functions for creating Zcash
+//!   transactions that spend funds belonging to the wallet.
+//!
+//! ## Core Traits
+//!
+//! The utility functions described above depend upon four important traits defined in this
+//! module, which between them encompass the data storage requirements of a light wallet.
+//! The relevant traits are [`InputSource`], [`WalletRead`], [`WalletWrite`], and
+//! [`WalletCommitmentTrees`]. A complete implementation of the data storage layer for a wallet
+//! will include an implementation of all four of these traits. See the [`zcash_client_sqlite`]
+//! crate for a complete example of the implementation of these traits.
+//!
+//! ## Accounts
+//!
+//! The operation of the [`InputSource`], [`WalletRead`] and [`WalletWrite`] traits is built around
+//! the concept of a wallet having one or more accounts, with a unique `AccountId` for each
+//! account.
+//!
+//! An account identifier corresponds to at most a single [`UnifiedSpendingKey`]'s worth of spend
+//! authority, with the received and spent notes of that account tracked via the corresponding
+//! [`UnifiedFullViewingKey`]. Both received notes and change spendable by that spending authority
+//! (both the external and internal parts of that key, as defined by
+//! [ZIP 316](https://zips.z.cash/zip-0316)) will be interpreted as belonging to that account.
+//!
+//! [`CompactBlock`]: crate::proto::compact_formats::CompactBlock
+//! [`scan_cached_blocks`]: crate::data_api::chain::scan_cached_blocks
+//! [`zcash_client_sqlite`]: https://crates.io/crates/zcash_client_sqlite
+//! [`TransactionRequest`]: crate::zip321::TransactionRequest
+//! [`propose_shielding`]: crate::data_api::wallet::propose_shielding
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fmt::Debug,
+    hash::Hash,
     io,
     num::{NonZeroU32, TryFromIntError},
 };
 
 use incrementalmerkletree::{frontier::Frontier, Retention};
-use sapling::{Node, NOTE_COMMITMENT_TREE_DEPTH};
 use secrecy::SecretVec;
 use shardtree::{error::ShardTreeError, store::ShardStore, ShardTree};
-use zcash_primitives::{
-    block::BlockHash,
-    consensus::BlockHeight,
-    legacy::TransparentAddress,
-    memo::{Memo, MemoBytes},
-    transaction::{
-        components::amount::{Amount, BalanceError, NonNegativeAmount},
-        Transaction, TxId,
-    },
-    zip32::{AccountId, Scope},
-};
-use zip32::DiversifierIndex;
 
+use self::{chain::CommitmentTreeRoot, scanning::ScanRange};
 use crate::{
-    address::{AddressMetadata, UnifiedAddress},
+    address::UnifiedAddress,
     decrypt::DecryptedOutput,
     keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
     proto::service::TreeState,
     wallet::{Note, NoteId, ReceivedNote, Recipient, WalletTransparentOutput, WalletTx},
     ShieldedProtocol,
 };
-
-use self::chain::CommitmentTreeRoot;
-use self::scanning::ScanRange;
+use zcash_primitives::{
+    block::BlockHash,
+    consensus::BlockHeight,
+    memo::{Memo, MemoBytes},
+    transaction::{
+        components::amount::{Amount, BalanceError, NonNegativeAmount},
+        Transaction, TxId,
+    },
+};
+use zip32::DiversifierIndex;
 
 #[cfg(feature = "transparent-inputs")]
-use zcash_primitives::transaction::components::OutPoint;
+use {
+    crate::wallet::TransparentAddressMetadata,
+    zcash_primitives::{legacy::TransparentAddress, transaction::components::OutPoint},
+};
 
 pub mod chain;
 pub mod error;
@@ -49,6 +103,13 @@ pub mod wallet;
 /// This conforms to the structure of subtree data returned by
 /// `lightwalletd` when using the `GetSubtreeRoots` GRPC call.
 pub const SAPLING_SHARD_HEIGHT: u8 = sapling::NOTE_COMMITMENT_TREE_DEPTH / 2;
+
+/// The height of subtree roots in the Orchard note commitment tree.
+///
+/// This conforms to the structure of subtree data returned by
+/// `lightwalletd` when using the `GetSubtreeRoots` GRPC call.
+#[cfg(feature = "orchard")]
+pub const ORCHARD_SHARD_HEIGHT: u8 = { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 } / 2;
 
 /// An enumeration of constraints that can be applied when querying for nullifiers for notes
 /// belonging to the wallet.
@@ -284,18 +345,18 @@ impl<T> Ratio<T> {
 /// this circumstance it is possible that a newly created transaction could conflict with a
 /// not-yet-mined transaction in the mempool.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WalletSummary {
-    account_balances: BTreeMap<AccountId, AccountBalance>,
+pub struct WalletSummary<AccountId: Eq + Hash> {
+    account_balances: HashMap<AccountId, AccountBalance>,
     chain_tip_height: BlockHeight,
     fully_scanned_height: BlockHeight,
     scan_progress: Option<Ratio<u64>>,
     next_sapling_subtree_index: u64,
 }
 
-impl WalletSummary {
+impl<AccountId: Eq + Hash> WalletSummary<AccountId> {
     /// Constructs a new [`WalletSummary`] from its constituent parts.
     pub fn new(
-        account_balances: BTreeMap<AccountId, AccountBalance>,
+        account_balances: HashMap<AccountId, AccountBalance>,
         chain_tip_height: BlockHeight,
         fully_scanned_height: BlockHeight,
         scan_progress: Option<Ratio<u64>>,
@@ -311,7 +372,7 @@ impl WalletSummary {
     }
 
     /// Returns the balances of accounts in the wallet, keyed by account ID.
-    pub fn account_balances(&self) -> &BTreeMap<AccountId, AccountBalance> {
+    pub fn account_balances(&self) -> &HashMap<AccountId, AccountBalance> {
         &self.account_balances
     }
 
@@ -354,10 +415,17 @@ pub trait InputSource {
     /// The type of errors produced by a wallet backend.
     type Error;
 
+    /// Backend-specific account identifier.
+    ///
+    /// An account identifier corresponds to at most a single unified spending key's worth of spend
+    /// authority, such that both received notes and change spendable by that spending authority
+    /// will be interpreted as belonging to that account. This might be a database identifier type
+    /// or a UUID.
+    type AccountId: Copy + Debug + Eq + Hash;
+
     /// Backend-specific note identifier.
     ///
-    /// For example, this might be a database identifier type
-    /// or a UUID.
+    /// For example, this might be a database identifier type or a UUID.
     type NoteRef: Copy + Debug + Eq + Ord;
 
     /// Fetches a spendable note by indexing into a transaction's shielded outputs for the
@@ -377,7 +445,7 @@ pub trait InputSource {
     /// be included.
     fn select_spendable_notes(
         &self,
-        account: AccountId,
+        account: Self::AccountId,
         target_value: Amount,
         sources: &[ShieldedProtocol],
         anchor_height: BlockHeight,
@@ -417,6 +485,13 @@ pub trait InputSource {
 pub trait WalletRead {
     /// The type of errors that may be generated when querying a wallet data store.
     type Error;
+
+    /// The type of the account identifier.
+    ///
+    /// An account identifier corresponds to at most a single unified spending key's worth of spend
+    /// authority, such that both received notes and change spendable by that spending authority
+    /// will be interpreted as belonging to that account.
+    type AccountId: Copy + Debug + Eq + Hash;
 
     /// Returns the height of the chain as known to the wallet as of the most recent call to
     /// [`WalletWrite::update_chain_tip`].
@@ -496,7 +571,7 @@ pub trait WalletRead {
 
     /// Returns the birthday height for the given account, or an error if the account is not known
     /// to the wallet.
-    fn get_account_birthday(&self, account: AccountId) -> Result<BlockHeight, Self::Error>;
+    fn get_account_birthday(&self, account: Self::AccountId) -> Result<BlockHeight, Self::Error>;
 
     /// Returns the most recently generated unified address for the specified account, if the
     /// account identifier specified refers to a valid account for this wallet.
@@ -505,26 +580,26 @@ pub trait WalletRead {
     /// account.
     fn get_current_address(
         &self,
-        account: AccountId,
+        account: Self::AccountId,
     ) -> Result<Option<UnifiedAddress>, Self::Error>;
 
     /// Returns all unified full viewing keys known to this wallet.
     fn get_unified_full_viewing_keys(
         &self,
-    ) -> Result<HashMap<AccountId, UnifiedFullViewingKey>, Self::Error>;
+    ) -> Result<HashMap<Self::AccountId, UnifiedFullViewingKey>, Self::Error>;
 
     /// Returns the account id corresponding to a given [`UnifiedFullViewingKey`], if any.
     fn get_account_for_ufvk(
         &self,
         ufvk: &UnifiedFullViewingKey,
-    ) -> Result<Option<AccountId>, Self::Error>;
+    ) -> Result<Option<Self::AccountId>, Self::Error>;
 
     /// Returns the wallet balances and sync status for an account given the specified minimum
     /// number of confirmations, or `Ok(None)` if the wallet has no balance data available.
     fn get_wallet_summary(
         &self,
         min_confirmations: u32,
-    ) -> Result<Option<WalletSummary>, Self::Error>;
+    ) -> Result<Option<WalletSummary<Self::AccountId>>, Self::Error>;
 
     /// Returns the memo for a note.
     ///
@@ -542,7 +617,7 @@ pub trait WalletRead {
     fn get_sapling_nullifiers(
         &self,
         query: NullifierQuery,
-    ) -> Result<Vec<(AccountId, sapling::Nullifier)>, Self::Error>;
+    ) -> Result<Vec<(Self::AccountId, sapling::Nullifier)>, Self::Error>;
 
     /// Returns the nullifiers for Orchard notes that the wallet is tracking, along with their
     /// associated account IDs, that are either unspent or have not yet been confirmed as spent (in
@@ -551,28 +626,34 @@ pub trait WalletRead {
     fn get_orchard_nullifiers(
         &self,
         query: NullifierQuery,
-    ) -> Result<Vec<(AccountId, orchard::note::Nullifier)>, Self::Error>;
+    ) -> Result<Vec<(Self::AccountId, orchard::note::Nullifier)>, Self::Error>;
 
     /// Returns the set of all transparent receivers associated with the given account.
     ///
     /// The set contains all transparent receivers that are known to have been derived
     /// under this account. Wallets should scan the chain for UTXOs sent to these
     /// receivers.
+    #[cfg(feature = "transparent-inputs")]
     fn get_transparent_receivers(
         &self,
-        account: AccountId,
-    ) -> Result<HashMap<TransparentAddress, AddressMetadata>, Self::Error>;
+        _account: Self::AccountId,
+    ) -> Result<HashMap<TransparentAddress, Option<TransparentAddressMetadata>>, Self::Error> {
+        Ok(HashMap::new())
+    }
 
     /// Returns a mapping from transparent receiver to not-yet-shielded UTXO balance,
     /// for each address associated with a nonzero balance.
+    #[cfg(feature = "transparent-inputs")]
     fn get_transparent_balances(
         &self,
-        account: AccountId,
-        max_height: BlockHeight,
-    ) -> Result<HashMap<TransparentAddress, Amount>, Self::Error>;
+        _account: Self::AccountId,
+        _max_height: BlockHeight,
+    ) -> Result<HashMap<TransparentAddress, Amount>, Self::Error> {
+        Ok(HashMap::new())
+    }
 
     /// Returns a vector with the IDs of all accounts known to this wallet.
-    fn get_account_ids(&self) -> Result<Vec<AccountId>, Self::Error>;
+    fn get_account_ids(&self) -> Result<Vec<Self::AccountId>, Self::Error>;
 
     /// Gets the transparent addresses and their last sync heights
     /// across all accounts, for purposes of scanning for new transactions.
@@ -689,33 +770,33 @@ pub struct ScannedBlockCommitments {
     /// The ordered vector of note commitments for Orchard outputs of the block.
     /// Present only when the `orchard` feature is enabled.
     #[cfg(feature = "orchard")]
-    pub orchard: Vec<(orchard::note::NoteCommitment, Retention<BlockHeight>)>,
+    pub orchard: Vec<(orchard::tree::MerkleHashOrchard, Retention<BlockHeight>)>,
 }
 
 /// The subset of information that is relevant to this wallet that has been
 /// decrypted and extracted from a [`CompactBlock`].
 ///
 /// [`CompactBlock`]: crate::proto::compact_formats::CompactBlock
-pub struct ScannedBlock<Nf, S> {
+pub struct ScannedBlock<A> {
     block_height: BlockHeight,
     block_hash: BlockHash,
     block_time: u32,
-    transactions: Vec<WalletTx<Nf, S>>,
+    transactions: Vec<WalletTx<A>>,
     sapling: ScannedBundles<sapling::Node, sapling::Nullifier>,
     #[cfg(feature = "orchard")]
-    orchard: ScannedBundles<orchard::note::NoteCommitment, orchard::note::Nullifier>,
+    orchard: ScannedBundles<orchard::tree::MerkleHashOrchard, orchard::note::Nullifier>,
 }
 
-impl<Nf, S> ScannedBlock<Nf, S> {
+impl<A> ScannedBlock<A> {
     /// Constructs a new `ScannedBlock`
     pub(crate) fn from_parts(
         block_height: BlockHeight,
         block_hash: BlockHash,
         block_time: u32,
-        transactions: Vec<WalletTx<Nf, S>>,
+        transactions: Vec<WalletTx<A>>,
         sapling: ScannedBundles<sapling::Node, sapling::Nullifier>,
         #[cfg(feature = "orchard")] orchard: ScannedBundles<
-            orchard::note::NoteCommitment,
+            orchard::tree::MerkleHashOrchard,
             orchard::note::Nullifier,
         >,
     ) -> Self {
@@ -746,7 +827,7 @@ impl<Nf, S> ScannedBlock<Nf, S> {
     }
 
     /// Returns the list of transactions from this block that are relevant to the wallet.
-    pub fn transactions(&self) -> &[WalletTx<Nf, S>] {
+    pub fn transactions(&self) -> &[WalletTx<A>] {
         &self.transactions
     }
 
@@ -759,7 +840,7 @@ impl<Nf, S> ScannedBlock<Nf, S> {
     #[cfg(feature = "orchard")]
     pub fn orchard(
         &self,
-    ) -> &ScannedBundles<orchard::note::NoteCommitment, orchard::note::Nullifier> {
+    ) -> &ScannedBundles<orchard::tree::MerkleHashOrchard, orchard::note::Nullifier> {
         &self.orchard
     }
 
@@ -790,9 +871,9 @@ impl<Nf, S> ScannedBlock<Nf, S> {
 ///
 /// The purpose of this struct is to permit atomic updates of the
 /// wallet database when transactions are successfully decrypted.
-pub struct DecryptedTransaction<'a> {
+pub struct DecryptedTransaction<'a, AccountId> {
     pub tx: &'a Transaction,
-    pub sapling_outputs: &'a Vec<DecryptedOutput<sapling::Note>>,
+    pub sapling_outputs: &'a Vec<DecryptedOutput<sapling::Note, AccountId>>,
 }
 
 /// A transaction that was constructed and sent by the wallet.
@@ -800,39 +881,47 @@ pub struct DecryptedTransaction<'a> {
 /// The purpose of this struct is to permit atomic updates of the
 /// wallet database when transactions are created and submitted
 /// to the network.
-pub struct SentTransaction<'a> {
+pub struct SentTransaction<'a, AccountId> {
     pub tx: &'a Transaction,
     pub created: time::OffsetDateTime,
     pub account: AccountId,
-    pub outputs: Vec<SentTransactionOutput>,
+    pub outputs: Vec<SentTransactionOutput<AccountId>>,
     pub fee_amount: Amount,
     #[cfg(feature = "transparent-inputs")]
     pub utxos_spent: Vec<OutPoint>,
 }
 
-/// A type that represents an output (either Sapling or transparent) that was sent by the wallet.
-pub struct SentTransactionOutput {
+/// An output of a transaction generated by the wallet.
+///
+/// This type is capable of representing both shielded and transparent outputs.
+pub struct SentTransactionOutput<AccountId> {
     output_index: usize,
-    recipient: Recipient,
+    recipient: Recipient<AccountId, Note>,
     value: NonNegativeAmount,
     memo: Option<MemoBytes>,
-    sapling_change_to: Option<(AccountId, sapling::Note)>,
 }
 
-impl SentTransactionOutput {
+impl<AccountId> SentTransactionOutput<AccountId> {
+    /// Constructs a new [`SentTransactionOutput`] from its constituent parts.
+    ///
+    /// ### Fields:
+    /// * `output_index` - the index of the output or action in the sent transaction
+    /// * `recipient` - the recipient of the output, either a Zcash address or a
+    ///    wallet-internal account and the note belonging to the wallet created by
+    ///    the output
+    /// * `value` - the value of the output, in zatoshis
+    /// * `memo` - the memo that was sent with this output
     pub fn from_parts(
         output_index: usize,
-        recipient: Recipient,
+        recipient: Recipient<AccountId, Note>,
         value: NonNegativeAmount,
         memo: Option<MemoBytes>,
-        sapling_change_to: Option<(AccountId, sapling::Note)>,
     ) -> Self {
         Self {
             output_index,
             recipient,
             value,
             memo,
-            sapling_change_to,
         }
     }
 
@@ -845,9 +934,9 @@ impl SentTransactionOutput {
     pub fn output_index(&self) -> usize {
         self.output_index
     }
-    /// Returns the recipient address of the transaction, or the account id for wallet-internal
-    /// transactions.
-    pub fn recipient(&self) -> &Recipient {
+    /// Returns the recipient address of the transaction, or the account id and
+    /// resulting note for wallet-internal outputs.
+    pub fn recipient(&self) -> &Recipient<AccountId, Note> {
         &self.recipient
     }
     /// Returns the value of the newly created output.
@@ -859,12 +948,6 @@ impl SentTransactionOutput {
     pub fn memo(&self) -> Option<&MemoBytes> {
         self.memo.as_ref()
     }
-
-    /// Returns the account to which change (or wallet-internal value in the case of a shielding
-    /// transaction) was sent, along with the change note.
-    pub fn sapling_change_to(&self) -> Option<&(AccountId, sapling::Note)> {
-        self.sapling_change_to.as_ref()
-    }
 }
 
 /// A data structure used to set the birthday height for an account, and ensure that the initial
@@ -872,7 +955,7 @@ impl SentTransactionOutput {
 #[derive(Clone, Debug)]
 pub struct AccountBirthday {
     height: BlockHeight,
-    sapling_frontier: Frontier<Node, NOTE_COMMITMENT_TREE_DEPTH>,
+    sapling_frontier: Frontier<sapling::Node, { sapling::NOTE_COMMITMENT_TREE_DEPTH }>,
     recover_until: Option<BlockHeight>,
 }
 
@@ -913,7 +996,7 @@ impl AccountBirthday {
     #[cfg(feature = "test-dependencies")]
     pub fn from_parts(
         height: BlockHeight,
-        sapling_frontier: Frontier<Node, NOTE_COMMITMENT_TREE_DEPTH>,
+        sapling_frontier: Frontier<sapling::Node, { sapling::NOTE_COMMITMENT_TREE_DEPTH }>,
         recover_until: Option<BlockHeight>,
     ) -> Self {
         Self {
@@ -946,7 +1029,9 @@ impl AccountBirthday {
 
     /// Returns the Sapling note commitment tree frontier as of the end of the block at
     /// [`Self::height`].
-    pub fn sapling_frontier(&self) -> &Frontier<Node, NOTE_COMMITMENT_TREE_DEPTH> {
+    pub fn sapling_frontier(
+        &self,
+    ) -> &Frontier<sapling::Node, { sapling::NOTE_COMMITMENT_TREE_DEPTH }> {
         &self.sapling_frontier
     }
 
@@ -990,7 +1075,9 @@ pub trait WalletWrite: WalletRead {
     /// current set of [ZIP 316] account identifiers known to the wallet database.
     ///
     /// Returns the account identifier for the newly-created wallet database entry, along with the
-    /// associated [`UnifiedSpendingKey`].
+    /// associated [`UnifiedSpendingKey`]. Note that the unique account identifier should *not* be
+    /// assumed equivalent to the ZIP 32 account index. It is an opaque identifier for a pool of
+    /// funds or set of outputs controlled by a single spending authority.
     ///
     /// If `birthday.height()` is below the current chain tip, this operation will
     /// trigger a re-scan of the blocks at and above the provided height. The birthday height is
@@ -1016,7 +1103,7 @@ pub trait WalletWrite: WalletRead {
         &mut self,
         seed: &SecretVec<u8>,
         birthday: AccountBirthday,
-    ) -> Result<(AccountId, UnifiedSpendingKey), Self::Error>;
+    ) -> Result<(Self::AccountId, UnifiedSpendingKey), Self::Error>;
 
     /// Generates and persists the next available diversified address, given the current
     /// addresses known to the wallet.
@@ -1025,7 +1112,7 @@ pub trait WalletWrite: WalletRead {
     /// account.
     fn get_next_available_address(
         &mut self,
-        account: AccountId,
+        account: Self::AccountId,
         request: UnifiedAddressRequest,
     ) -> Result<Option<UnifiedAddress>, Self::Error>;
 
@@ -1046,7 +1133,7 @@ pub trait WalletWrite: WalletRead {
     /// after the highest diversifier index in the database, which may leave gaps in the sequence.
     fn insert_address_with_diversifier_index(
         &mut self,
-        account: AccountId,
+        account: Self::AccountId,
         diversifier_index: DiversifierIndex,
     ) -> Result<UnifiedAddress, Self::Error>;
 
@@ -1055,10 +1142,8 @@ pub trait WalletWrite: WalletRead {
     /// pertaining to this wallet.
     ///
     /// `blocks` must be sequential, in order of increasing block height
-    fn put_blocks(
-        &mut self,
-        blocks: Vec<ScannedBlock<sapling::Nullifier, Scope>>,
-    ) -> Result<(), Self::Error>;
+    fn put_blocks(&mut self, blocks: Vec<ScannedBlock<Self::AccountId>>)
+        -> Result<(), Self::Error>;
 
     /// Updates the wallet's view of the blockchain.
     ///
@@ -1070,11 +1155,17 @@ pub trait WalletWrite: WalletRead {
     fn update_chain_tip(&mut self, tip_height: BlockHeight) -> Result<(), Self::Error>;
 
     /// Caches a decrypted transaction in the persistent wallet store.
-    fn store_decrypted_tx(&mut self, received_tx: DecryptedTransaction) -> Result<(), Self::Error>;
+    fn store_decrypted_tx(
+        &mut self,
+        received_tx: DecryptedTransaction<Self::AccountId>,
+    ) -> Result<(), Self::Error>;
 
     /// Saves information about a transaction that was constructed and sent by the wallet to the
     /// persistent wallet store.
-    fn store_sent_tx(&mut self, sent_tx: &SentTransaction) -> Result<(), Self::Error>;
+    fn store_sent_tx(
+        &mut self,
+        sent_tx: &SentTransaction<Self::AccountId>,
+    ) -> Result<(), Self::Error>;
 
     /// Truncates the wallet database to the specified height.
     ///
@@ -1111,13 +1202,15 @@ pub trait WalletWrite: WalletRead {
 /// also provide operations related to Orchard note commitment trees in the future.
 pub trait WalletCommitmentTrees {
     type Error;
+    /// The type of the backing [`ShardStore`] for the Sapling note commitment tree.
     type SaplingShardStore<'a>: ShardStore<
         H = sapling::Node,
         CheckpointId = BlockHeight,
         Error = Self::Error,
     >;
 
-    ///
+    /// Evaluates the given callback function with a reference to the Sapling
+    /// note commitment tree maintained by the wallet.
     fn with_sapling_tree_mut<F, A, E>(&mut self, callback: F) -> Result<A, E>
     where
         for<'a> F: FnMut(
@@ -1129,11 +1222,47 @@ pub trait WalletCommitmentTrees {
         ) -> Result<A, E>,
         E: From<ShardTreeError<Self::Error>>;
 
-    /// Adds a sequence of note commitment tree subtree roots to the data store.
+    /// Adds a sequence of Sapling note commitment tree subtree roots to the data store.
+    ///
+    /// Each such value should be the Merkle root of a subtree of the Sapling note commitment tree
+    /// containing 2^[`SAPLING_SHARD_HEIGHT`] note commitments.
     fn put_sapling_subtree_roots(
         &mut self,
         start_index: u64,
         roots: &[CommitmentTreeRoot<sapling::Node>],
+    ) -> Result<(), ShardTreeError<Self::Error>>;
+
+    /// The type of the backing [`ShardStore`] for the Orchard note commitment tree.
+    #[cfg(feature = "orchard")]
+    type OrchardShardStore<'a>: ShardStore<
+        H = orchard::tree::MerkleHashOrchard,
+        CheckpointId = BlockHeight,
+        Error = Self::Error,
+    >;
+
+    /// Evaluates the given callback function with a reference to the Orchard
+    /// note commitment tree maintained by the wallet.
+    #[cfg(feature = "orchard")]
+    fn with_orchard_tree_mut<F, A, E>(&mut self, callback: F) -> Result<A, E>
+    where
+        for<'a> F: FnMut(
+            &'a mut ShardTree<
+                Self::OrchardShardStore<'a>,
+                { ORCHARD_SHARD_HEIGHT * 2 },
+                ORCHARD_SHARD_HEIGHT,
+            >,
+        ) -> Result<A, E>,
+        E: From<ShardTreeError<Self::Error>>;
+
+    /// Adds a sequence of Orchard note commitment tree subtree roots to the data store.
+    ///
+    /// Each such value should be the Merkle root of a subtree of the Orchard note commitment tree
+    /// containing 2^[`ORCHARD_SHARD_HEIGHT`] note commitments.
+    #[cfg(feature = "orchard")]
+    fn put_orchard_subtree_roots(
+        &mut self,
+        start_index: u64,
+        roots: &[CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>],
     ) -> Result<(), ShardTreeError<Self::Error>>;
 }
 
@@ -1148,14 +1277,12 @@ pub mod testing {
     use zcash_primitives::{
         block::BlockHash,
         consensus::{BlockHeight, Network},
-        legacy::TransparentAddress,
         memo::Memo,
         transaction::{components::Amount, Transaction, TxId},
-        zip32::{AccountId, Scope},
     };
 
     use crate::{
-        address::{AddressMetadata, UnifiedAddress},
+        address::UnifiedAddress,
         keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
         wallet::{Note, NoteId, ReceivedNote, WalletTransparentOutput},
         ShieldedProtocol,
@@ -1167,12 +1294,24 @@ pub mod testing {
         WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite, SAPLING_SHARD_HEIGHT,
     };
 
+    #[cfg(feature = "transparent-inputs")]
+    use {crate::wallet::TransparentAddressMetadata, zcash_primitives::legacy::TransparentAddress};
+
+    #[cfg(feature = "orchard")]
+    use super::ORCHARD_SHARD_HEIGHT;
+
     pub struct MockWalletDb {
         pub network: Network,
         pub sapling_tree: ShardTree<
             MemoryShardStore<sapling::Node, BlockHeight>,
             { SAPLING_SHARD_HEIGHT * 2 },
             SAPLING_SHARD_HEIGHT,
+        >,
+        #[cfg(feature = "orchard")]
+        pub orchard_tree: ShardTree<
+            MemoryShardStore<orchard::tree::MerkleHashOrchard, BlockHeight>,
+            { ORCHARD_SHARD_HEIGHT * 2 },
+            ORCHARD_SHARD_HEIGHT,
         >,
     }
 
@@ -1181,6 +1320,8 @@ pub mod testing {
             Self {
                 network,
                 sapling_tree: ShardTree::new(MemoryShardStore::empty(), 100),
+                #[cfg(feature = "orchard")]
+                orchard_tree: ShardTree::new(MemoryShardStore::empty(), 100),
             }
         }
     }
@@ -1188,6 +1329,7 @@ pub mod testing {
     impl InputSource for MockWalletDb {
         type Error = ();
         type NoteRef = u32;
+        type AccountId = u32;
 
         fn get_spendable_note(
             &self,
@@ -1200,7 +1342,7 @@ pub mod testing {
 
         fn select_spendable_notes(
             &self,
-            _account: AccountId,
+            _account: Self::AccountId,
             _target_value: Amount,
             _sources: &[ShieldedProtocol],
             _anchor_height: BlockHeight,
@@ -1212,6 +1354,7 @@ pub mod testing {
 
     impl WalletRead for MockWalletDb {
         type Error = ();
+        type AccountId = u32;
 
         fn chain_height(&self) -> Result<Option<BlockHeight>, Self::Error> {
             Ok(None)
@@ -1266,34 +1409,37 @@ pub mod testing {
             Ok(None)
         }
 
-        fn get_account_birthday(&self, _account: AccountId) -> Result<BlockHeight, Self::Error> {
+        fn get_account_birthday(
+            &self,
+            _account: Self::AccountId,
+        ) -> Result<BlockHeight, Self::Error> {
             Err(())
         }
 
         fn get_current_address(
             &self,
-            _account: AccountId,
+            _account: Self::AccountId,
         ) -> Result<Option<UnifiedAddress>, Self::Error> {
             Ok(None)
         }
 
         fn get_unified_full_viewing_keys(
             &self,
-        ) -> Result<HashMap<AccountId, UnifiedFullViewingKey>, Self::Error> {
+        ) -> Result<HashMap<Self::AccountId, UnifiedFullViewingKey>, Self::Error> {
             Ok(HashMap::new())
         }
 
         fn get_account_for_ufvk(
             &self,
             _ufvk: &UnifiedFullViewingKey,
-        ) -> Result<Option<AccountId>, Self::Error> {
+        ) -> Result<Option<Self::AccountId>, Self::Error> {
             Ok(None)
         }
 
         fn get_wallet_summary(
             &self,
             _min_confirmations: u32,
-        ) -> Result<Option<WalletSummary>, Self::Error> {
+        ) -> Result<Option<WalletSummary<Self::AccountId>>, Self::Error> {
             Ok(None)
         }
 
@@ -1308,7 +1454,7 @@ pub mod testing {
         fn get_sapling_nullifiers(
             &self,
             _query: NullifierQuery,
-        ) -> Result<Vec<(AccountId, sapling::Nullifier)>, Self::Error> {
+        ) -> Result<Vec<(Self::AccountId, sapling::Nullifier)>, Self::Error> {
             Ok(Vec::new())
         }
 
@@ -1316,26 +1462,29 @@ pub mod testing {
         fn get_orchard_nullifiers(
             &self,
             _query: NullifierQuery,
-        ) -> Result<Vec<(AccountId, orchard::note::Nullifier)>, Self::Error> {
+        ) -> Result<Vec<(Self::AccountId, orchard::note::Nullifier)>, Self::Error> {
             Ok(Vec::new())
         }
 
+        #[cfg(feature = "transparent-inputs")]
         fn get_transparent_receivers(
             &self,
-            _account: AccountId,
-        ) -> Result<HashMap<TransparentAddress, AddressMetadata>, Self::Error> {
+            _account: Self::AccountId,
+        ) -> Result<HashMap<TransparentAddress, Option<TransparentAddressMetadata>>, Self::Error>
+        {
             Ok(HashMap::new())
         }
 
+        #[cfg(feature = "transparent-inputs")]
         fn get_transparent_balances(
             &self,
-            _account: AccountId,
+            _account: Self::AccountId,
             _max_height: BlockHeight,
         ) -> Result<HashMap<TransparentAddress, Amount>, Self::Error> {
             Ok(HashMap::new())
         }
 
-        fn get_account_ids(&self) -> Result<Vec<AccountId>, Self::Error> {
+        fn get_account_ids(&self) -> Result<Vec<Self::AccountId>, Self::Error> {
             Ok(Vec::new())
         }
 
@@ -1353,16 +1502,16 @@ pub mod testing {
             &mut self,
             seed: &SecretVec<u8>,
             _birthday: AccountBirthday,
-        ) -> Result<(AccountId, UnifiedSpendingKey), Self::Error> {
-            let account = AccountId::ZERO;
+        ) -> Result<(Self::AccountId, UnifiedSpendingKey), Self::Error> {
+            let account = zip32::AccountId::ZERO;
             UnifiedSpendingKey::from_seed(&self.network, seed.expose_secret(), account)
-                .map(|k| (account, k))
+                .map(|k| (u32::from(account), k))
                 .map_err(|_| ())
         }
 
         fn get_next_available_address(
             &mut self,
-            _account: AccountId,
+            _account: Self::AccountId,
             _request: UnifiedAddressRequest,
         ) -> Result<Option<UnifiedAddress>, Self::Error> {
             Ok(None)
@@ -1370,7 +1519,7 @@ pub mod testing {
 
         fn insert_address_with_diversifier_index(
             &mut self,
-            _account: AccountId,
+            _account: Self::AccountId,
             _diversifier_index: DiversifierIndex,
         ) -> Result<UnifiedAddress, Self::Error> {
             todo!()
@@ -1379,7 +1528,7 @@ pub mod testing {
         #[allow(clippy::type_complexity)]
         fn put_blocks(
             &mut self,
-            _blocks: Vec<ScannedBlock<sapling::Nullifier, Scope>>,
+            _blocks: Vec<ScannedBlock<Self::AccountId>>,
         ) -> Result<(), Self::Error> {
             Ok(())
         }
@@ -1390,12 +1539,15 @@ pub mod testing {
 
         fn store_decrypted_tx(
             &mut self,
-            _received_tx: DecryptedTransaction,
+            _received_tx: DecryptedTransaction<Self::AccountId>,
         ) -> Result<(), Self::Error> {
             Ok(())
         }
 
-        fn store_sent_tx(&mut self, _sent_tx: &SentTransaction) -> Result<(), Self::Error> {
+        fn store_sent_tx(
+            &mut self,
+            _sent_tx: &SentTransaction<Self::AccountId>,
+        ) -> Result<(), Self::Error> {
             Ok(())
         }
 
@@ -1447,6 +1599,44 @@ pub mod testing {
                 for (root, i) in roots.iter().zip(0u64..) {
                     let root_addr =
                         Address::from_parts(SAPLING_SHARD_HEIGHT.into(), start_index + i);
+                    t.insert(root_addr, *root.root_hash())?;
+                }
+                Ok::<_, ShardTreeError<Self::Error>>(())
+            })?;
+
+            Ok(())
+        }
+
+        #[cfg(feature = "orchard")]
+        type OrchardShardStore<'a> =
+            MemoryShardStore<orchard::tree::MerkleHashOrchard, BlockHeight>;
+
+        #[cfg(feature = "orchard")]
+        fn with_orchard_tree_mut<F, A, E>(&mut self, mut callback: F) -> Result<A, E>
+        where
+            for<'a> F: FnMut(
+                &'a mut ShardTree<
+                    Self::OrchardShardStore<'a>,
+                    { ORCHARD_SHARD_HEIGHT * 2 },
+                    ORCHARD_SHARD_HEIGHT,
+                >,
+            ) -> Result<A, E>,
+            E: From<ShardTreeError<Self::Error>>,
+        {
+            callback(&mut self.orchard_tree)
+        }
+
+        /// Adds a sequence of note commitment tree subtree roots to the data store.
+        #[cfg(feature = "orchard")]
+        fn put_orchard_subtree_roots(
+            &mut self,
+            start_index: u64,
+            roots: &[CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>],
+        ) -> Result<(), ShardTreeError<Self::Error>> {
+            self.with_orchard_tree_mut(|t| {
+                for (root, i) in roots.iter().zip(0u64..) {
+                    let root_addr =
+                        Address::from_parts(ORCHARD_SHARD_HEIGHT.into(), start_index + i);
                     t.insert(root_addr, *root.root_hash())?;
                 }
                 Ok::<_, ShardTreeError<Self::Error>>(())
