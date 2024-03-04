@@ -118,6 +118,13 @@ pub enum NullifierQuery {
     All,
 }
 
+pub struct TransparentAddressSyncInfo {
+    pub account_id: u32,
+    pub index: u32,
+    pub address: TransparentAddress,
+    pub height: Option<BlockHeight>,
+}
+
 /// Balance information for a value within a single pool in an account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Balance {
@@ -662,7 +669,7 @@ pub trait WalletRead {
     /// to record updates to the block heights per address.
     fn get_transparent_addresses_and_sync_heights(
         &mut self,
-    ) -> Result<HashMap<TransparentAddress, Option<BlockHeight>>, Self::Error>;
+    ) -> Result<Vec<TransparentAddressSyncInfo>, Self::Error>;
 }
 
 /// Metadata describing the sizes of the zcash note commitment trees as of a particular block.
@@ -1291,7 +1298,8 @@ pub mod testing {
     use super::{
         chain::CommitmentTreeRoot, scanning::ScanRange, AccountBirthday, BlockMetadata,
         DecryptedTransaction, InputSource, NullifierQuery, ScannedBlock, SentTransaction,
-        WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite, SAPLING_SHARD_HEIGHT,
+        TransparentAddressSyncInfo, WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite,
+        SAPLING_SHARD_HEIGHT,
     };
 
     #[cfg(feature = "transparent-inputs")]
@@ -1490,8 +1498,8 @@ pub mod testing {
 
         fn get_transparent_addresses_and_sync_heights(
             &mut self,
-        ) -> Result<HashMap<TransparentAddress, Option<BlockHeight>>, Self::Error> {
-            Ok(HashMap::new())
+        ) -> Result<Vec<TransparentAddressSyncInfo>, Self::Error> {
+            Ok(Vec::new())
         }
     }
 
