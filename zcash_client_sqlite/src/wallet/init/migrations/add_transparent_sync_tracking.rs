@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::wallet::init::WalletMigrationError;
 
-use super::addresses_table;
+use super::{addresses_table, full_account_ids};
 
 pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xb6ce8980_00c9_4985_9e0c_90a4b11841be);
 
@@ -18,7 +18,12 @@ impl schemer::Migration for Migration {
     }
 
     fn dependencies(&self) -> HashSet<Uuid> {
-        [addresses_table::MIGRATION_ID].into_iter().collect()
+        [
+            addresses_table::MIGRATION_ID,
+            full_account_ids::MIGRATION_ID,
+        ]
+        .into_iter()
+        .collect()
     }
 
     fn description(&self) -> &'static str {

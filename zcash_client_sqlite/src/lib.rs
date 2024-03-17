@@ -512,7 +512,7 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters> WalletRead for W
 
     fn get_transparent_addresses_and_sync_heights(
         &mut self,
-    ) -> Result<Vec<TransparentAddressSyncInfo>, Self::Error> {
+    ) -> Result<Vec<TransparentAddressSyncInfo<AccountId>>, Self::Error> {
         #[cfg(feature = "transparent-inputs")]
         return wallet::get_transparent_addresses_and_sync_heights(
             self.conn.borrow(),

@@ -125,8 +125,8 @@ pub enum NullifierQuery {
     All,
 }
 
-pub struct TransparentAddressSyncInfo {
-    pub account_id: u32,
+pub struct TransparentAddressSyncInfo<AccountId> {
+    pub account_id: AccountId,
     pub index: u32,
     pub address: TransparentAddress,
     pub height: Option<BlockHeight>,
@@ -895,7 +895,7 @@ pub trait WalletRead {
     /// to record updates to the block heights per address.
     fn get_transparent_addresses_and_sync_heights(
         &mut self,
-    ) -> Result<Vec<TransparentAddressSyncInfo>, Self::Error>;
+    ) -> Result<Vec<TransparentAddressSyncInfo<Self::AccountId>>, Self::Error>;
 }
 
 /// Metadata describing the sizes of the zcash note commitment trees as of a particular block.
@@ -1876,7 +1876,7 @@ pub mod testing {
 
         fn get_transparent_addresses_and_sync_heights(
             &mut self,
-        ) -> Result<Vec<TransparentAddressSyncInfo>, Self::Error> {
+        ) -> Result<Vec<TransparentAddressSyncInfo<Self::AccountId>>, Self::Error> {
             Ok(Vec::new())
         }
     }

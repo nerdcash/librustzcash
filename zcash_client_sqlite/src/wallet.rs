@@ -2136,9 +2136,9 @@ pub(crate) fn get_transparent_balances<P: consensus::Parameters>(
 pub(crate) fn get_transparent_addresses_and_sync_heights<P: consensus::Parameters>(
     conn: &rusqlite::Connection,
     params: &P,
-) -> Result<Vec<TransparentAddressSyncInfo>, SqliteClientError> {
+) -> Result<Vec<TransparentAddressSyncInfo<AccountId>>, SqliteClientError> {
     let mut stmt = conn.prepare(
-        "SELECT cached_transparent_receiver_address, diversifier_index_be, last_downloaded_transparent_block, account
+        "SELECT cached_transparent_receiver_address, diversifier_index_be, last_downloaded_transparent_block, account_id
          FROM addresses
          WHERE cached_transparent_receiver_address IS NOT NULL",
     )?;
@@ -2168,7 +2168,7 @@ pub(crate) fn get_transparent_addresses_and_sync_heights<P: consensus::Parameter
             address,
             index,
             height: height.map(|h| BlockHeight::from(h)),
-            account_id,
+            account_id: AccountId(account_id),
         });
     }
 
