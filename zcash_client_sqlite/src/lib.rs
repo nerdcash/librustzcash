@@ -131,6 +131,18 @@ pub(crate) const DEFAULT_UA_REQUEST: UnifiedAddressRequest =
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct AccountId(u32);
 
+impl From<u32> for AccountId {
+    fn from(id: u32) -> Self {
+        AccountId(id)
+    }
+}
+
+impl From<AccountId> for u32 {
+    fn from(id: AccountId) -> u32 {
+        id.0
+    }
+}
+
 impl ConditionallySelectable for AccountId {
     fn conditional_select(a: &Self, b: &Self, choice: subtle::Choice) -> Self {
         AccountId(ConditionallySelectable::conditional_select(
@@ -599,13 +611,13 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
 
     fn insert_address_with_diversifier_index(
         &mut self,
-        account: AccountId,
+        account_id: AccountId,
         diversifier_index: DiversifierIndex,
     ) -> Result<UnifiedAddress, SqliteClientError> {
         self.transactionally(|wdb| {
             let keys = wdb.get_unified_full_viewing_keys()?;
             let ufvk = keys
-                .get(&account)
+                .get(&account_id)
                 .ok_or(SqliteClientError::AccountUnknown)?;
 
             let has_orchard = true;
@@ -637,7 +649,7 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
             return match wallet::insert_address(
                 wdb.conn.0,
                 &wdb.params,
-                account,
+                account_id,
                 diversifier_index,
                 &addr,
             ) {
