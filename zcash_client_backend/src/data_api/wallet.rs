@@ -7,15 +7,11 @@
 //! shielded internal address belonging to their wallet.
 //!
 //! The important high-level operations provided by this module are [`propose_transfer`],
-//! [`propose_shielding`], and [`create_proposed_transactions`].
+//! and [`create_proposed_transactions`].
 //!
 //! [`propose_transfer`] takes a [`TransactionRequest`] object, selects inputs notes and
 //! computes the fees required to satisfy that request, and returns a [`Proposal`] object that
 //! describes the transaction to be made.
-//!
-//! [`propose_shielding`] takes a set of transparent source addresses, and constructs a
-//! [`Proposal`] to send those funds to a wallet-internal shielded address, as described in
-//! [ZIP 316](https://zips.z.cash/zip-0316).
 //!
 //! [`create_proposed_transactions`] constructs one or more Zcash [`Transaction`]s based upon a
 //! provided [`Proposal`], stores them to the wallet database, and returns the [`TxId`] for each
@@ -24,9 +20,18 @@
 //! the responsibility of the caller to retrieve and serialize the transactions and submit them for
 //! inclusion into the Zcash blockchain.
 //!
+#![cfg_attr(
+    feature = "transparent-inputs",
+    doc = "
+Another important high-level operation provided by this module is [`propose_shielding`], which
+takes a set of transparent source addresses, and constructs a [`Proposal`] to send those funds
+to a wallet-internal shielded address, as described in [ZIP 316](https://zips.z.cash/zip-0316).
+
+[`propose_shielding`]: crate::data_api::wallet::propose_shielding
+"
+)]
 //! [`TransactionRequest`]: crate::zip321::TransactionRequest
 //! [`propose_transfer`]: crate::data_api::wallet::propose_transfer
-//! [`propose_shielding`]: crate::data_api::wallet::propose_shielding
 
 use nonempty::NonEmpty;
 use rand_core::OsRng;
@@ -36,24 +41,12 @@ use sapling::{
 };
 use std::num::NonZeroU32;
 
-use zcash_primitives::{
-    consensus::{self, BlockHeight, NetworkUpgrade},
-    memo::MemoBytes,
-    transaction::{
-        builder::{BuildConfig, BuildResult, Builder},
-        components::amount::{Amount, NonNegativeAmount},
-        fees::{zip317::FeeError as Zip317FeeError, FeeRule, StandardFeeRule},
-        Transaction, TxId,
-    },
-    zip32::Scope,
-};
-
 use super::InputSource;
 use crate::{
     address::Address,
     data_api::{
-        error::Error, DecryptedTransaction, SentTransaction, SentTransactionOutput,
-        WalletCommitmentTrees, WalletRead, WalletWrite,
+        error::Error, Account, SentTransaction, SentTransactionOutput, WalletCommitmentTrees,
+        WalletRead, WalletWrite,
     },
     decrypt_transaction,
     fees::{self, DustOutputPolicy},
@@ -63,6 +56,17 @@ use crate::{
     zip321::{self, Payment},
     PoolType, ShieldedProtocol,
 };
+use zcash_primitives::transaction::{
+    builder::{BuildConfig, BuildResult, Builder},
+    components::{amount::NonNegativeAmount, sapling::zip212_enforcement},
+    fees::{zip317::FeeError as Zip317FeeError, FeeRule, StandardFeeRule},
+    Transaction, TxId,
+};
+use zcash_protocol::{
+    consensus::{self, BlockHeight, NetworkUpgrade},
+    memo::MemoBytes,
+};
+use zip32::Scope;
 
 #[cfg(feature = "transparent-inputs")]
 use {
@@ -100,10 +104,7 @@ where
         .or_else(|| params.activation_height(NetworkUpgrade::Sapling))
         .expect("Sapling activation height must be known.");
 
-    data.store_decrypted_tx(DecryptedTransaction {
-        tx,
-        sapling_outputs: &decrypt_transaction(params, height, tx, &ufvks),
-    })?;
+    data.store_decrypted_tx(decrypt_transaction(params, height, tx, &ufvks))?;
 
     Ok(())
 }
@@ -268,7 +269,7 @@ where
         wallet_db,
         params,
         StandardFeeRule::PreZip313,
-        account,
+        account.id(),
         min_confirmations,
         to,
         amount,
@@ -379,7 +380,7 @@ where
     let proposal = propose_transfer(
         wallet_db,
         params,
-        account,
+        account.id(),
         input_selector,
         request,
         min_confirmations,
@@ -693,7 +694,8 @@ where
     let account = wallet_db
         .get_account_for_ufvk(&usk.to_unified_full_viewing_key())
         .map_err(Error::DataSource)?
-        .ok_or(Error::KeyNotRecognized)?;
+        .ok_or(Error::KeyNotRecognized)?
+        .id();
 
     let (sapling_anchor, sapling_inputs) =
         if proposal_step.involves(PoolType::Shielded(ShieldedProtocol::Sapling)) {
@@ -1138,10 +1140,7 @@ where
                                 try_sapling_note_decryption(
                                     &sapling_internal_ivk,
                                     &bundle.shielded_outputs()[output_index],
-                                    consensus::sapling_zip212_enforcement(
-                                        params,
-                                        min_target_height,
-                                    ),
+                                    zip212_enforcement(params, min_target_height),
                                 )
                                 .map(|(note, _, _)| Note::Sapling(note))
                             })
@@ -1181,7 +1180,7 @@ where
             created: time::OffsetDateTime::now_utc(),
             account,
             outputs,
-            fee_amount: Amount::from(proposal_step.balance().fee_required()),
+            fee_amount: proposal_step.balance().fee_required(),
             #[cfg(feature = "transparent-inputs")]
             utxos_spent,
         })

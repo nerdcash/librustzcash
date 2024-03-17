@@ -87,8 +87,8 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
         )?;
 
         for ((id_tx, txid), ufvks) in tx_sent_notes {
-            let (block_height, tx) =
-                get_transaction(transaction, &self.params, txid).map_err(|err| match err {
+            let (block_height, tx) = get_transaction(transaction, &self.params, txid)
+                .map_err(|err| match err {
                     SqliteClientError::CorruptedData(msg) => {
                         WalletMigrationError::CorruptedData(msg)
                     }
@@ -97,14 +97,23 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                         "An error was encountered decoding transaction data: {:?}",
                         other
                     )),
+                })?
+                .ok_or_else(|| {
+                    WalletMigrationError::CorruptedData(format!(
+                        "Transaction not found for id {:?}",
+                        txid
+                    ))
                 })?;
 
             let decrypted_outputs = decrypt_transaction(&self.params, block_height, &tx, &ufvks);
-            for d_out in decrypted_outputs {
+
+            // Orchard outputs were not supported as of the wallet states that could require this
+            // migration.
+            for d_out in decrypted_outputs.sapling_outputs() {
                 stmt_update_sent_memo.execute(named_params![
                     ":id_tx": id_tx,
-                    ":output_index": d_out.index,
-                    ":memo": memo_repr(Some(&d_out.memo))
+                    ":output_index": d_out.index(),
+                    ":memo": memo_repr(Some(d_out.memo()))
                 ])?;
             }
         }
@@ -209,6 +218,6 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
     }
 
     fn down(&self, _: &rusqlite::Transaction) -> Result<(), Self::Error> {
-        panic!("Reversing this migration is not supported.");
+        Err(WalletMigrationError::CannotRevert(MIGRATION_ID))
     }
 }

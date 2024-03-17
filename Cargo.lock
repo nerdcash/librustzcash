@@ -1087,8 +1087,7 @@ dependencies = [
 [[package]]
 name = "incrementalmerkletree"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "361c467824d4d9d4f284be4b2608800839419dccc4d4608f28345237fe354623"
+source = "git+https://github.com/nuttycom/incrementalmerkletree?rev=fa147c89c6c98a03bba745538f4e68d4eaed5146#fa147c89c6c98a03bba745538f4e68d4eaed5146"
 dependencies = [
  "either",
  "proptest",
@@ -1476,8 +1475,7 @@ checksum = "624a8340c38c1b80fd549087862da4ba43e08858af025b236e509b6649fc13d5"
 [[package]]
 name = "orchard"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fb255c3ffdccd3c84fe9ebed72aef64fdc72e6a3e4180dd411002d47abaad42"
+source = "git+https://github.com/zcash/orchard?rev=e74879dd0ad0918f4ffe0826e03905cd819981bd#e74879dd0ad0918f4ffe0826e03905cd819981bd"
 dependencies = [
  "aes",
  "bitvec",
@@ -2104,9 +2102,9 @@ dependencies = [
 
 [[package]]
 name = "sapling-crypto"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d183012062dfdde85f7e3e758328fcf6e9846d8dd3fce35b04d0efcb6677b0e0"
+checksum = "0db258736b34dfc6bec50fab2afb94c1845d90370b38309ebf9bb166cc951251"
 dependencies = [
  "aes",
  "bellman",
@@ -2264,8 +2262,7 @@ dependencies = [
 [[package]]
 name = "shardtree"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbf20c7a2747d9083092e3a3eeb9a7ed75577ae364896bebbc5e0bdcd4e97735"
+source = "git+https://github.com/nuttycom/incrementalmerkletree?rev=fa147c89c6c98a03bba745538f4e68d4eaed5146#fa147c89c6c98a03bba745538f4e68d4eaed5146"
 dependencies = [
  "assert_matches",
  "bitflags 2.4.1",
@@ -3012,7 +3009,7 @@ checksum = "213b7324336b53d2414b2db8537e56544d981803139155afa84f76eeebb7a546"
 
 [[package]]
 name = "zcash_address"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "assert_matches",
  "bech32",
@@ -3020,11 +3017,12 @@ dependencies = [
  "f4jumble",
  "proptest",
  "zcash_encoding",
+ "zcash_protocol",
 ]
 
 [[package]]
 name = "zcash_client_backend"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "assert_matches",
  "base64",
@@ -3064,14 +3062,16 @@ dependencies = [
  "zcash_note_encryption",
  "zcash_primitives",
  "zcash_proofs",
+ "zcash_protocol",
  "zip32",
 ]
 
 [[package]]
 name = "zcash_client_sqlite"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "assert_matches",
+ "bls12_381",
  "bs58",
  "byteorder",
  "document-features",
@@ -3083,8 +3083,10 @@ dependencies = [
  "maybe-rayon",
  "nonempty",
  "orchard",
+ "pasta_curves",
  "proptest",
  "prost",
+ "rand_chacha",
  "rand_core",
  "regex",
  "rusqlite",
@@ -3093,6 +3095,7 @@ dependencies = [
  "schemer-rusqlite",
  "secrecy",
  "shardtree",
+ "subtle",
  "tempfile",
  "time",
  "tracing",
@@ -3104,6 +3107,8 @@ dependencies = [
  "zcash_note_encryption",
  "zcash_primitives",
  "zcash_proofs",
+ "zcash_protocol",
+ "zip32",
 ]
 
 [[package]]
@@ -3142,9 +3147,10 @@ dependencies = [
 
 [[package]]
 name = "zcash_keys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bech32",
+ "blake2b_simd",
  "bls12_381",
  "bs58",
  "byteorder",
@@ -3159,11 +3165,13 @@ dependencies = [
  "proptest",
  "rand_core",
  "sapling-crypto",
+ "secrecy",
  "subtle",
  "tracing",
  "zcash_address",
  "zcash_encoding",
  "zcash_primitives",
+ "zcash_protocol",
  "zip32",
 ]
 
@@ -3218,6 +3226,7 @@ dependencies = [
  "zcash_address",
  "zcash_encoding",
  "zcash_note_encryption",
+ "zcash_protocol",
  "zcash_spec",
  "zip32",
 ]
@@ -3244,6 +3253,16 @@ dependencies = [
  "wagyu-zcash-parameters",
  "xdg",
  "zcash_primitives",
+]
+
+[[package]]
+name = "zcash_protocol"
+version = "0.1.0"
+dependencies = [
+ "document-features",
+ "incrementalmerkletree",
+ "memuse",
+ "proptest",
 ]
 
 [[package]]
@@ -3297,9 +3316,9 @@ dependencies = [
 
 [[package]]
 name = "zip32"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d724a63be4dfb50b7f3617e542984e22e4b4a5b8ca5de91f55613152885e6b22"
+checksum = "4226d0aee9c9407c27064dfeec9d7b281c917de3374e1e5a2e2cfad9e09de19e"
 dependencies = [
  "blake2b_simd",
  "memuse",

@@ -8,9 +8,9 @@ use zcash_client_backend::{
     encoding::{Bech32DecodeError, TransparentCodecError},
     PoolType,
 };
-use zcash_primitives::{
-    consensus::BlockHeight, transaction::components::amount::BalanceError, zip32::AccountId,
-};
+use zcash_keys::keys::AddressGenerationError;
+use zcash_primitives::zip32;
+use zcash_primitives::{consensus::BlockHeight, transaction::components::amount::BalanceError};
 
 use crate::wallet::commitment_tree;
 use crate::PRUNING_DEPTH;
@@ -71,12 +71,20 @@ pub enum SqliteClientError {
     /// The space of allocatable diversifier indices has been exhausted for the given account.
     DiversifierIndexOutOfRange,
 
-    /// The account for which information was requested does not belong to the wallet.
-    AccountUnknown(AccountId),
+    /// An error occurred in generating a Zcash address.
+    AddressGeneration(AddressGenerationError),
 
-    /// An error occurred deriving a spending key from a seed and an account
-    /// identifier.
-    KeyDerivationError(AccountId),
+    /// The account for which information was requested does not belong to the wallet.
+    AccountUnknown,
+
+    /// The account was imported, and ZIP-32 derivation information is not known for it.
+    UnknownZip32Derivation,
+
+    /// An error occurred deriving a spending key from a seed and a ZIP-32 account index.
+    KeyDerivationError(zip32::AccountId),
+
+    /// An error occurred while processing an account due to a failure in deriving the account's keys.
+    BadAccountData(String),
 
     /// A caller attempted to initialize the accounts table with a discontinuous
     /// set of account identifiers.
@@ -119,6 +127,7 @@ impl error::Error for SqliteClientError {
             SqliteClientError::DbError(e) => Some(e),
             SqliteClientError::Io(e) => Some(e),
             SqliteClientError::BalanceError(e) => Some(e),
+            SqliteClientError::AddressGeneration(e) => Some(e),
             _ => None,
         }
     }
@@ -147,9 +156,11 @@ impl fmt::Display for SqliteClientError {
             SqliteClientError::BlockConflict(h) => write!(f, "A block hash conflict occurred at height {}; rewind required.", u32::from(*h)),
             SqliteClientError::NonSequentialBlocks => write!(f, "`put_blocks` requires that the provided block range be sequential"),
             SqliteClientError::DiversifierIndexOutOfRange => write!(f, "The space of available diversifier indices is exhausted"),
-            SqliteClientError::AccountUnknown(acct_id) => write!(f, "Account {} does not belong to this wallet.", u32::from(*acct_id)),
-
+            SqliteClientError::AddressGeneration(e) => write!(f, "{}", e),
+            SqliteClientError::AccountUnknown => write!(f, "The account with the given ID does not belong to this wallet."),
+            SqliteClientError::UnknownZip32Derivation => write!(f, "ZIP-32 derivation information is not known for this account."),
             SqliteClientError::KeyDerivationError(acct_id) => write!(f, "Key derivation failed for account {}", u32::from(*acct_id)),
+            SqliteClientError::BadAccountData(e) => write!(f, "Failed to add account: {}", e),
             SqliteClientError::AccountIdDiscontinuity => write!(f, "Wallet account identifiers must be sequential."),
             SqliteClientError::AccountIdOutOfRange => write!(f, "Wallet account identifiers must be less than 0x7FFFFFFF."),
             #[cfg(feature = "transparent-inputs")]
@@ -215,5 +226,11 @@ impl From<ShardTreeError<commitment_tree::Error>> for SqliteClientError {
 impl From<BalanceError> for SqliteClientError {
     fn from(e: BalanceError) -> Self {
         SqliteClientError::BalanceError(e)
+    }
+}
+
+impl From<AddressGenerationError> for SqliteClientError {
+    fn from(e: AddressGenerationError) -> Self {
+        SqliteClientError::AddressGeneration(e)
     }
 }

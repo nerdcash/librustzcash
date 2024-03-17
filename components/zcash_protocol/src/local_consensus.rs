@@ -1,7 +1,4 @@
-use crate::{
-    consensus::{BlockHeight, NetworkUpgrade, Parameters},
-    constants,
-};
+use crate::consensus::{BlockHeight, NetworkType, NetworkUpgrade, Parameters};
 
 /// a `LocalNetwork` setup should define the activation heights
 /// of network upgrades. `None` is considered as "not activated"
@@ -29,14 +26,10 @@ use crate::{
 ///         heartwood: Some(BlockHeight::from_u32(1)),
 ///         canopy: Some(BlockHeight::from_u32(1)),
 ///         nu5: Some(BlockHeight::from_u32(1)),
-///         #[cfg(feature = "unstable-nu6")]
-///         nu6: Some(BlockHeight::from_u32(1)),
-///         #[cfg(feature = "zfuture")]
-///         z_future: Some(BlockHeight::from_u32(1)),
 ///         };
 ///     ```
 ///     
-#[derive(Clone, PartialEq, Eq, Copy, Debug)]
+#[derive(Clone, PartialEq, Eq, Copy, Debug, Hash)]
 pub struct LocalNetwork {
     pub overwinter: Option<BlockHeight>,
     pub sapling: Option<BlockHeight>,
@@ -44,18 +37,18 @@ pub struct LocalNetwork {
     pub heartwood: Option<BlockHeight>,
     pub canopy: Option<BlockHeight>,
     pub nu5: Option<BlockHeight>,
+    #[cfg(zcash_unstable = "nu6")]
     pub nu6: Option<BlockHeight>,
-    #[cfg(feature = "zfuture")]
+    #[cfg(zcash_unstable = "zfuture")]
     pub z_future: Option<BlockHeight>,
 }
 
-/// Parameters default implementation for `LocalNetwork`
-/// Important note:
-/// The functions `coin_type()`, `address_network()`,  
-/// `hrp_sapling_extended_spending_key()`, `hrp_sapling_extended_full_viewing_key()`,
-/// `hrp_sapling_payment_address()`, `b58_script_address_prefix()` return
-/// `constants::regtest` values
+/// Parameters implementation for `LocalNetwork`
 impl Parameters for LocalNetwork {
+    fn network_type(&self) -> NetworkType {
+        NetworkType::Regtest
+    }
+
     fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
         match nu {
             NetworkUpgrade::Overwinter => self.overwinter,
@@ -64,50 +57,18 @@ impl Parameters for LocalNetwork {
             NetworkUpgrade::Heartwood => self.heartwood,
             NetworkUpgrade::Canopy => self.canopy,
             NetworkUpgrade::Nu5 => self.nu5,
-            #[cfg(feature = "unstable-nu6")]
+            #[cfg(zcash_unstable = "nu6")]
             NetworkUpgrade::Nu6 => self.nu6,
-            #[cfg(feature = "zfuture")]
+            #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => self.z_future,
         }
-    }
-
-    fn coin_type(&self) -> u32 {
-        constants::regtest::COIN_TYPE
-    }
-
-    fn address_network(&self) -> Option<zcash_address::Network> {
-        Some(zcash_address::Network::Regtest)
-    }
-
-    fn hrp_sapling_extended_spending_key(&self) -> &str {
-        constants::regtest::HRP_SAPLING_EXTENDED_SPENDING_KEY
-    }
-
-    fn hrp_sapling_extended_full_viewing_key(&self) -> &str {
-        constants::regtest::HRP_SAPLING_EXTENDED_FULL_VIEWING_KEY
-    }
-
-    fn hrp_sapling_payment_address(&self) -> &str {
-        constants::regtest::HRP_SAPLING_PAYMENT_ADDRESS
-    }
-
-    fn b58_pubkey_address_prefix(&self) -> [u8; 2] {
-        constants::regtest::B58_PUBKEY_ADDRESS_PREFIX
-    }
-
-    fn b58_script_address_prefix(&self) -> [u8; 2] {
-        constants::regtest::B58_SCRIPT_ADDRESS_PREFIX
-    }
-
-    fn is_nu_active(&self, nu: NetworkUpgrade, height: BlockHeight) -> bool {
-        self.activation_height(nu).map_or(false, |h| h <= height)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        consensus::{BlockHeight, NetworkUpgrade, Parameters},
+        consensus::{BlockHeight, NetworkConstants, NetworkUpgrade, Parameters},
         constants,
         local_consensus::LocalNetwork,
     };
@@ -120,9 +81,9 @@ mod tests {
         let expected_heartwood = BlockHeight::from_u32(4);
         let expected_canopy = BlockHeight::from_u32(5);
         let expected_nu5 = BlockHeight::from_u32(6);
-        #[cfg(feature = "unstable-nu6")]
+        #[cfg(zcash_unstable = "nu6")]
         let expected_nu6 = BlockHeight::from_u32(7);
-        #[cfg(feature = "zfuture")]
+        #[cfg(zcash_unstable = "zfuture")]
         let expected_z_future = BlockHeight::from_u32(7);
 
         let regtest = LocalNetwork {
@@ -132,9 +93,9 @@ mod tests {
             heartwood: Some(expected_heartwood),
             canopy: Some(expected_canopy),
             nu5: Some(expected_nu5),
-            #[cfg(feature = "unstable-nu6")]
+            #[cfg(zcash_unstable = "nu6")]
             nu6: Some(expected_nu6),
-            #[cfg(feature = "zfuture")]
+            #[cfg(zcash_unstable = "zfuture")]
             z_future: Some(expected_z_future),
         };
 
@@ -144,28 +105,10 @@ mod tests {
         assert!(regtest.is_nu_active(NetworkUpgrade::Heartwood, expected_heartwood));
         assert!(regtest.is_nu_active(NetworkUpgrade::Canopy, expected_canopy));
         assert!(regtest.is_nu_active(NetworkUpgrade::Nu5, expected_nu5));
-        #[cfg(feature = "unstable-nu6")]
+        #[cfg(zcash_unstable = "nu6")]
         assert!(regtest.is_nu_active(NetworkUpgrade::Nu6, expected_nu6));
-        #[cfg(feature = "zfuture")]
+        #[cfg(zcash_unstable = "zfuture")]
         assert!(!regtest.is_nu_active(NetworkUpgrade::ZFuture, expected_nu5));
-
-        assert_eq!(regtest.coin_type(), constants::regtest::COIN_TYPE);
-        assert_eq!(
-            regtest.hrp_sapling_extended_spending_key(),
-            constants::regtest::HRP_SAPLING_EXTENDED_SPENDING_KEY
-        );
-        assert_eq!(
-            regtest.hrp_sapling_extended_full_viewing_key(),
-            constants::regtest::HRP_SAPLING_EXTENDED_FULL_VIEWING_KEY
-        );
-        assert_eq!(
-            regtest.hrp_sapling_payment_address(),
-            constants::regtest::HRP_SAPLING_PAYMENT_ADDRESS
-        );
-        assert_eq!(
-            regtest.b58_pubkey_address_prefix(),
-            constants::regtest::B58_PUBKEY_ADDRESS_PREFIX
-        );
     }
 
     #[test]
@@ -176,9 +119,9 @@ mod tests {
         let expected_heartwood = BlockHeight::from_u32(4);
         let expected_canopy = BlockHeight::from_u32(5);
         let expected_nu5 = BlockHeight::from_u32(6);
-        #[cfg(feature = "unstable-nu6")]
+        #[cfg(zcash_unstable = "nu6")]
         let expected_nu6 = BlockHeight::from_u32(7);
-        #[cfg(feature = "zfuture")]
+        #[cfg(zcash_unstable = "zfuture")]
         let expected_z_future = BlockHeight::from_u32(7);
 
         let regtest = LocalNetwork {
@@ -188,9 +131,9 @@ mod tests {
             heartwood: Some(expected_heartwood),
             canopy: Some(expected_canopy),
             nu5: Some(expected_nu5),
-            #[cfg(feature = "unstable-nu6")]
+            #[cfg(zcash_unstable = "nu6")]
             nu6: Some(expected_nu6),
-            #[cfg(feature = "zfuture")]
+            #[cfg(zcash_unstable = "zfuture")]
             z_future: Some(expected_z_future),
         };
 
@@ -218,7 +161,7 @@ mod tests {
             regtest.activation_height(NetworkUpgrade::Nu5),
             Some(expected_nu5)
         );
-        #[cfg(feature = "zfuture")]
+        #[cfg(zcash_unstable = "zfuture")]
         assert_eq!(
             regtest.activation_height(NetworkUpgrade::ZFuture),
             Some(expected_z_future)
@@ -233,9 +176,9 @@ mod tests {
         let expected_heartwood = BlockHeight::from_u32(4);
         let expected_canopy = BlockHeight::from_u32(5);
         let expected_nu5 = BlockHeight::from_u32(6);
-        #[cfg(feature = "unstable-nu6")]
+        #[cfg(zcash_unstable = "nu6")]
         let expected_nu6 = BlockHeight::from_u32(7);
-        #[cfg(feature = "zfuture")]
+        #[cfg(zcash_unstable = "zfuture")]
         let expected_z_future = BlockHeight::from_u32(7);
 
         let regtest = LocalNetwork {
@@ -245,9 +188,9 @@ mod tests {
             heartwood: Some(expected_heartwood),
             canopy: Some(expected_canopy),
             nu5: Some(expected_nu5),
-            #[cfg(feature = "unstable-nu6")]
+            #[cfg(zcash_unstable = "nu6")]
             nu6: Some(expected_nu6),
-            #[cfg(feature = "zfuture")]
+            #[cfg(zcash_unstable = "zfuture")]
             z_future: Some(expected_z_future),
         };
 

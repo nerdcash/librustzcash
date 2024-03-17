@@ -18,8 +18,11 @@ use sapling::{
 };
 use zcash_client_backend::{data_api::SAPLING_SHARD_HEIGHT, keys::UnifiedFullViewingKey};
 use zcash_primitives::{
-    consensus::{self, sapling_zip212_enforcement, BlockHeight, BranchId},
-    transaction::{components::amount::NonNegativeAmount, Transaction},
+    consensus::{self, BlockHeight, BranchId},
+    transaction::{
+        components::{amount::NonNegativeAmount, sapling::zip212_enforcement},
+        Transaction,
+    },
     zip32::Scope,
 };
 
@@ -165,21 +168,29 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                     // be mined under ZIP 212 enforcement rules, so we default to `On`
                     Zip212Enforcement::On
                 },
-                |h| sapling_zip212_enforcement(&self.params, h),
+                |h| zip212_enforcement(&self.params, h),
             );
 
             let ufvk_str: String = row.get(5)?;
-            let ufvk = UnifiedFullViewingKey::decode(&self.params, &ufvk_str)
-                .expect("Stored UFVKs must be valid");
-            let dfvk = ufvk
-                .sapling()
-                .expect("UFVK must have a Sapling component to have received Sapling notes");
+            let ufvk = UnifiedFullViewingKey::decode(&self.params, &ufvk_str).map_err(|e| {
+                WalletMigrationError::CorruptedData(format!("Stored UFVK was invalid: {:?}", e))
+            })?;
+
+            let dfvk = ufvk.sapling().ok_or_else(|| {
+                WalletMigrationError::CorruptedData(
+                    "UFVK must have a Sapling component to have received Sapling notes.".to_owned(),
+                )
+            })?;
 
             // We previously set the default to external scope, so we now verify whether the output
             // is decryptable using the intenally-scoped IVK and, if so, mark it as such.
             if let Some(tx_data) = tx_data_opt {
-                let tx = Transaction::read(&tx_data[..], BranchId::Canopy)
-                    .expect("Transaction must be valid");
+                let tx = Transaction::read(&tx_data[..], BranchId::Canopy).map_err(|e| {
+                    WalletMigrationError::CorruptedData(format!(
+                        "Unable to parse raw transaction: {:?}",
+                        e
+                    ))
+                })?;
                 let output = tx
                     .sapling_bundle()
                     .and_then(|b| b.shielded_outputs().get(output_index))
@@ -241,7 +252,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                     &mut commitment_tree,
                     dfvk,
                     &diversifier,
-                    &note_value.try_into().unwrap(),
+                    &sapling::value::NoteValue::from_raw(note_value.into_u64()),
                     &rseed,
                     note_commitment_tree_position,
                 )?;
@@ -260,8 +271,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
     }
 
     fn down(&self, _transaction: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
-        // TODO: something better than just panic?
-        panic!("Cannot revert this migration.");
+        Err(WalletMigrationError::CannotRevert(MIGRATION_ID))
     }
 }
 
@@ -279,14 +289,11 @@ mod tests {
     use rusqlite::{named_params, params, Connection};
     use tempfile::NamedTempFile;
     use zcash_client_backend::{
-        data_api::{
-            BlockMetadata, DecryptedTransaction, WalletCommitmentTrees, SAPLING_SHARD_HEIGHT,
-        },
+        data_api::{BlockMetadata, WalletCommitmentTrees, SAPLING_SHARD_HEIGHT},
         decrypt_transaction,
         proto::compact_formats::{CompactBlock, CompactTx},
         scanning::{scan_block, Nullifiers, ScanningKeys},
-        wallet::Recipient,
-        PoolType, ShieldedProtocol, TransferType,
+        TransferType,
     };
     use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
     use zcash_primitives::{
@@ -299,7 +306,7 @@ mod tests {
             components::{amount::NonNegativeAmount, transparent},
             fees::fixed,
         },
-        zip32::{AccountId, Scope},
+        zip32::{self, Scope},
     };
     use zcash_proofs::prover::LocalTxProver;
 
@@ -313,7 +320,7 @@ mod tests {
             memo_repr, parse_scope,
             sapling::ReceivedSaplingOutput,
         },
-        WalletDb,
+        AccountId, WalletDb,
     };
 
     // These must be different.
@@ -324,8 +331,9 @@ mod tests {
         db_data: &mut WalletDb<Connection, P>,
     ) -> (UnifiedFullViewingKey, BlockHeight, BuildResult) {
         // Create an account in the wallet
-        let usk0 = UnifiedSpendingKey::from_seed(&db_data.params, &[0u8; 32][..], AccountId::ZERO)
-            .unwrap();
+        let usk0 =
+            UnifiedSpendingKey::from_seed(&db_data.params, &[0u8; 32][..], zip32::AccountId::ZERO)
+                .unwrap();
         let ufvk0 = usk0.to_unified_full_viewing_key();
         let height = db_data
             .params
@@ -443,7 +451,7 @@ mod tests {
         let sql_args = named_params![
             ":tx": &tx_ref,
             ":output_index": i64::try_from(output.index()).expect("output indices are representable as i64"),
-            ":account": u32::from(account),
+            ":account": account.0,
             ":diversifier": &diversifier.0.as_ref(),
             ":value": output.note().value().inner(),
             ":rcm": &rcm.as_ref(),
@@ -480,37 +488,30 @@ mod tests {
 
         let (ufvk0, height, res) = prepare_wallet_state(&mut db_data);
         let tx = res.transaction();
+        let account_id = AccountId(0);
 
         // We can't use `decrypt_and_store_transaction` because we haven't migrated yet.
         // Replicate its relevant innards here.
-        let d_tx = DecryptedTransaction {
+        let d_tx = decrypt_transaction(
+            &params,
+            height,
             tx,
-            sapling_outputs: &decrypt_transaction(
-                &params,
-                height,
-                tx,
-                &[(AccountId::ZERO, ufvk0)].into_iter().collect(),
-            ),
-        };
+            &[(account_id, ufvk0)].into_iter().collect(),
+        );
+
         db_data
             .transactionally::<_, _, rusqlite::Error>(|wdb| {
-                let tx_ref = crate::wallet::put_tx_data(wdb.conn.0, d_tx.tx, None, None).unwrap();
+                let tx_ref = crate::wallet::put_tx_data(wdb.conn.0, d_tx.tx(), None, None).unwrap();
 
                 let mut spending_account_id: Option<AccountId> = None;
-                for output in d_tx.sapling_outputs {
-                    match output.transfer_type {
-                        TransferType::Outgoing | TransferType::WalletInternal => {
-                            let recipient = if output.transfer_type == TransferType::Outgoing {
-                                Recipient::Sapling(output.note.recipient())
-                            } else {
-                                Recipient::InternalAccount(
-                                    output.account,
-                                    PoolType::Shielded(ShieldedProtocol::Sapling),
-                                )
-                            };
 
+                // Orchard outputs were not supported as of the wallet states that could require this
+                // migration.
+                for output in d_tx.sapling_outputs() {
+                    match output.transfer_type() {
+                        TransferType::Outgoing | TransferType::WalletInternal => {
                             // Don't need to bother with sent outputs for this test.
-                            if matches!(recipient, Recipient::InternalAccount(_, _)) {
+                            if output.transfer_type() != TransferType::Outgoing {
                                 put_received_note_before_migration(
                                     wdb.conn.0, output, tx_ref, None,
                                 )
@@ -519,11 +520,12 @@ mod tests {
                         }
                         TransferType::Incoming => {
                             match spending_account_id {
-                                Some(id) => assert_eq!(id, output.account),
+                                Some(id) => assert_eq!(id, *output.account()),
                                 None => {
-                                    spending_account_id = Some(output.account);
+                                    spending_account_id = Some(*output.account());
                                 }
                             }
+
                             put_received_note_before_migration(wdb.conn.0, output, tx_ref, None)
                                 .unwrap();
                         }
@@ -551,7 +553,7 @@ mod tests {
             row_count += 1;
             let value: u64 = row.get(0).unwrap();
             let scope = parse_scope(row.get(1).unwrap());
-            match dbg!(value) {
+            match value {
                 EXTERNAL_VALUE => assert_eq!(scope, Some(Scope::External)),
                 INTERNAL_VALUE => assert_eq!(scope, Some(Scope::Internal)),
                 _ => {
@@ -600,7 +602,7 @@ mod tests {
             ..Default::default()
         };
         block.vtx.push(compact_tx);
-        let scanning_keys = ScanningKeys::from_account_ufvks([(AccountId::ZERO, ufvk0)]);
+        let scanning_keys = ScanningKeys::from_account_ufvks([(AccountId(0), ufvk0)]);
 
         let scanned_block = scan_block(
             &params,
@@ -650,6 +652,10 @@ mod tests {
                         block.block_time(),
                         block.sapling().final_tree_size(),
                         block.sapling().commitments().len().try_into().unwrap(),
+                        #[cfg(feature = "orchard")]
+                        block.orchard().final_tree_size(),
+                        #[cfg(feature = "orchard")]
+                        block.orchard().commitments().len().try_into().unwrap(),
                     )?;
 
                     for tx in block.transactions() {
@@ -724,7 +730,7 @@ mod tests {
             row_count += 1;
             let value: u64 = row.get(0).unwrap();
             let scope = parse_scope(row.get(1).unwrap());
-            match dbg!(value) {
+            match value {
                 EXTERNAL_VALUE => assert_eq!(scope, Some(Scope::External)),
                 INTERNAL_VALUE => assert_eq!(scope, Some(Scope::Internal)),
                 _ => {

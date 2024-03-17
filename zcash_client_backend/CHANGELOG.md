@@ -13,18 +13,28 @@ and this library adheres to Rust's notion of
   changes related to `Orchard` below are introduced under this feature
   flag.
 - `zcash_client_backend::data_api`:
+  - `Account`
   - `AccountBalance::with_orchard_balance_mut`
+  - `AccountBirthday::orchard_frontier`
+  - `AccountKind`
   - `BlockMetadata::orchard_tree_size`
+  - `DecryptedTransaction::{new, tx(), orchard_outputs()}`
+  - `NoteRetention`
   - `ScannedBlock::orchard`
   - `ScannedBlockCommitments::orchard`
+  - `SentTransaction::new`
+  - `SpendableNotes`
   - `ORCHARD_SHARD_HEIGHT`
   - `BlockMetadata::orchard_tree_size`
+  - `WalletSummary::next_orchard_subtree_index`
+  - `chain::ChainState`
   - `chain::ScanSummary::{spent_orchard_note_count, received_orchard_note_count}`
 - `zcash_client_backend::fees`:
   - `orchard`
   - `ChangeValue::orchard`
 - `zcash_client_backend::proto`:
   - `service::TreeState::orchard_tree`
+  - `service::TreeState::to_chain_state`
   - `impl TryFrom<&CompactOrchardAction> for CompactAction`
   - `CompactOrchardAction::{cmx, nf, ephemeral_key}`
 - `zcash_client_backend::scanning`:
@@ -38,23 +48,80 @@ and this library adheres to Rust's notion of
   - `WalletOrchardSpend`
   - `WalletOrchardOutput`
   - `WalletTx::{orchard_spends, orchard_outputs}`
+  - `ReceivedNote::map_note`
+  - `ReceivedNote<_, sapling::Note>::note_value`
+  - `ReceivedNote<_, orchard::note::Note>::note_value`
 - `WalletWrite::insert_address_with_diversifier_index`
 - `WalletWrite::put_latest_scanned_block_for_transparent`
 - `WalletRead::get_transparent_addresses_and_sync_heights`
 
 ### Changed
 - `zcash_client_backend::data_api`:
+  - Arguments to `AccountBirthday::from_parts` have changed.
   - Arguments to `BlockMetadata::from_parts` have changed.
   - Arguments to `ScannedBlock::from_parts` have changed.
   - Changes to the `WalletRead` trait:
-    - Added `get_orchard_nullifiers`
+    - Added `Account` associated type.
+    - Added `get_account` method.
+    - Added `get_derived_account` method.
+    - `get_account_for_ufvk` now returns `Self::Account` instead of a bare
+      `AccountId`.
+    - Added `get_orchard_nullifiers` method.
+    - `get_transaction` now returns `Result<Option<Transaction>, _>` rather
+      than returning an `Err` if the `txid` parameter does not correspond to
+      a transaction in the database.
+  - Changes to the `InputSource` trait:
+    - `select_spendable_notes` now takes its `target_value` argument as a
+      `NonNegativeAmount`. Also, it now returns a `SpendableNotes` data 
+      structure instead of a vector.
+  - Fields of `DecryptedTransaction` are now private. Use `DecryptedTransaction::new`
+    and the newly provided accessors instead.
+  - Fields of `SentTransaction` are now private. Use `SentTransaction::new`
+    and the newly provided accessors instead.
   - `ShieldedProtocol` has a new `Orchard` variant.
   - `WalletCommitmentTrees`
     - `type OrchardShardStore`
     - `fn with_orchard_tree_mut`
     - `fn put_orchard_subtree_roots`
+  - Added method `WalletRead::validate_seed`
+  - Removed `Error::AccountNotFound` variant.
+  - `WalletSummary::new` now takes an additional `next_orchard_subtree_index`
+    argument when the `orchard` feature flag is enabled.
+- `zcash_client_backend::decrypt`:
+  - Fields of `DecryptedOutput` are now private. Use `DecryptedOutput::new`
+    and the newly provided accessors instead.
+  - `decrypt_transaction` now returns a `DecryptedTransaction<AccountId>`
+    instead of a `DecryptedOutput<sapling::Note>` and will decrypt Orchard
+    outputs when the `orchard` feature is enabled. In addition, the type
+    constraint on its `<AccountId>` parameter has been strengthened to `Copy`.
 - `zcash_client_backend::fees`:
   - Arguments to `ChangeStrategy::compute_balance` have changed.
+  - `ChangeError::DustInputs` now has an `orchard` field behind the `orchard`
+    feature flag.
+- `zcash_client_backend::proto`:
+  - `ProposalDecodingError` has a new variant `TransparentMemo`.
+- `zcash_client_backend::zip321::render::amount_str` now takes a
+  `NonNegativeAmount` rather than a signed `Amount` as its argument.
+- `zcash_client_backend::zip321::parse::parse_amount` now parses a
+  `NonNegativeAmount` rather than a signed `Amount`.
+- `zcash_client_backend::zip321::TransactionRequest::total` now
+  returns `Result<_, BalanceError>` instead of `Result<_, ()>`.
+
+### Removed
+- `zcash_client_backend::PoolType::is_receiver`: use
+  `zcash_keys::Address::has_receiver` instead.
+- `zcash_client_backend::wallet::ReceivedNote::traverse_opt` removed as
+  unnecessary.
+
+### Fixed
+- This release fixes an error in amount parsing in `zip321` that previously
+  allowed amounts having a decimal point but no decimal value to be parsed
+  as valid.
+
+## [0.11.1] - 2024-03-09
+
+### Fixed
+- Documentation now correctly builds with all feature flags.
 
 ## [0.11.0] - 2024-03-01
 

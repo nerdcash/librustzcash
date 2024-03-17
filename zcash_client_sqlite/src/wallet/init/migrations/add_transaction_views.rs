@@ -266,8 +266,7 @@ impl RusqliteMigration for Migration {
     }
 
     fn down(&self, _transaction: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
-        // TODO: something better than just panic?
-        panic!("Cannot revert this migration.");
+        Err(WalletMigrationError::CannotRevert(MIGRATION_ID))
     }
 }
 
@@ -441,11 +440,13 @@ mod tests {
 
         let usk = UnifiedSpendingKey::from_seed(&network, &[0u8; 32][..], AccountId::ZERO).unwrap();
         let ufvk = usk.to_unified_full_viewing_key();
-        let (ua, _) = ufvk.default_address(UnifiedAddressRequest::unsafe_new(
-            false,
-            true,
-            UA_TRANSPARENT,
-        ));
+        let (ua, _) = ufvk
+            .default_address(UnifiedAddressRequest::unsafe_new(
+                false,
+                true,
+                UA_TRANSPARENT,
+            ))
+            .expect("A valid default address exists for the UFVK");
         let taddr = ufvk
             .transparent()
             .and_then(|k| {
