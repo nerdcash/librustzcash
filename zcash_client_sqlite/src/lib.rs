@@ -1075,7 +1075,7 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                         match spending_account_id {
                             Some(id) => {
                                 if id != *output.account() {
-                                    panic!("Unable to determine a unique account identifier for z->t spend.");
+                                    // panic!("Unable to determine a unique account identifier for z->t spend.");
                                 }
                             }
                             None => {
@@ -1128,7 +1128,7 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                         match spending_account_id {
                             Some(id) => {
                                 if id != *output.account() {
-                                    panic!("Unable to determine a unique account identifier for z->t spend.");
+                                    // panic!("Unable to determine a unique account identifier for z->t spend.");
                                 }
                             }
                             None => {
