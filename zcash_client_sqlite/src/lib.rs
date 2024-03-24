@@ -121,13 +121,18 @@ pub(crate) const SAPLING_TABLES_PREFIX: &str = "sapling";
 #[cfg(feature = "orchard")]
 pub(crate) const ORCHARD_TABLES_PREFIX: &str = "orchard";
 
+#[cfg(not(feature = "orchard"))]
+pub(crate) const UA_ORCHARD: bool = false;
+#[cfg(feature = "orchard")]
+pub(crate) const UA_ORCHARD: bool = true;
+
 #[cfg(not(feature = "transparent-inputs"))]
 pub(crate) const UA_TRANSPARENT: bool = false;
 #[cfg(feature = "transparent-inputs")]
 pub(crate) const UA_TRANSPARENT: bool = true;
 
 pub(crate) const DEFAULT_UA_REQUEST: UnifiedAddressRequest =
-    UnifiedAddressRequest::unsafe_new(false, true, UA_TRANSPARENT);
+    UnifiedAddressRequest::unsafe_new(UA_ORCHARD, true, UA_TRANSPARENT);
 
 /// The ID type for accounts.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
@@ -558,7 +563,7 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
     fn create_account(
         &mut self,
         seed: &SecretVec<u8>,
-        birthday: AccountBirthday,
+        birthday: &AccountBirthday,
     ) -> Result<(AccountId, UnifiedSpendingKey), Self::Error> {
         self.transactionally(|wdb| {
             let seed_fingerprint =
@@ -692,7 +697,7 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
         })
     }
 
-    #[tracing::instrument(skip_all, fields(height = blocks.first().map(|b| u32::from(b.height()))))]
+    #[tracing::instrument(skip_all, fields(height = blocks.first().map(|b| u32::from(b.height())), count = blocks.len()))]
     #[allow(clippy::type_complexity)]
     fn put_blocks(
         &mut self,
@@ -918,7 +923,7 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                 >(
                     // An iterator of checkpoints heights for which we wish to ensure that
                     // checkpoints exists.
-                    checkpoint_heights: I,
+                    ensure_heights: I,
                     // The map of checkpoint positions from which we will draw note commitment tree
                     // position information for the newly created checkpoints.
                     existing_checkpoint_positions: &BTreeMap<BlockHeight, Position>,
@@ -926,15 +931,15 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                     // there is no preceding checkpoint in existing_checkpoint_positions.
                     state_final_tree: &Frontier<H, DEPTH>,
                 ) -> Vec<(BlockHeight, Checkpoint)> {
-                    checkpoint_heights
-                        .flat_map(|from_checkpoint_height| {
+                    ensure_heights
+                        .flat_map(|ensure_height| {
                             existing_checkpoint_positions
-                                .range::<BlockHeight, _>(..=*from_checkpoint_height)
+                                .range::<BlockHeight, _>(..=*ensure_height)
                                 .last()
                                 .map_or_else(
                                     || {
                                         Some((
-                                            *from_checkpoint_height,
+                                            *ensure_height,
                                             state_final_tree
                                                 .value()
                                                 .map_or_else(Checkpoint::tree_empty, |t| {
@@ -942,10 +947,10 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                                                 }),
                                         ))
                                     },
-                                    |(to_prev_height, position)| {
-                                        if *to_prev_height < *from_checkpoint_height {
+                                    |(existing_checkpoint_height, position)| {
+                                        if *existing_checkpoint_height < *ensure_height {
                                             Some((
-                                                *from_checkpoint_height,
+                                                *ensure_height,
                                                 Checkpoint::at_position(*position),
                                             ))
                                         } else {
@@ -961,16 +966,17 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                 }
 
                 #[cfg(feature = "orchard")]
-                let missing_sapling_checkpoints = ensure_checkpoints(
-                    orchard_checkpoint_positions.keys(),
-                    &sapling_checkpoint_positions,
-                    from_state.final_sapling_tree(),
-                );
-                #[cfg(feature = "orchard")]
-                let missing_orchard_checkpoints = ensure_checkpoints(
-                    sapling_checkpoint_positions.keys(),
-                    &orchard_checkpoint_positions,
-                    from_state.final_orchard_tree(),
+                let (missing_sapling_checkpoints, missing_orchard_checkpoints) = (
+                    ensure_checkpoints(
+                        orchard_checkpoint_positions.keys(),
+                        &sapling_checkpoint_positions,
+                        from_state.final_sapling_tree(),
+                    ),
+                    ensure_checkpoints(
+                        sapling_checkpoint_positions.keys(),
+                        &orchard_checkpoint_positions,
+                        from_state.final_orchard_tree(),
+                    ),
                 );
 
                 // Update the Sapling note commitment tree with all newly read note commitments
@@ -989,13 +995,27 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                             sapling_tree.insert_tree(tree, checkpoints)?;
                         }
 
-                        // Ensure we have a Sapling checkpoint for each checkpointed Orchard block height
+                        // Ensure we have a Sapling checkpoint for each checkpointed Orchard block height.
+                        // We skip all checkpoints below the minimum retained checkpoint in the
+                        // Sapling tree, because branches below this height may be pruned.
                         #[cfg(feature = "orchard")]
-                        for (height, checkpoint) in &missing_sapling_checkpoints {
-                            sapling_tree
-                                .store_mut()
-                                .add_checkpoint(*height, checkpoint.clone())
-                                .map_err(ShardTreeError::Storage)?;
+                        {
+                            let min_checkpoint_height = sapling_tree
+                                .store()
+                                .min_checkpoint_id()
+                                .map_err(ShardTreeError::Storage)?
+                                .expect(
+                                    "At least one checkpoint was inserted (by insert_frontier)",
+                                );
+
+                            for (height, checkpoint) in &missing_sapling_checkpoints {
+                                if *height > min_checkpoint_height {
+                                    sapling_tree
+                                        .store_mut()
+                                        .add_checkpoint(*height, checkpoint.clone())
+                                        .map_err(ShardTreeError::Storage)?;
+                                }
+                            }
                         }
 
                         Ok(())
@@ -1019,13 +1039,27 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                             orchard_tree.insert_tree(tree, checkpoints)?;
                         }
 
-                        for (height, checkpoint) in &missing_orchard_checkpoints {
-                            orchard_tree
-                                .store_mut()
-                                .add_checkpoint(*height, checkpoint.clone())
-                                .map_err(ShardTreeError::Storage)?;
-                        }
+                        // Ensure we have an Orchard checkpoint for each checkpointed Sapling block height.
+                        // We skip all checkpoints below the minimum retained checkpoint in the
+                        // Orchard tree, because branches below this height may be pruned.
+                        {
+                            let min_checkpoint_height = orchard_tree
+                                .store()
+                                .min_checkpoint_id()
+                                .map_err(ShardTreeError::Storage)?
+                                .expect(
+                                    "At least one checkpoint was inserted (by insert_frontier)",
+                                );
 
+                            for (height, checkpoint) in &missing_orchard_checkpoints {
+                                if *height > min_checkpoint_height {
+                                    orchard_tree
+                                        .store_mut()
+                                        .add_checkpoint(*height, checkpoint.clone())
+                                        .map_err(ShardTreeError::Storage)?;
+                                }
+                            }
+                        }
                         Ok(())
                     })?;
                 }
@@ -1823,7 +1857,8 @@ extern crate assert_matches;
 #[cfg(test)]
 mod tests {
     use secrecy::SecretVec;
-    use zcash_client_backend::data_api::{AccountBirthday, WalletRead, WalletWrite};
+    use zcash_client_backend::data_api::{WalletRead, WalletWrite};
+    use zcash_primitives::block::BlockHash;
 
     use crate::{testing::TestBuilder, AccountId, DEFAULT_UA_REQUEST};
 
@@ -1836,29 +1871,28 @@ mod tests {
     #[test]
     fn validate_seed() {
         let st = TestBuilder::new()
-            .with_test_account(AccountBirthday::from_sapling_activation)
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
             .build();
+        let account = st.test_account().unwrap();
 
         assert!({
-            let account = st.test_account().unwrap().0;
             st.wallet()
-                .validate_seed(account, st.test_seed().unwrap())
+                .validate_seed(account.account_id(), st.test_seed().unwrap())
                 .unwrap()
         });
 
         // check that passing an invalid account results in a failure
         assert!({
-            let account = AccountId(3);
+            let wrong_account_index = AccountId(3);
             !st.wallet()
-                .validate_seed(account, st.test_seed().unwrap())
+                .validate_seed(wrong_account_index, st.test_seed().unwrap())
                 .unwrap()
         });
 
         // check that passing an invalid seed results in a failure
         assert!({
-            let account = st.test_account().unwrap().0;
             !st.wallet()
-                .validate_seed(account, &SecretVec::new(vec![1u8; 32]))
+                .validate_seed(account.account_id(), &SecretVec::new(vec![1u8; 32]))
                 .unwrap()
         });
     }
@@ -1866,22 +1900,28 @@ mod tests {
     #[test]
     pub(crate) fn get_next_available_address() {
         let mut st = TestBuilder::new()
-            .with_test_account(AccountBirthday::from_sapling_activation)
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
             .build();
-        let account = st.test_account().unwrap();
+        let account = st.test_account().cloned().unwrap();
 
-        let current_addr = st.wallet().get_current_address(account.0).unwrap();
+        let current_addr = st
+            .wallet()
+            .get_current_address(account.account_id())
+            .unwrap();
         assert!(current_addr.is_some());
 
         // TODO: Add Orchard
         let addr2 = st
             .wallet_mut()
-            .get_next_available_address(account.0, DEFAULT_UA_REQUEST)
+            .get_next_available_address(account.account_id(), DEFAULT_UA_REQUEST)
             .unwrap();
         assert!(addr2.is_some());
         assert_ne!(current_addr, addr2);
 
-        let addr2_cur = st.wallet().get_current_address(account.0).unwrap();
+        let addr2_cur = st
+            .wallet()
+            .get_current_address(account.account_id())
+            .unwrap();
         assert_eq!(addr2, addr2_cur);
     }
 
@@ -1891,15 +1931,16 @@ mod tests {
         // Add an account to the wallet.
         let st = TestBuilder::new()
             .with_block_cache()
-            .with_test_account(AccountBirthday::from_sapling_activation)
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
             .build();
         let account = st.test_account().unwrap();
+        let ufvk = account.usk().to_unified_full_viewing_key();
+        let (taddr, _) = account.usk().default_transparent_address();
 
-        let (_, usk, _) = st.test_account().unwrap();
-        let ufvk = usk.to_unified_full_viewing_key();
-        let (taddr, _) = usk.default_transparent_address();
-
-        let receivers = st.wallet().get_transparent_receivers(account.0).unwrap();
+        let receivers = st
+            .wallet()
+            .get_transparent_receivers(account.account_id())
+            .unwrap();
 
         // The receiver for the default UA should be in the set.
         assert!(receivers.contains_key(
@@ -1927,8 +1968,8 @@ mod tests {
 
         // Generate some fake CompactBlocks.
         let seed = [0u8; 32];
-        let account = zip32::AccountId::ZERO;
-        let extsk = sapling::spending_key(&seed, st.wallet().params.coin_type(), account);
+        let hd_account_index = zip32::AccountId::ZERO;
+        let extsk = sapling::spending_key(&seed, st.wallet().params.coin_type(), hd_account_index);
         let dfvk = extsk.to_diversifiable_full_viewing_key();
         let (h1, meta1, _) = st.generate_next_block(
             &dfvk,

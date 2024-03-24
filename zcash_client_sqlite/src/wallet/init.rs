@@ -329,7 +329,7 @@ mod tests {
         address::Address,
         data_api::scanning::ScanPriority,
         encoding::{encode_extended_full_viewing_key, encode_payment_address},
-        keys::{sapling, UnifiedFullViewingKey, UnifiedSpendingKey},
+        keys::{sapling, UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
     };
 
     use ::sapling::zip32::ExtendedFullViewingKey;
@@ -341,14 +341,13 @@ mod tests {
         zip32::AccountId,
     };
 
-    use crate::{
-        testing::TestBuilder, wallet::scanning::priority_code, WalletDb, DEFAULT_UA_REQUEST,
-    };
+    use crate::{testing::TestBuilder, wallet::scanning::priority_code, WalletDb, UA_TRANSPARENT};
 
-    use super::{init_wallet_db, WalletMigrationError};
+    use super::init_wallet_db;
 
     #[cfg(feature = "transparent-inputs")]
     use {
+        super::WalletMigrationError,
         crate::wallet::{self, pool_code, PoolType},
         zcash_address::test_vectors,
         zcash_client_backend::data_api::WalletWrite,
@@ -1362,8 +1361,12 @@ mod tests {
             )?;
 
             let ufvk_str = ufvk.encode(&wdb.params);
+
+            // Unified addresses at the time of the addition of migrations did not contain an
+            // Orchard component.
+            let ua_request = UnifiedAddressRequest::unsafe_new(false, true, UA_TRANSPARENT);
             let address_str = Address::Unified(
-                ufvk.default_address(DEFAULT_UA_REQUEST)
+                ufvk.default_address(ua_request)
                     .expect("A valid default address exists for the UFVK")
                     .0,
             )
@@ -1383,7 +1386,7 @@ mod tests {
             {
                 let taddr = Address::Transparent(
                     *ufvk
-                        .default_address(DEFAULT_UA_REQUEST)
+                        .default_address(ua_request)
                         .expect("A valid default address exists for the UFVK")
                         .0
                         .transparent()
@@ -1430,6 +1433,7 @@ mod tests {
     #[cfg(feature = "transparent-inputs")]
     fn account_produces_expected_ua_sequence() {
         use zcash_client_backend::data_api::{AccountBirthday, AccountSource, WalletRead};
+        use zcash_primitives::block::BlockHash;
 
         let network = Network::MainNetwork;
         let data_file = NamedTempFile::new().unwrap();
@@ -1448,9 +1452,9 @@ mod tests {
             Ok(())
         );
 
-        let birthday = AccountBirthday::from_sapling_activation(&network);
+        let birthday = AccountBirthday::from_sapling_activation(&network, BlockHash([0; 32]));
         let (account_id, _usk) = db_data
-            .create_account(&Secret::new(seed.to_vec()), birthday)
+            .create_account(&Secret::new(seed.to_vec()), &birthday)
             .unwrap();
         assert_matches!(
             db_data.get_account(account_id),
@@ -1483,10 +1487,13 @@ mod tests {
                 assert_eq!(DiversifierIndex::from(tv.diversifier_index), di);
                 assert_eq!(tvua.transparent(), ua.transparent());
                 assert_eq!(tvua.sapling(), ua.sapling());
+                #[cfg(not(feature = "orchard"))]
                 assert_eq!(tv.unified_addr, ua.encode(&Network::MainNetwork));
 
+                // hardcoded with knowledge of what's coming next
+                let ua_request = UnifiedAddressRequest::unsafe_new(false, true, true);
                 db_data
-                    .get_next_available_address(account_id, DEFAULT_UA_REQUEST)
+                    .get_next_available_address(account_id, ua_request)
                     .unwrap()
                     .expect("get_next_available_address generated an address");
             } else {

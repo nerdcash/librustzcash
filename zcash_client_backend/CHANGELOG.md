@@ -53,6 +53,7 @@ and this library adheres to Rust's notion of
   - `ReceivedNote::map_note`
   - `ReceivedNote<_, sapling::Note>::note_value`
   - `ReceivedNote<_, orchard::note::Note>::note_value`
+- `zcash_client_backend::zip321::Payment::without_memo`
 - `WalletWrite::insert_address_with_diversifier_index`
 - `WalletWrite::put_latest_scanned_block_for_transparent`
 - `WalletRead::get_transparent_addresses_and_sync_heights`
@@ -74,6 +75,8 @@ and this library adheres to Rust's notion of
     - `get_transaction` now returns `Result<Option<Transaction>, _>` rather
       than returning an `Err` if the `txid` parameter does not correspond to
       a transaction in the database.
+  - `WalletWrite::create_account` now takes its `AccountBirthday` argument by 
+    reference.
   - Changes to the `InputSource` trait:
     - `select_spendable_notes` now takes its `target_value` argument as a
       `NonNegativeAmount`. Also, it now returns a `SpendableNotes` data 
