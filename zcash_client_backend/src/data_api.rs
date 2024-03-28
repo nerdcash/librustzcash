@@ -128,11 +128,14 @@ pub enum NullifierQuery {
     All,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "transparent-inputs")]
 pub struct TransparentAddressSyncInfo<AccountId> {
     pub account_id: AccountId,
     pub index: u32,
     pub address: TransparentAddress,
     pub height: Option<BlockHeight>,
+    pub used: bool,
 }
 
 /// Balance information for a value within a single pool in an account.
@@ -923,6 +926,7 @@ pub trait WalletRead {
     ///
     /// Use [`WalletWrite::put_latest_scanned_block_for_transparent`] during sync
     /// to record updates to the block heights per address.
+    #[cfg(feature = "transparent-inputs")]
     fn get_transparent_addresses_and_sync_heights(
         &mut self,
     ) -> Result<Vec<TransparentAddressSyncInfo<Self::AccountId>>, Self::Error>;
@@ -1511,9 +1515,9 @@ pub trait WalletWrite: WalletRead {
     /// simply gets the next diversified address sequentially. Mixing use of the two functions
     /// is not recommended because `get_next_available_address` will return the next address
     /// after the highest diversifier index in the database, which may leave gaps in the sequence.
-    fn insert_address_with_diversifier_index(
+    fn put_address_with_diversifier_index(
         &mut self,
-        account: Self::AccountId,
+        account: &Self::AccountId,
         diversifier_index: DiversifierIndex,
     ) -> Result<UnifiedAddress, Self::Error>;
 
@@ -1575,6 +1579,7 @@ pub trait WalletWrite: WalletRead {
     fn truncate_to_height(&mut self, block_height: BlockHeight) -> Result<(), Self::Error>;
 
     /// Records the last block that was scanned for transparent transactions.
+    #[cfg(feature = "transparent-inputs")]
     fn put_latest_scanned_block_for_transparent(
         &mut self,
         address: &TransparentAddress,
@@ -1680,12 +1685,15 @@ pub mod testing {
         chain::{ChainState, CommitmentTreeRoot},
         scanning::ScanRange,
         AccountBirthday, BlockMetadata, DecryptedTransaction, InputSource, NullifierQuery,
-        ScannedBlock, SeedRelevance, SentTransaction, SpendableNotes, TransparentAddressSyncInfo,
-        WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite, SAPLING_SHARD_HEIGHT,
+        ScannedBlock, SeedRelevance, SentTransaction, SpendableNotes, WalletCommitmentTrees,
+        WalletRead, WalletSummary, WalletWrite, SAPLING_SHARD_HEIGHT,
     };
 
     #[cfg(feature = "transparent-inputs")]
-    use {crate::wallet::TransparentAddressMetadata, zcash_primitives::legacy::TransparentAddress};
+    use {
+        super::TransparentAddressSyncInfo, crate::wallet::TransparentAddressMetadata,
+        zcash_primitives::legacy::TransparentAddress,
+    };
 
     #[cfg(feature = "orchard")]
     use super::ORCHARD_SHARD_HEIGHT;
@@ -1909,6 +1917,7 @@ pub mod testing {
             Ok(HashMap::new())
         }
 
+        #[cfg(feature = "transparent-inputs")]
         fn get_transparent_addresses_and_sync_heights(
             &mut self,
         ) -> Result<Vec<TransparentAddressSyncInfo<Self::AccountId>>, Self::Error> {
@@ -1938,9 +1947,9 @@ pub mod testing {
             Ok(None)
         }
 
-        fn insert_address_with_diversifier_index(
+        fn put_address_with_diversifier_index(
             &mut self,
-            _account: Self::AccountId,
+            _account: &Self::AccountId,
             _diversifier_index: DiversifierIndex,
         ) -> Result<UnifiedAddress, Self::Error> {
             todo!()
@@ -1985,6 +1994,7 @@ pub mod testing {
             Ok(0)
         }
 
+        #[cfg(feature = "transparent-inputs")]
         fn put_latest_scanned_block_for_transparent(
             &mut self,
             _address: &TransparentAddress,

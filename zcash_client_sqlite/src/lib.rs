@@ -56,8 +56,7 @@ use zcash_client_backend::{
         scanning::{ScanPriority, ScanRange},
         Account, AccountBirthday, AccountSource, BlockMetadata, DecryptedTransaction, InputSource,
         NullifierQuery, ScannedBlock, SeedRelevance, SentTransaction, SpendableNotes,
-        TransparentAddressSyncInfo, WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite,
-        SAPLING_SHARD_HEIGHT,
+        WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite, SAPLING_SHARD_HEIGHT,
     },
     keys::{
         AddressGenerationError, UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey,
@@ -88,6 +87,7 @@ use {
 
 #[cfg(feature = "transparent-inputs")]
 use {
+    zcash_client_backend::data_api::TransparentAddressSyncInfo,
     zcash_client_backend::wallet::TransparentAddressMetadata,
     zcash_primitives::{legacy::TransparentAddress, transaction::components::OutPoint},
 };
@@ -543,6 +543,7 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters> WalletRead for W
         wallet::get_transparent_balances(self.conn.borrow(), &self.params, account, max_height)
     }
 
+    #[cfg(feature = "transparent-inputs")]
     fn get_transparent_addresses_and_sync_heights(
         &mut self,
     ) -> Result<Vec<TransparentAddressSyncInfo<AccountId>>, Self::Error> {
@@ -642,15 +643,15 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
         Ok(())
     }
 
-    fn insert_address_with_diversifier_index(
+    fn put_address_with_diversifier_index(
         &mut self,
-        account_id: AccountId,
+        account_id: &AccountId,
         diversifier_index: DiversifierIndex,
     ) -> Result<UnifiedAddress, SqliteClientError> {
         self.transactionally(|wdb| {
             let keys = wdb.get_unified_full_viewing_keys()?;
             let ufvk = keys
-                .get(&account_id)
+                .get(account_id)
                 .ok_or(SqliteClientError::AccountUnknown)?;
 
             let has_orchard = true;
@@ -669,6 +670,7 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                         has_sapling = false;
                         None
                     }
+                    #[cfg(feature = "transparent-inputs")]
                     Err(AddressGenerationError::InvalidTransparentChildIndex(_)) => {
                         has_transparent = false;
                         None
@@ -679,10 +681,10 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                 }
             };
 
-            return match wallet::insert_address(
+            match wallet::insert_address(
                 wdb.conn.0,
                 &wdb.params,
-                account_id,
+                *account_id,
                 diversifier_index,
                 &addr,
             ) {
@@ -695,7 +697,7 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                     _,
                 )) => Ok(addr), // conflicts are ignorable
                 Err(e) => Err(e.into()),
-            };
+            }
         })
     }
 
@@ -1454,6 +1456,7 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
         })
     }
 
+    #[cfg(feature = "transparent-inputs")]
     fn put_latest_scanned_block_for_transparent(
         &mut self,
         _address: &TransparentAddress,

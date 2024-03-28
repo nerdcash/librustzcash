@@ -2250,7 +2250,12 @@ pub(crate) fn get_transparent_addresses_and_sync_heights<P: consensus::Parameter
     params: &P,
 ) -> Result<Vec<TransparentAddressSyncInfo<AccountId>>, SqliteClientError> {
     let mut stmt = conn.prepare(
-        "SELECT cached_transparent_receiver_address, diversifier_index_be, last_downloaded_transparent_block, account_id
+        "SELECT
+            cached_transparent_receiver_address,
+            diversifier_index_be,
+            last_downloaded_transparent_block,
+            account_id,
+            (SELECT COUNT(*) FROM utxos WHERE utxos.address = addresses.cached_transparent_receiver_address) > 0 AS used
          FROM addresses
          WHERE cached_transparent_receiver_address IS NOT NULL",
     )?;
@@ -2258,10 +2263,10 @@ pub(crate) fn get_transparent_addresses_and_sync_heights<P: consensus::Parameter
     let mut res = Vec::new();
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
-        let taddr_str: String = row.get(0)?;
+        let taddr_str: String = row.get("cached_transparent_receiver_address")?;
         let address = TransparentAddress::decode(params, &taddr_str)?;
 
-        let di_vec: Vec<u8> = row.get(1)?;
+        let di_vec: Vec<u8> = row.get("diversifier_index_be")?;
         let mut di_bytes: [u8; 11] = di_vec.try_into().map_err(|_| {
             SqliteClientError::CorruptedData("Diversifier index is not an 11-byte value".to_owned())
         })?;
@@ -2273,14 +2278,16 @@ pub(crate) fn get_transparent_addresses_and_sync_heights<P: consensus::Parameter
             )
         })?;
 
-        let height: Option<u32> = row.get(2)?;
-        let account_id: u32 = row.get(3)?;
+        let height: Option<u32> = row.get("last_downloaded_transparent_block")?;
+        let account_id: u32 = row.get("account_id")?;
+        let used: bool = row.get("used")?;
 
         res.push(TransparentAddressSyncInfo {
             address,
             index,
             height: height.map(|h| BlockHeight::from(h)),
             account_id: AccountId(account_id),
+            used,
         });
     }
 
