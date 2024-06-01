@@ -65,7 +65,7 @@ use zcash_client_backend::{
     wallet::{Note, NoteId, ReceivedNote, Recipient, WalletTransparentOutput},
     DecryptedOutput, PoolType, ShieldedProtocol, TransferType,
 };
-use zcash_keys::address::Address;
+use zcash_keys::address::Receiver;
 use zcash_primitives::{
     block::BlockHash,
     consensus::{self, BlockHeight},
@@ -1150,11 +1150,22 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
             for output in d_tx.sapling_outputs() {
                 match output.transfer_type() {
                     TransferType::Outgoing => {
-                        //TODO: Recover the UA, if possible.
-                        let recipient = Recipient::Sapling(output.note().recipient());
+                        let recipient = {
+                            let receiver = Receiver::Sapling(output.note().recipient());
+                            let wallet_address = wallet::select_receiving_address(
+                                &wdb.params,
+                                wdb.conn.0,
+                                *output.account(),
+                                &receiver
+                            )?.unwrap_or_else(||
+                                receiver.to_zcash_address(wdb.params.network_type())
+                            );
+
+                            Recipient::External(wallet_address, PoolType::Shielded(ShieldedProtocol::Sapling))
+                        };
+
                         wallet::put_sent_output(
                             wdb.conn.0,
-                            &wdb.params,
                             *output.account(),
                             tx_ref,
                             output.index(),
@@ -1174,7 +1185,6 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
 
                         wallet::put_sent_output(
                             wdb.conn.0,
-                            &wdb.params,
                             *output.account(),
                             tx_ref,
                             output.index(),
@@ -1189,14 +1199,22 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                         if let Some(account_id) = funding_account {
                             let recipient = Recipient::InternalAccount {
                                 receiving_account: *output.account(),
-                                // TODO: recover the actual UA, if possible
-                                external_address: Some(Address::Sapling(output.note().recipient())),
+                                external_address: {
+                                    let receiver = Receiver::Sapling(output.note().recipient());
+                                    Some(wallet::select_receiving_address(
+                                        &wdb.params,
+                                        wdb.conn.0,
+                                        *output.account(),
+                                        &receiver
+                                    )?.unwrap_or_else(||
+                                        receiver.to_zcash_address(wdb.params.network_type())
+                                    ))
+                                },
                                 note: Note::Sapling(output.note().clone()),
                             };
 
                             wallet::put_sent_output(
                                 wdb.conn.0,
-                                &wdb.params,
                                 account_id,
                                 tx_ref,
                                 output.index(),
@@ -1213,20 +1231,22 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
             for output in d_tx.orchard_outputs() {
                 match output.transfer_type() {
                     TransferType::Outgoing => {
-                        // TODO: Recover the actual UA, if possible.
-                        let recipient = Recipient::Unified(
-                            UnifiedAddress::from_receivers(
-                                Some(output.note().recipient()),
-                                None,
-                                None,
-                            )
-                            .expect("UA has an Orchard receiver by construction."),
-                            PoolType::Shielded(ShieldedProtocol::Orchard),
-                        );
+                        let recipient = {
+                            let receiver = Receiver::Orchard(output.note().recipient());
+                            let wallet_address = wallet::select_receiving_address(
+                                &wdb.params,
+                                wdb.conn.0,
+                                *output.account(),
+                                &receiver
+                            )?.unwrap_or_else(||
+                                receiver.to_zcash_address(wdb.params.network_type())
+                            );
+
+                            Recipient::External(wallet_address, PoolType::Shielded(ShieldedProtocol::Orchard))
+                        };
 
                         wallet::put_sent_output(
                             wdb.conn.0,
-                            &wdb.params,
                             *output.account(),
                             tx_ref,
                             output.index(),
@@ -1246,7 +1266,6 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
 
                         wallet::put_sent_output(
                             wdb.conn.0,
-                            &wdb.params,
                             *output.account(),
                             tx_ref,
                             output.index(),
@@ -1262,19 +1281,22 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                             // Even if the recipient address is external, record the send as internal.
                             let recipient = Recipient::InternalAccount {
                                 receiving_account: *output.account(),
-                                // TODO: recover the actual UA, if possible
-                                external_address: Some(Address::Unified(
-                                    UnifiedAddress::from_receivers(
-                                    Some(output.note().recipient()),
-                                    None,
-                                    None,
-                                ).expect("UA has an Orchard receiver by construction."))),
+                                external_address: {
+                                    let receiver = Receiver::Orchard(output.note().recipient());
+                                    Some(wallet::select_receiving_address(
+                                        &wdb.params,
+                                        wdb.conn.0,
+                                        *output.account(),
+                                        &receiver
+                                    )?.unwrap_or_else(||
+                                        receiver.to_zcash_address(wdb.params.network_type())
+                                    ))
+                                },
                                 note: Note::Orchard(*output.note()),
                             };
 
                             wallet::put_sent_output(
                                 wdb.conn.0,
-                                &wdb.params,
                                 account_id,
                                 tx_ref,
                                 output.index(),
@@ -1327,13 +1349,29 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
                         .enumerate()
                     {
                         if let Some(address) = txout.recipient_address() {
+                            let receiver = Receiver::Transparent(address);
+
+                            #[cfg(feature = "transparent-inputs")]
+                            let recipient_addr = wallet::select_receiving_address(
+                                &wdb.params,
+                                wdb.conn.0,
+                                account_id,
+                                &receiver
+                            )?.unwrap_or_else(||
+                                receiver.to_zcash_address(wdb.params.network_type())
+                            );
+
+                            #[cfg(not(feature = "transparent-inputs"))]
+                            let recipient_addr = receiver.to_zcash_address(wdb.params.network_type());
+
+                            let recipient = Recipient::External(recipient_addr, PoolType::Transparent);
+
                             wallet::put_sent_output(
                                 wdb.conn.0,
-                                &wdb.params,
                                 account_id,
                                 tx_ref,
                                 output_index,
-                                &Recipient::Transparent(address),
+                                &recipient,
                                 txout.value,
                                 None,
                             )?;
@@ -1392,13 +1430,7 @@ impl<P: consensus::Parameters> WalletWrite for WalletDb<rusqlite::Connection, P>
             }
 
             for output in sent_tx.outputs() {
-                wallet::insert_sent_output(
-                    wdb.conn.0,
-                    &wdb.params,
-                    tx_ref,
-                    *sent_tx.account_id(),
-                    output,
-                )?;
+                wallet::insert_sent_output(wdb.conn.0, tx_ref, *sent_tx.account_id(), output)?;
 
                 match output.recipient() {
                     Recipient::InternalAccount {
@@ -1987,7 +2019,6 @@ mod tests {
             .unwrap();
         assert!(current_addr.is_some());
 
-        // TODO: Add Orchard
         let addr2 = st
             .wallet_mut()
             .get_next_available_address(account.account_id(), DEFAULT_UA_REQUEST)

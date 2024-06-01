@@ -6,6 +6,8 @@ and this library adheres to Rust's notion of
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- MSRV is now 1.66.0.
 
 ## [0.10.3] - 2024-04-08
 
@@ -80,6 +82,8 @@ This version was yanked, use 0.10.1 instead.
 - `zcash_client_sqlite::error::SqliteClientError` has new error variants:
   - `SqliteClientError::UnsupportedPoolType`
   - `SqliteClientError::BalanceError`
+  - The `Bech32DecodeError` variant has been replaced with a more general
+    `DecodingError` type.
 
 ## [0.8.1] - 2023-10-18
 
