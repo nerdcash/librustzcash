@@ -7,6 +7,13 @@ and this library adheres to Rust's notion of
 
 ## [Unreleased]
 
+### Added
+- `zcash_client_backend::data_api`:
+  - `chain::BlockCache` trait, behind the `sync` feature flag.
+- `zcash_client_backend::scanning`:
+  - `testing` module
+- `zcash_client_backend::sync` module, behind the `sync` feature flag.
+
 ## [0.12.1] - 2024-03-27
 
 ### Fixed

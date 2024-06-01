@@ -65,7 +65,7 @@
 //! - `memo` the shielded memo associated with the output, if any.
 
 use incrementalmerkletree::Retention;
-use rusqlite::{self, named_params, params, OptionalExtension};
+use rusqlite::{self, named_params, OptionalExtension};
 use secrecy::{ExposeSecret, SecretVec};
 use shardtree::{error::ShardTreeError, store::ShardStore, ShardTree};
 use zip32::fingerprint::SeedFingerprint;
@@ -1594,7 +1594,7 @@ pub(crate) fn account_birthday(
     conn.query_row(
         "SELECT birthday_height
          FROM accounts
-         WHERE account = :account_id",
+         WHERE id = :account_id",
         named_params![":account_id": account.0],
         |row| row.get::<_, u32>(0).map(BlockHeight::from),
     )
@@ -1626,10 +1626,10 @@ pub(crate) fn get_account<P: Parameters>(
         SELECT account_kind, hd_seed_fingerprint, hd_account_index, ufvk, uivk
         FROM accounts
         WHERE id = :account_id
-    "#,
+        "#,
     )?;
 
-    let mut result = sql.query(params![account_id.0])?;
+    let mut result = sql.query(named_params![":account_id": account_id.0])?;
     let row = result.next()?;
     match row {
         Some(row) => {
@@ -2080,17 +2080,17 @@ pub(crate) fn truncate_to_height<P: consensus::Parameters>(
 
 #[cfg(feature = "transparent-inputs")]
 fn to_unspent_transparent_output(row: &Row) -> Result<WalletTransparentOutput, SqliteClientError> {
-    let txid: Vec<u8> = row.get(0)?;
+    let txid: Vec<u8> = row.get("prevout_txid")?;
     let mut txid_bytes = [0u8; 32];
     txid_bytes.copy_from_slice(&txid);
 
-    let index: u32 = row.get(1)?;
-    let script_pubkey = Script(row.get(2)?);
-    let raw_value: i64 = row.get(3)?;
+    let index: u32 = row.get("prevout_idx")?;
+    let script_pubkey = Script(row.get("script")?);
+    let raw_value: i64 = row.get("value_zat")?;
     let value = NonNegativeAmount::from_nonnegative_i64(raw_value).map_err(|_| {
         SqliteClientError::CorruptedData(format!("Invalid UTXO value: {}", raw_value))
     })?;
-    let height: u32 = row.get(4)?;
+    let height: u32 = row.get("height")?;
 
     let outpoint = OutPoint::new(txid_bytes, index);
     WalletTransparentOutput::from_parts(
@@ -2870,6 +2870,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use sapling::zip32::ExtendedSpendingKey;
+    use secrecy::{ExposeSecret, SecretVec};
     use zcash_client_backend::data_api::{AccountSource, WalletRead};
     use zcash_primitives::{block::BlockHash, transaction::components::amount::NonNegativeAmount};
 
@@ -2877,6 +2878,8 @@ mod tests {
         testing::{AddressType, BlockCache, TestBuilder, TestState},
         AccountId,
     };
+
+    use super::account_birthday;
 
     #[cfg(feature = "transparent-inputs")]
     use {
@@ -3043,6 +3046,25 @@ mod tests {
             account_parameters.kind,
             AccountSource::Derived{account_index, ..} if account_index == expected_account_index
         );
+    }
+
+    #[test]
+    fn get_account_ids() {
+        use crate::testing::TestBuilder;
+        use zcash_client_backend::data_api::WalletWrite;
+
+        let mut st = TestBuilder::new()
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        let seed = SecretVec::new(st.test_seed().unwrap().expose_secret().clone());
+        let birthday = st.test_account().unwrap().birthday().clone();
+
+        st.wallet_mut().create_account(&seed, &birthday).unwrap();
+
+        for acct_id in st.wallet().get_account_ids().unwrap() {
+            assert_matches!(st.wallet().get_account(acct_id), Ok(Some(_)))
+        }
     }
 
     #[test]
@@ -3254,5 +3276,19 @@ mod tests {
         // The fully-scanned height should now be the latest block, as the two disjoint
         // ranges have been connected.
         assert_eq!(block_fully_scanned(&st), Some(end_height));
+    }
+
+    #[test]
+    fn test_account_birthday() {
+        let st = TestBuilder::new()
+            .with_block_cache()
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        let account_id = st.test_account().unwrap().account_id();
+        assert_matches!(
+            account_birthday(&st.wallet().conn, account_id),
+            Ok(birthday) if birthday == st.sapling_activation_height()
+        )
     }
 }
