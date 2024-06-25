@@ -134,7 +134,9 @@ pub struct TransparentAddressSyncInfo<AccountId> {
     pub account_id: AccountId,
     pub index: u32,
     pub address: TransparentAddress,
-    pub height: Option<BlockHeight>,
+    /// The height of the first block at which to scan for new transactions involving this address.
+    /// This will default to the wallet birthday, but may be updated after a sync has taken place to record a higher block height.
+    pub height: BlockHeight,
     pub used: bool,
 }
 

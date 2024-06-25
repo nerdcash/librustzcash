@@ -2291,10 +2291,11 @@ pub(crate) fn get_transparent_addresses_and_sync_heights<P: consensus::Parameter
         "SELECT
             cached_transparent_receiver_address,
             diversifier_index_be,
-            last_downloaded_transparent_block,
+            COALESCE(last_downloaded_transparent_block, accounts.birthday_height) as last_downloaded_transparent_block,
             account_id,
             (SELECT COUNT(*) FROM utxos WHERE utxos.address = addresses.cached_transparent_receiver_address) > 0 AS used
          FROM addresses
+         INNER JOIN accounts ON accounts.id = addresses.account_id
          WHERE cached_transparent_receiver_address IS NOT NULL",
     )?;
 
@@ -2316,14 +2317,14 @@ pub(crate) fn get_transparent_addresses_and_sync_heights<P: consensus::Parameter
             )
         })?;
 
-        let height: Option<u32> = row.get("last_downloaded_transparent_block")?;
+        let height: u32 = row.get("last_downloaded_transparent_block")?;
         let account_id: u32 = row.get("account_id")?;
         let used: bool = row.get("used")?;
 
         res.push(TransparentAddressSyncInfo {
             address,
             index,
-            height: height.map(|h| BlockHeight::from(h)),
+            height: BlockHeight::from(height),
             account_id: AccountId(account_id),
             used,
         });
