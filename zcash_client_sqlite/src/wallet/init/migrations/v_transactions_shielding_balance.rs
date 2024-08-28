@@ -12,6 +12,8 @@ use super::v_tx_outputs_use_legacy_false;
 
 pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xb8fe5112_4365_473c_8b42_2b07c0f0adaf);
 
+const DEPENDENCIES: &[Uuid] = &[v_tx_outputs_use_legacy_false::MIGRATION_ID];
+
 pub(super) struct Migration;
 
 impl schemer::Migration for Migration {
@@ -20,9 +22,7 @@ impl schemer::Migration for Migration {
     }
 
     fn dependencies(&self) -> HashSet<Uuid> {
-        [v_tx_outputs_use_legacy_false::MIGRATION_ID]
-            .into_iter()
-            .collect()
+        DEPENDENCIES.iter().copied().collect()
     }
 
     fn description(&self) -> &'static str {
@@ -151,5 +151,15 @@ impl RusqliteMigration for Migration {
 
     fn down(&self, _transaction: &rusqlite::Transaction) -> Result<(), Self::Error> {
         Err(WalletMigrationError::CannotRevert(MIGRATION_ID))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::wallet::init::migrations::tests::test_migrate;
+
+    #[test]
+    fn migrate() {
+        test_migrate(&[super::MIGRATION_ID]);
     }
 }

@@ -7,9 +7,7 @@ use schemer_rusqlite::RusqliteMigration;
 use secrecy::{ExposeSecret, SecretVec};
 use uuid::Uuid;
 
-use zcash_client_backend::{
-    address::Address, keys::UnifiedSpendingKey, PoolType, ShieldedProtocol,
-};
+use zcash_client_backend::{address::Address, keys::UnifiedSpendingKey, PoolType};
 use zcash_keys::keys::UnifiedAddressRequest;
 use zcash_primitives::{consensus, zip32::AccountId};
 
@@ -29,6 +27,8 @@ use crate::{
 
 pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xbe57ef3b_388e_42ea_97e2_678dafcf9754);
 
+const DEPENDENCIES: &[Uuid] = &[initial_setup::MIGRATION_ID];
+
 pub(super) struct Migration<P> {
     pub(super) params: P,
     pub(super) seed: Option<Rc<SecretVec<u8>>>,
@@ -40,7 +40,7 @@ impl<P> schemer::Migration for Migration<P> {
     }
 
     fn dependencies(&self) -> HashSet<Uuid> {
-        [initial_setup::MIGRATION_ID].into_iter().collect()
+        DEPENDENCIES.iter().copied().collect()
     }
 
     fn description(&self) -> &'static str {
@@ -131,7 +131,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                             });
                         }
                     }
-                    Address::Transparent(_) => {
+                    Address::Transparent(_) | Address::Tex(_) => {
                         return Err(WalletMigrationError::CorruptedData(
                             "Address field value decoded to a transparent address; should have been Sapling or unified.".to_string()));
                     }
@@ -262,10 +262,10 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                     ))
                 })?;
                 let output_pool = match decoded_address {
-                    Address::Sapling(_) => {
-                        Ok(pool_code(PoolType::Shielded(ShieldedProtocol::Sapling)))
+                    Address::Sapling(_) => Ok(pool_code(PoolType::SAPLING)),
+                    Address::Transparent(_) | Address::Tex(_) => {
+                        Ok(pool_code(PoolType::TRANSPARENT))
                     }
-                    Address::Transparent(_) => Ok(pool_code(PoolType::Transparent)),
                     Address::Unified(_) => Err(WalletMigrationError::CorruptedData(
                         "Unified addresses should not yet appear in the sent_notes table."
                             .to_string(),
@@ -295,5 +295,15 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
 
     fn down(&self, _transaction: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
         Err(WalletMigrationError::CannotRevert(MIGRATION_ID))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::wallet::init::migrations::tests::test_migrate;
+
+    #[test]
+    fn migrate() {
+        test_migrate(&[super::MIGRATION_ID]);
     }
 }
