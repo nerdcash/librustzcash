@@ -7,7 +7,7 @@ use schemer_rusqlite::RusqliteMigration;
 use uuid::Uuid;
 use zcash_protocol::consensus;
 
-use crate::{error::SqliteClientError, wallet::init::WalletMigrationError};
+use crate::wallet::init::WalletMigrationError;
 
 #[cfg(feature = "transparent-inputs")]
 use crate::wallet::{self, init, transparent::ephemeral};
@@ -68,11 +68,8 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
         // stored in each account.
         #[cfg(feature = "transparent-inputs")]
         for account_id in wallet::get_account_ids(transaction)? {
-            match ephemeral::init_account(transaction, &self.params, account_id) {
-                Ok(_) => continue,
-                Err(SqliteClientError::UnknownZip32Derivation) => continue,
-                Err(err) => return Err(init::sqlite_client_error_to_wallet_migration_error(err)),
-            }
+            ephemeral::init_account(transaction, &self.params, account_id)
+                .map_err(init::sqlite_client_error_to_wallet_migration_error)?;
         }
         Ok(())
     }
