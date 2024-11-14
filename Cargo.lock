@@ -68,6 +68,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c6cb57a04249c6480766f7f7cef5467412af1490f8d1e243141daddada3264f"
 
 [[package]]
+name = "ambassador"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b27ba24e4d8a188489d5a03c7fabc167a60809a383cdb4d15feb37479cd2a48"
+dependencies = [
+ "itertools 0.10.5",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "amplify"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -425,12 +437,6 @@ name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
-
-[[package]]
-name = "base64"
-version = "0.21.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
 
 [[package]]
 name = "base64"
@@ -2103,14 +2109,24 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "incrementalmerkletree"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75346da3bd8e3d8891d02508245ed2df34447ca6637e343829f8d08986e9cde2"
+checksum = "d45063fbc4b0a37837f6bfe0445f269d13d730ad0aa3b5a7f74aa7bf27a0f4df"
 dependencies = [
  "either",
  "proptest",
  "rand 0.8.5",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "incrementalmerkletree-testing"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc7fb094e413bc6daea7b30a6f2c749e47fd07e98691c6ef3b3423d4ef4b7fb6"
+dependencies = [
+ "incrementalmerkletree",
+ "proptest",
 ]
 
 [[package]]
@@ -2625,9 +2641,9 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orchard"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dc7bde644aeb980be296cd908c6650894dc8541deb56f9f5294c52ed7ca568f"
+checksum = "4f18e997fa121de5c73e95cdc7e8512ae43b7de38904aeea5e5713cc48f3c0ba"
 dependencies = [
  "aes",
  "bitvec",
@@ -3554,7 +3570,7 @@ version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29993a25686778eb88d4189742cd713c9bce943bc54251a33509dc63cbacf73d"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "rustls-pki-types",
 ]
 
@@ -3643,9 +3659,9 @@ dependencies = [
 
 [[package]]
 name = "sapling-crypto"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15e379398fffad84e49f9a45a05635fc004f66086e65942dbf4eb95332c26d2a"
+checksum = "cfff8cfce16aeb38da50b8e2ed33c9018f30552beff2210c266662a021b17f38"
 dependencies = [
  "aes",
  "bellman",
@@ -3825,7 +3841,7 @@ version = "3.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ad483d2ab0149d5a5ebcd9972a3852711e0153d863bf5a5d0391d28883c4a20"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "chrono",
  "hex",
  "indexmap 1.9.3",
@@ -3905,14 +3921,15 @@ dependencies = [
 
 [[package]]
 name = "shardtree"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78222845cd8bbe5eb95687407648ff17693a35de5e8abaa39a4681fb21e033f9"
+checksum = "b5f2390975ebfe8838f9e861f7a588123d49a7a7a0a08568ea831d8ad53fc9b4"
 dependencies = [
  "assert_matches",
  "bitflags 2.6.0",
  "either",
  "incrementalmerkletree",
+ "incrementalmerkletree-testing",
  "proptest",
  "tracing",
 ]
@@ -4421,7 +4438,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64",
  "bytes",
  "flate2",
  "h2",
@@ -5802,7 +5819,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_address"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "assert_matches",
  "bech32",
@@ -5815,12 +5832,13 @@ dependencies = [
 
 [[package]]
 name = "zcash_client_backend"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
+ "ambassador",
  "arti-client",
  "assert_matches",
  "async-trait",
- "base64 0.21.7",
+ "base64",
  "bech32",
  "bip32",
  "bls12_381",
@@ -5841,10 +5859,12 @@ dependencies = [
  "nom",
  "nonempty",
  "orchard",
+ "pasta_curves",
  "percent-encoding",
  "proptest",
  "prost",
  "rand 0.8.5",
+ "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "rayon",
  "rust_decimal",
@@ -5877,8 +5897,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_client_sqlite"
-version = "0.11.2"
+version = "0.12.2"
 dependencies = [
+ "ambassador",
  "assert_matches",
  "bip32",
  "bls12_381",
@@ -5887,6 +5908,7 @@ dependencies = [
  "document-features",
  "group",
  "incrementalmerkletree",
+ "incrementalmerkletree-testing",
  "jubjub",
  "libsqlite3-sys",
  "maybe-rayon",
@@ -5958,7 +5980,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_keys"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bech32",
  "bip32",
@@ -6001,7 +6023,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_primitives"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "aes",
  "assert_matches",
@@ -6045,7 +6067,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_proofs"
-version = "0.17.0"
+version = "0.19.0"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -6069,10 +6091,11 @@ dependencies = [
 
 [[package]]
 name = "zcash_protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "document-features",
  "incrementalmerkletree",
+ "incrementalmerkletree-testing",
  "memuse",
  "proptest",
 ]
@@ -6139,9 +6162,9 @@ dependencies = [
 
 [[package]]
 name = "zip321"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "base64 0.21.7",
+ "base64",
  "nom",
  "percent-encoding",
  "proptest",

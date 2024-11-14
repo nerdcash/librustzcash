@@ -322,10 +322,12 @@ where
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
-    use crate::{testing, wallet::sapling::tests::SaplingPoolTester};
+    use zcash_client_backend::data_api::testing::sapling::SaplingPoolTester;
+
+    use crate::testing;
 
     #[cfg(feature = "orchard")]
-    use crate::wallet::orchard::tests::OrchardPoolTester;
+    use zcash_client_backend::data_api::testing::orchard::OrchardPoolTester;
 
     #[test]
     fn valid_chain_states_sapling() {
@@ -360,6 +362,17 @@ mod tests {
     #[cfg(feature = "orchard")]
     fn data_db_truncation_orchard() {
         testing::pool::data_db_truncation::<OrchardPoolTester>()
+    }
+
+    #[test]
+    fn reorg_to_checkpoint_sapling() {
+        testing::pool::reorg_to_checkpoint::<SaplingPoolTester>()
+    }
+
+    #[test]
+    #[cfg(feature = "orchard")]
+    fn reorg_to_checkpoint_orchard() {
+        testing::pool::reorg_to_checkpoint::<OrchardPoolTester>()
     }
 
     #[test]

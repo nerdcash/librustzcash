@@ -15,10 +15,10 @@
 
 use static_assertions::const_assert_eq;
 
-use zcash_client_backend::data_api::scanning::ScanPriority;
+use zcash_client_backend::data_api::{scanning::ScanPriority, GAP_LIMIT};
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
-use crate::wallet::{scanning::priority_code, GAP_LIMIT};
+use crate::wallet::scanning::priority_code;
 
 /// Stores information about the accounts that the wallet is tracking.
 pub(super) const TABLE_ACCOUNTS: &str = r#"
@@ -85,7 +85,7 @@ CREATE INDEX "addresses_accounts" ON "addresses" (
 /// (`TransparentKeyScope::EPHEMERAL`) at the "change" level of the BIP 32 address hierarchy.
 /// The ephemeral addresses stored in the table are exactly the "reserved" ephemeral addresses
 /// (that is addresses that have been allocated for use in a ZIP 320 transaction proposal), plus
-/// the addresses at the next `GAP_LIMIT` indices.
+/// the addresses at the next [`GAP_LIMIT`] indices.
 ///
 /// Addresses are never removed. New ones should only be reserved via the
 /// `WalletWrite::reserve_next_n_ephemeral_addresses` API. All of the addresses in the table
@@ -103,12 +103,12 @@ CREATE INDEX "addresses_accounts" ON "addresses" (
 ///
 /// It is an external invariant that within each account:
 /// - the address indices are contiguous and start from 0;
-/// - the last `GAP_LIMIT` addresses have `used_in_tx` and `seen_in_tx` both NULL.
+/// - the last [`GAP_LIMIT`] addresses have `used_in_tx` and `seen_in_tx` both NULL.
 ///
-/// All but the last `GAP_LIMIT` addresses are defined to be "reserved" addresses. Since the next
+/// All but the last [`GAP_LIMIT`] addresses are defined to be "reserved" addresses. Since the next
 /// index to reserve is determined by dead reckoning from the last stored address, we use dummy
 /// entries having `NULL` for the value of the `address` column after the maximum valid index in
-/// order to allow the last `GAP_LIMIT` addresses at the end of the index range to be used.
+/// order to allow the last [`GAP_LIMIT`] addresses at the end of the index range to be used.
 ///
 /// Note that the fact that `used_in_tx` references a specific transaction is just a debugging aid.
 /// The same is mostly true of `seen_in_tx`, but we also take into account whether the referenced
@@ -393,6 +393,26 @@ CREATE TABLE transparent_spend_map (
 /// this table, distinguished by the `output_pool` column. The information we want to
 /// record for sent outputs is the same across all pools, whereas for received outputs we
 /// want to cache pool-specific data.
+///
+/// ### Columns
+/// - `(tx, output_pool, output_index)` collectively identify a transaction output.
+/// - `from_account_id`: the ID of the account that created the transaction.
+///   - On recover-from-seed or when scanning by UFVK, this will be either the account
+///     that decrypted the output, or one of the accounts that funded the transaction.
+/// - `to_address`: the address of the external recipient of this output, or `NULL` if the
+///   output was received by the wallet.
+/// - `to_account_id`: the ID of the account that received this output, or `NULL` if the
+///   output was for an external recipient.
+/// - `value`: the value of the output in zatoshis.
+/// - `memo`: the memo bytes associated with this output, if known.
+///   - This is always `NULL` for transparent outputs.
+///   - This will be set for all shielded outputs of transactions created by the wallet.
+///   - On recover-from-seed or when scanning by UFVK, this will only be set for shielded
+///     outputs after post-scanning transaction enhancement. For shielded notes sent to
+///     external recipients, the transaction needs to have been created with an
+///     [`OvkPolicy`] using a known OVK.
+///
+/// [`OvkPolicy`]: zcash_client_backend::wallet::OvkPolicy
 pub(super) const TABLE_SENT_NOTES: &str = r#"
 CREATE TABLE "sent_notes" (
     id INTEGER PRIMARY KEY,
