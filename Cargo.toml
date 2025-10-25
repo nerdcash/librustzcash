@@ -19,7 +19,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.79"
 repository = "https://github.com/zcash/librustzcash"
 license = "MIT OR Apache-2.0"
 categories = ["cryptography::cryptocurrencies"]
@@ -158,6 +158,3 @@ zip32 = "0.1.1"
 lto = true
 panic = 'abort'
 codegen-units = 1
-
-[workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("zfuture"))'] }
