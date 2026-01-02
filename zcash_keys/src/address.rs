@@ -1,10 +1,13 @@
 //! Structs for handling supported address types.
 
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+use transparent::address::TransparentAddress;
 use zcash_address::{
+    ConversionError, ToAddress, TryFromAddress, ZcashAddress,
     unified::{self, Container, Encoding, Typecode},
-    ConversionError, ToAddress, TryFromRawAddress, ZcashAddress,
 };
-use zcash_primitives::legacy::TransparentAddress;
 use zcash_protocol::consensus::{self, NetworkType};
 
 #[cfg(feature = "sapling")]
@@ -173,7 +176,8 @@ impl UnifiedAddress {
         &self.unknown
     }
 
-    fn to_address(&self, net: NetworkType) -> ZcashAddress {
+    /// Serializes this [`UnifiedAddress`] as a [`ZcashAddress`] for the given network.
+    pub fn to_zcash_address(&self, net: NetworkType) -> ZcashAddress {
         let items = self
             .unknown
             .iter()
@@ -210,12 +214,12 @@ impl UnifiedAddress {
 
     /// Returns the string encoding of this `UnifiedAddress` for the given network.
     pub fn encode<P: consensus::Parameters>(&self, params: &P) -> String {
-        self.to_address(params.network_type()).to_string()
+        self.to_zcash_address(params.network_type()).to_string()
     }
 
     /// Returns the set of receiver typecodes.
     pub fn receiver_types(&self) -> Vec<Typecode> {
-        let result = std::iter::empty();
+        let result = core::iter::empty();
         #[cfg(feature = "orchard")]
         let result = result.chain(self.orchard.map(|_| Typecode::Orchard));
         #[cfg(feature = "sapling")]
@@ -229,6 +233,17 @@ impl UnifiedAddress {
                 .iter()
                 .map(|(typecode, _)| Typecode::Unknown(*typecode)),
         );
+        result.collect()
+    }
+
+    /// Returns the set of receivers in the unified address, excluding unknown receiver types.
+    pub fn as_understood_receivers(&self) -> Vec<Receiver> {
+        let result = core::iter::empty();
+        #[cfg(feature = "orchard")]
+        let result = result.chain(self.orchard.map(Receiver::Orchard));
+        #[cfg(feature = "sapling")]
+        let result = result.chain(self.sapling.map(Receiver::Sapling));
+        let result = result.chain(self.transparent.map(Receiver::Transparent));
         result.collect()
     }
 }
@@ -330,16 +345,20 @@ impl From<UnifiedAddress> for Address {
     }
 }
 
-impl TryFromRawAddress for Address {
+impl TryFromAddress for Address {
     type Error = &'static str;
 
     #[cfg(feature = "sapling")]
-    fn try_from_raw_sapling(data: [u8; 43]) -> Result<Self, ConversionError<Self::Error>> {
+    fn try_from_sapling(
+        _net: NetworkType,
+        data: [u8; 43],
+    ) -> Result<Self, ConversionError<Self::Error>> {
         let pa = PaymentAddress::from_bytes(&data).ok_or("Invalid Sapling payment address")?;
         Ok(pa.into())
     }
 
-    fn try_from_raw_unified(
+    fn try_from_unified(
+        _net: NetworkType,
         ua: zcash_address::unified::Address,
     ) -> Result<Self, ConversionError<Self::Error>> {
         UnifiedAddress::try_from(ua)
@@ -347,17 +366,24 @@ impl TryFromRawAddress for Address {
             .map(Address::from)
     }
 
-    fn try_from_raw_transparent_p2pkh(
+    fn try_from_transparent_p2pkh(
+        _net: NetworkType,
         data: [u8; 20],
     ) -> Result<Self, ConversionError<Self::Error>> {
         Ok(TransparentAddress::PublicKeyHash(data).into())
     }
 
-    fn try_from_raw_transparent_p2sh(data: [u8; 20]) -> Result<Self, ConversionError<Self::Error>> {
+    fn try_from_transparent_p2sh(
+        _net: NetworkType,
+        data: [u8; 20],
+    ) -> Result<Self, ConversionError<Self::Error>> {
         Ok(TransparentAddress::ScriptHash(data).into())
     }
 
-    fn try_from_raw_tex(data: [u8; 20]) -> Result<Self, ConversionError<Self::Error>> {
+    fn try_from_tex(
+        _net: NetworkType,
+        data: [u8; 20],
+    ) -> Result<Self, ConversionError<Self::Error>> {
         Ok(Address::Tex(data))
     }
 }
@@ -366,7 +392,8 @@ impl Address {
     /// Attempts to decode an [`Address`] value from its [`ZcashAddress`] encoded representation.
     ///
     /// Returns `None` if any error is encountered in decoding. Use
-    /// [`Self::try_from_zcash_address(s.parse()?)?`] if you need detailed error information.
+    /// [`Self::try_from_zcash_address`] passing in `s.parse()?` if you need detailed
+    /// error information.
     pub fn decode<P: consensus::Parameters>(params: &P, s: &str) -> Option<Self> {
         Self::try_from_zcash_address(params, s.parse::<ZcashAddress>().ok()?).ok()
     }
@@ -394,7 +421,7 @@ impl Address {
                     ZcashAddress::from_transparent_p2sh(net, *data)
                 }
             },
-            Address::Unified(ua) => ua.to_address(net),
+            Address::Unified(ua) => ua.to_zcash_address(net),
             Address::Tex(data) => ZcashAddress::from_tex(net, *data),
         }
     }
@@ -421,6 +448,53 @@ impl Address {
             },
         }
     }
+
+    /// Returns the transparent address corresponding to this address, if it is a transparent
+    /// address, a Unified address with a transparent receiver, or ZIP 320 (TEX) address.
+    pub fn to_transparent_address(&self) -> Option<TransparentAddress> {
+        match self {
+            #[cfg(feature = "sapling")]
+            Address::Sapling(_) => None,
+            Address::Transparent(addr) => Some(*addr),
+            Address::Unified(ua) => ua.transparent().copied(),
+            Address::Tex(addr_bytes) => Some(TransparentAddress::PublicKeyHash(*addr_bytes)),
+        }
+    }
+
+    /// Returns the Sapling address corresponding to this address, if it is a ZIP 32-encoded
+    /// Sapling address, or a Unified address with a Sapling receiver.
+    #[cfg(feature = "sapling")]
+    pub fn to_sapling_address(&self) -> Option<PaymentAddress> {
+        match self {
+            Address::Sapling(addr) => Some(*addr),
+            Address::Transparent(_) => None,
+            Address::Unified(ua) => ua.sapling().copied(),
+            Address::Tex(_) => None,
+        }
+    }
+
+    /// Returns the protocol-typed unified [`Receiver`]s of this address as a vector, ignoring the
+    /// original encoding of the address.
+    ///
+    /// In the case that the underlying address is the [`Address::Unified`] variant, this is
+    /// equivalent to [`UnifiedAddress::as_understood_receivers`] in that it does not return
+    /// unknown receiver data.
+    ///
+    /// Note that this method eliminates the distinction between transparent addresses and the
+    /// transparent receiving address for a TEX address; as such, it should only be used in cases
+    /// where address uses are being detected in inspection of chain data, and NOT in any situation
+    /// where a transaction sending to this address is being constructed.
+    pub fn as_understood_unified_receivers(&self) -> Vec<Receiver> {
+        match self {
+            #[cfg(feature = "sapling")]
+            Address::Sapling(addr) => vec![Receiver::Sapling(*addr)],
+            Address::Transparent(addr) => vec![Receiver::Transparent(*addr)],
+            Address::Unified(ua) => ua.as_understood_receivers(),
+            Address::Tex(addr) => vec![Receiver::Transparent(TransparentAddress::PublicKeyHash(
+                *addr,
+            ))],
+        }
+    }
 }
 
 #[cfg(all(
@@ -433,15 +507,15 @@ impl Address {
 ))]
 pub mod testing {
     use proptest::prelude::*;
-    use zcash_primitives::consensus::Network;
+    use zcash_protocol::consensus::Network;
 
-    use crate::keys::{testing::arb_unified_spending_key, UnifiedAddressRequest};
+    use crate::keys::{UnifiedAddressRequest, testing::arb_unified_spending_key};
 
     use super::{Address, UnifiedAddress};
 
     #[cfg(feature = "sapling")]
     use sapling::testing::arb_payment_address;
-    use zcash_primitives::legacy::testing::arb_transparent_addr;
+    use transparent::address::testing::arb_transparent_addr;
 
     pub fn arb_unified_addr(
         params: Network,
@@ -473,7 +547,7 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use zcash_address::test_vectors;
-    use zcash_primitives::consensus::MAIN_NETWORK;
+    use zcash_protocol::consensus::MAIN_NETWORK;
 
     use super::{Address, UnifiedAddress};
 
@@ -481,7 +555,7 @@ mod tests {
     use crate::keys::sapling;
 
     #[cfg(any(feature = "orchard", feature = "sapling"))]
-    use zcash_primitives::zip32::AccountId;
+    use zip32::AccountId;
 
     #[test]
     #[cfg(any(feature = "orchard", feature = "sapling"))]

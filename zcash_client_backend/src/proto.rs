@@ -8,27 +8,31 @@ use std::{
     fmt::{self, Display},
     io,
 };
+use zcash_address::unified::{self, Encoding};
 
-use sapling::{self, note::ExtractedNoteCommitment, Node};
-use zcash_note_encryption::{EphemeralKeyBytes, COMPACT_NOTE_SIZE};
+use sapling::{self, Node, note::ExtractedNoteCommitment};
+use zcash_note_encryption::{COMPACT_NOTE_SIZE, EphemeralKeyBytes};
 use zcash_primitives::{
     block::{BlockHash, BlockHeader},
-    consensus::BlockHeight,
-    memo::{self, MemoBytes},
     merkle_tree::read_commitment_tree,
-    transaction::{components::amount::NonNegativeAmount, fees::StandardFeeRule, TxId},
+    transaction::TxId,
 };
+use zcash_protocol::{
+    PoolType, ShieldedProtocol,
+    consensus::{self, BlockHeight, NetworkType},
+    memo::{self, MemoBytes},
+    value::Zatoshis,
+};
+use zip321::{TransactionRequest, Zip321Error};
 
 use crate::{
-    data_api::{chain::ChainState, InputSource},
-    fees::{ChangeValue, TransactionBalance},
+    data_api::{InputSource, chain::ChainState, wallet::TargetHeight},
+    fees::{ChangeValue, StandardFeeRule, TransactionBalance},
     proposal::{Proposal, ProposalError, ShieldedInputs, Step, StepOutput, StepOutputIndex},
-    zip321::{TransactionRequest, Zip321Error},
-    PoolType, ShieldedProtocol,
 };
 
 #[cfg(feature = "transparent-inputs")]
-use zcash_primitives::transaction::components::OutPoint;
+use transparent::bundle::OutPoint;
 
 #[cfg(feature = "orchard")]
 use orchard::tree::MerkleHashOrchard;
@@ -36,16 +40,19 @@ use orchard::tree::MerkleHashOrchard;
 #[rustfmt::skip]
 #[allow(unknown_lints)]
 #[allow(clippy::derive_partial_eq_without_eq)]
+#[allow(clippy::doc_overindented_list_items)]
 pub mod compact_formats;
 
 #[rustfmt::skip]
 #[allow(unknown_lints)]
 #[allow(clippy::derive_partial_eq_without_eq)]
+#[allow(clippy::doc_overindented_list_items)]
 pub mod proposal;
 
 #[rustfmt::skip]
 #[allow(unknown_lints)]
 #[allow(clippy::derive_partial_eq_without_eq)]
+#[allow(clippy::doc_overindented_list_items)]
 pub mod service;
 
 impl compact_formats::CompactBlock {
@@ -53,11 +60,8 @@ impl compact_formats::CompactBlock {
     ///
     /// # Panics
     ///
-    /// This function will panic if [`CompactBlock.header`] is not set and
-    /// [`CompactBlock.hash`] is not exactly 32 bytes.
-    ///
-    /// [`CompactBlock.header`]: #structfield.header
-    /// [`CompactBlock.hash`]: #structfield.hash
+    /// This function will panic if [`field@Self::header`] is not set and
+    /// [`field@Self::hash`] is not exactly 32 bytes.
     pub fn hash(&self) -> BlockHash {
         if let Some(header) = self.header() {
             header.hash()
@@ -70,11 +74,8 @@ impl compact_formats::CompactBlock {
     ///
     /// # Panics
     ///
-    /// This function will panic if [`CompactBlock.header`] is not set and
-    /// [`CompactBlock.prevHash`] is not exactly 32 bytes.
-    ///
-    /// [`CompactBlock.header`]: #structfield.header
-    /// [`CompactBlock.prevHash`]: #structfield.prevHash
+    /// This function will panic if [`field@Self::header`] is not set and
+    /// [`field@Self::prev_hash`] is not exactly 32 bytes.
     pub fn prev_hash(&self) -> BlockHash {
         if let Some(header) = self.header() {
             header.prev_block
@@ -87,17 +88,15 @@ impl compact_formats::CompactBlock {
     ///
     /// # Panics
     ///
-    /// This function will panic if [`CompactBlock.height`] is not
-    /// representable within a u32.
+    /// This function will panic if [`field@Self::height`] is not representable within a
+    /// `u32`.
     pub fn height(&self) -> BlockHeight {
         self.height.try_into().unwrap()
     }
 
     /// Returns the [`BlockHeader`] for this block if present.
     ///
-    /// A convenience method that parses [`CompactBlock.header`] if present.
-    ///
-    /// [`CompactBlock.header`]: #structfield.header
+    /// A convenience method that parses [`field@Self::header`] if present.
     pub fn header(&self) -> Option<BlockHeader> {
         if self.header.is_empty() {
             None
@@ -119,20 +118,16 @@ impl compact_formats::CompactTx {
 impl compact_formats::CompactSaplingOutput {
     /// Returns the note commitment for this output.
     ///
-    /// A convenience method that parses [`CompactOutput.cmu`].
-    ///
-    /// [`CompactOutput.cmu`]: #structfield.cmu
+    /// A convenience method that parses [`field@Self::cmu`].
     pub fn cmu(&self) -> Result<ExtractedNoteCommitment, ()> {
         let mut repr = [0; 32];
-        repr.as_mut().copy_from_slice(&self.cmu[..]);
+        repr.copy_from_slice(&self.cmu[..]);
         Option::from(ExtractedNoteCommitment::from_bytes(&repr)).ok_or(())
     }
 
     /// Returns the ephemeral public key for this output.
     ///
-    /// A convenience method that parses [`CompactOutput.epk`].
-    ///
-    /// [`CompactOutput.epk`]: #structfield.epk
+    /// A convenience method that parses [`field@Self::ephemeral_key`].
     pub fn ephemeral_key(&self) -> Result<EphemeralKeyBytes, ()> {
         self.ephemeral_key[..]
             .try_into()
@@ -180,6 +175,9 @@ impl TryFrom<&compact_formats::CompactSaplingOutput>
 }
 
 impl compact_formats::CompactSaplingSpend {
+    /// Returns the nullifier for this spend.
+    ///
+    /// A convenience method that parses [`field@Self::nf`].
     pub fn nf(&self) -> Result<sapling::Nullifier, ()> {
         sapling::Nullifier::from_slice(&self.nf).map_err(|_| ())
     }
@@ -203,9 +201,7 @@ impl TryFrom<&compact_formats::CompactOrchardAction> for orchard::note_encryptio
 impl compact_formats::CompactOrchardAction {
     /// Returns the note commitment for the output of this action.
     ///
-    /// A convenience method that parses [`CompactOrchardAction.cmx`].
-    ///
-    /// [`CompactOrchardAction.cmx`]: #structfield.cmx
+    /// A convenience method that parses [`field@Self::cmx`].
     pub fn cmx(&self) -> Result<orchard::note::ExtractedNoteCommitment, ()> {
         Option::from(orchard::note::ExtractedNoteCommitment::from_bytes(
             &self.cmx[..].try_into().map_err(|_| ())?,
@@ -215,9 +211,7 @@ impl compact_formats::CompactOrchardAction {
 
     /// Returns the nullifier for the spend of this action.
     ///
-    /// A convenience method that parses [`CompactOrchardAction.nullifier`].
-    ///
-    /// [`CompactOrchardAction.nullifier`]: #structfield.nullifier
+    /// A convenience method that parses [`field@Self::nullifier`].
     pub fn nf(&self) -> Result<orchard::note::Nullifier, ()> {
         let nf_bytes: [u8; 32] = self.nullifier[..].try_into().map_err(|_| ())?;
         Option::from(orchard::note::Nullifier::from_bytes(&nf_bytes)).ok_or(())
@@ -225,9 +219,7 @@ impl compact_formats::CompactOrchardAction {
 
     /// Returns the ephemeral public key for the output of this action.
     ///
-    /// A convenience method that parses [`CompactOrchardAction.ephemeral_key`].
-    ///
-    /// [`CompactOrchardAction.ephemeral_key`]: #structfield.ephemeral_key
+    /// A convenience method that parses [`field@Self::ephemeral_key`].
     pub fn ephemeral_key(&self) -> Result<EphemeralKeyBytes, ()> {
         self.ephemeral_key[..]
             .try_into()
@@ -258,6 +250,85 @@ impl<SpendAuth> From<&orchard::Action<SpendAuth>> for compact_formats::CompactOr
     }
 }
 
+impl service::LightdInfo {
+    /// Returns the network type for the chain this server is following, or `None` if it
+    /// is not recognised.
+    pub fn chain_name(&self) -> Option<NetworkType> {
+        match self.chain_name.as_str() {
+            "main" => Some(NetworkType::Main),
+            "test" => Some(NetworkType::Test),
+            "regtest" => Some(NetworkType::Regtest),
+            _ => None,
+        }
+    }
+
+    /// Returns the Sapling activation height for the chain this server is following.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if [`field@Self::sapling_activation_height`] is not
+    /// representable within a `u32`.
+    pub fn sapling_activation_height(&self) -> BlockHeight {
+        self.sapling_activation_height
+            .try_into()
+            .expect("lightwalletd should provide in-range heights")
+    }
+
+    /// Returns the current consensus branch ID for the chain tip of the chain this server
+    /// is following, or `None` if it is not recognised.
+    pub fn consensus_branch_id(&self) -> Option<consensus::BranchId> {
+        u32::from_str_radix(&self.consensus_branch_id, 16)
+            .ok()?
+            .try_into()
+            .ok()
+    }
+
+    /// Returns the chain tip height reported by the full node backing this server.
+    ///
+    /// If the full node is still syncing, this may not be the network's chain tip; in
+    /// this case, [`Self::estimated_height`] will report a larger height.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if [`field@Self::block_height`] is not representable
+    /// within a `u32`.
+    pub fn block_height(&self) -> BlockHeight {
+        self.block_height
+            .try_into()
+            .expect("lightwalletd should provide in-range heights")
+    }
+
+    /// Returns the estimated chain tip height for the chain this server is following.
+    ///
+    /// If the full node backing this server is fully synced, this is always equal to
+    /// [`Self::block_height`].
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if [`field@Self::estimated_height`] is not representable
+    /// within a `u32`.
+    pub fn estimated_height(&self) -> BlockHeight {
+        self.estimated_height
+            .try_into()
+            .expect("lightwalletd should provide in-range heights")
+    }
+
+    /// Returns the donation address for this server.
+    ///
+    /// Returns `None` if:
+    /// - no donation address was provided.
+    /// - the provided donation address is not a valid [`unified::Address`].
+    /// - the provided donation address is for a different chain.
+    pub fn donation_address(&self) -> Option<unified::Address> {
+        if self.donation_address.is_empty() {
+            None
+        } else {
+            let (network_type, address) = unified::Address::decode(&self.donation_address).ok()?;
+            (Some(network_type) == self.chain_name()).then_some(address)
+        }
+    }
+}
+
 impl service::TreeState {
     /// Deserializes and returns the Sapling note commitment tree field of the tree state.
     pub fn sapling_tree(
@@ -269,7 +340,7 @@ impl service::TreeState {
             let sapling_tree_bytes = hex::decode(&self.sapling_tree).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Hex decoding of Sapling tree bytes failed: {:?}", e),
+                    format!("Hex decoding of Sapling tree bytes failed: {e:?}"),
                 )
             })?;
             read_commitment_tree::<Node, _, { sapling::NOTE_COMMITMENT_TREE_DEPTH }>(
@@ -290,7 +361,7 @@ impl service::TreeState {
             let orchard_tree_bytes = hex::decode(&self.orchard_tree).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Hex decoding of Orchard tree bytes failed: {:?}", e),
+                    format!("Hex decoding of Orchard tree bytes failed: {e:?}"),
                 )
             })?;
             read_commitment_tree::<
@@ -308,7 +379,7 @@ impl service::TreeState {
         let mut hash_bytes = hex::decode(&self.hash).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Block hash is not valid hex: {:?}", e),
+                format!("Block hash is not valid hex: {e:?}"),
             )
         })?;
         // Zcashd hex strings for block hashes are byte-reversed.
@@ -356,8 +427,8 @@ pub enum ProposalDecodingError<DbError> {
     MemoInvalid(memo::Error),
     /// The serialization version returned by the protobuf was not recognized.
     VersionInvalid(u32),
-    /// The proposal did not correctly specify a standard fee rule.
-    FeeRuleNotSpecified,
+    /// The fee rule specified by the proposal is not supported by the wallet.
+    FeeRuleNotSupported(proposal::FeeRule),
     /// The proposal violated balance or structural constraints.
     ProposalInvalid(ProposalError),
     /// An inputs field for the given protocol was present, but contained no input note references.
@@ -380,56 +451,52 @@ impl<E: Display> Display for ProposalDecodingError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProposalDecodingError::NoSteps => write!(f, "The proposal had no steps."),
-            ProposalDecodingError::Zip321(err) => write!(f, "Transaction request invalid: {}", err),
+            ProposalDecodingError::Zip321(err) => write!(f, "Transaction request invalid: {err}"),
             ProposalDecodingError::NullInput(i) => {
-                write!(f, "Proposed input was null at index {}", i)
+                write!(f, "Proposed input was null at index {i}")
             }
             ProposalDecodingError::TxIdInvalid(err) => {
-                write!(f, "Invalid transaction id: {:?}", err)
+                write!(f, "Invalid transaction id: {err:?}")
             }
             ProposalDecodingError::ValuePoolNotSupported(id) => {
-                write!(f, "Invalid value pool identifier: {:?}", id)
+                write!(f, "Invalid value pool identifier: {id:?}")
             }
-            ProposalDecodingError::InputRetrieval(err) => write!(
-                f,
-                "An error occurred retrieving a transaction input: {}",
-                err
-            ),
-            ProposalDecodingError::InputNotFound(txid, pool, idx) => write!(
-                f,
-                "No {} input found for txid {}, index {}",
-                pool, txid, idx
-            ),
+            ProposalDecodingError::InputRetrieval(err) => {
+                write!(f, "An error occurred retrieving a transaction input: {err}")
+            }
+            ProposalDecodingError::InputNotFound(txid, pool, idx) => {
+                write!(f, "No {pool} input found for txid {txid}, index {idx}")
+            }
             ProposalDecodingError::BalanceInvalid => {
                 write!(f, "An error occurred decoding the proposal balance.")
             }
             ProposalDecodingError::MemoInvalid(err) => {
-                write!(f, "An error occurred decoding a proposed memo: {}", err)
+                write!(f, "An error occurred decoding a proposed memo: {err}")
             }
             ProposalDecodingError::VersionInvalid(v) => {
-                write!(f, "Unrecognized proposal version {}", v)
+                write!(f, "Unrecognized proposal version {v}")
             }
-            ProposalDecodingError::FeeRuleNotSpecified => {
-                write!(f, "Proposal did not specify a known fee rule.")
+            ProposalDecodingError::FeeRuleNotSupported(r) => {
+                write!(
+                    f,
+                    "Fee calculation using the {r:?} fee rule is not supported."
+                )
             }
-            ProposalDecodingError::ProposalInvalid(err) => write!(f, "{}", err),
+            ProposalDecodingError::ProposalInvalid(err) => write!(f, "{err}"),
             ProposalDecodingError::EmptyShieldedInputs(protocol) => write!(
                 f,
-                "An inputs field was present for {:?}, but contained no note references.",
-                protocol
+                "An inputs field was present for {protocol:?}, but contained no note references."
             ),
             ProposalDecodingError::TransparentMemo => {
                 write!(f, "Transparent outputs cannot have memos.")
             }
             ProposalDecodingError::InvalidChangeRecipient(pool_type) => write!(
                 f,
-                "Change outputs to the {} pool are not supported.",
-                pool_type
+                "Change outputs to the {pool_type} pool are not supported."
             ),
             ProposalDecodingError::InvalidEphemeralRecipient(pool_type) => write!(
                 f,
-                "Ephemeral outputs to the {} pool are not supported.",
-                pool_type
+                "Ephemeral outputs to the {pool_type} pool are not supported."
             ),
         }
     }
@@ -513,7 +580,7 @@ impl proposal::Proposal {
                             txid: utxo.outpoint().hash().to_vec(),
                             value_pool: proposal::ValuePool::Transparent.into(),
                             index: utxo.outpoint().n(),
-                            value: utxo.txout().value.into(),
+                            value: utxo.txout().value().into(),
                         })),
                     })
                     .chain(step.shielded_inputs().iter().flat_map(|s_in| {
@@ -596,12 +663,9 @@ impl proposal::Proposal {
             })
             .collect();
 
-        #[allow(deprecated)]
         proposal::Proposal {
             proto_version: PROPOSAL_SER_V1,
             fee_rule: match value.fee_rule() {
-                StandardFeeRule::PreZip313 => proposal::FeeRule::PreZip313,
-                StandardFeeRule::Zip313 => proposal::FeeRule::Zip313,
                 StandardFeeRule::Zip317 => proposal::FeeRule::Zip317,
             }
             .into(),
@@ -622,15 +686,14 @@ impl proposal::Proposal {
         use self::proposal::proposed_input::Value::*;
         match self.proto_version {
             PROPOSAL_SER_V1 => {
-                #[allow(deprecated)]
                 let fee_rule = match self.fee_rule() {
-                    proposal::FeeRule::PreZip313 => StandardFeeRule::PreZip313,
-                    proposal::FeeRule::Zip313 => StandardFeeRule::Zip313,
                     proposal::FeeRule::Zip317 => StandardFeeRule::Zip317,
-                    proposal::FeeRule::NotSpecified => {
-                        return Err(ProposalDecodingError::FeeRuleNotSpecified);
+                    other => {
+                        return Err(ProposalDecodingError::FeeRuleNotSupported(other));
                     }
                 };
+
+                let target_height = TargetHeight::from(self.min_target_height);
 
                 let mut steps = Vec::with_capacity(self.steps.len());
                 for step in &self.steps {
@@ -676,7 +739,10 @@ impl proposal::Proposal {
                                             let outpoint = OutPoint::new(txid.into(), out.index);
                                             transparent_inputs.push(
                                                 wallet_db
-                                                    .get_unspent_transparent_output(&outpoint)
+                                                    .get_unspent_transparent_output(
+                                                        &outpoint,
+                                                        target_height,
+                                                    )
                                                     .map_err(ProposalDecodingError::InputRetrieval)?
                                                     .ok_or({
                                                         ProposalDecodingError::InputNotFound(
@@ -684,13 +750,19 @@ impl proposal::Proposal {
                                                             PoolType::TRANSPARENT,
                                                             out.index,
                                                         )
-                                                    })?,
+                                                    })?
+                                                    .into_wallet_output(),
                                             );
                                         }
                                     }
                                     PoolType::Shielded(protocol) => received_notes.push(
                                         wallet_db
-                                            .get_spendable_note(&txid, protocol, out.index)
+                                            .get_spendable_note(
+                                                &txid,
+                                                protocol,
+                                                out.index,
+                                                target_height,
+                                            )
                                             .map_err(ProposalDecodingError::InputRetrieval)
                                             .and_then(|opt| {
                                                 opt.ok_or({
@@ -747,7 +819,7 @@ impl proposal::Proposal {
                             .proposed_change
                             .iter()
                             .map(|cv| -> Result<ChangeValue, ProposalDecodingError<_>> {
-                                let value = NonNegativeAmount::from_u64(cv.value)
+                                let value = Zatoshis::from_u64(cv.value)
                                     .map_err(|_| ProposalDecodingError::BalanceInvalid)?;
                                 let memo = cv
                                     .memo
@@ -781,7 +853,7 @@ impl proposal::Proposal {
                                 }
                             })
                             .collect::<Result<Vec<_>, _>>()?,
-                        NonNegativeAmount::from_u64(proto_balance.fee_required)
+                        Zatoshis::from_u64(proto_balance.fee_required)
                             .map_err(|_| ProposalDecodingError::BalanceInvalid)?,
                     )
                     .map_err(|_| ProposalDecodingError::BalanceInvalid)?;
@@ -803,7 +875,7 @@ impl proposal::Proposal {
 
                 Proposal::multi_step(
                     fee_rule,
-                    self.min_target_height.into(),
+                    target_height,
                     NonEmpty::from_vec(steps).ok_or(ProposalDecodingError::NoSteps)?,
                 )
                 .map_err(ProposalDecodingError::ProposalInvalid)

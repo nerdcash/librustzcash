@@ -2,16 +2,16 @@
 use std::collections::HashSet;
 
 use rusqlite::named_params;
-use schemer_rusqlite::RusqliteMigration;
+use schemerz_rusqlite::RusqliteMigration;
 use uuid::Uuid;
 
-use zcash_client_backend::keys::{
-    UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedIncomingViewingKey,
+use zcash_keys::keys::{
+    ReceiverRequirement::*, UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedIncomingViewingKey,
 };
-use zcash_primitives::consensus;
+use zcash_protocol::consensus;
 
 use super::orchard_received_notes;
-use crate::{wallet::init::WalletMigrationError, UA_ORCHARD, UA_TRANSPARENT};
+use crate::{UA_ORCHARD, UA_TRANSPARENT, wallet::init::WalletMigrationError};
 
 pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0x604349c7_5ce5_4768_bea6_12d106ccda93);
 
@@ -21,7 +21,7 @@ pub(super) struct Migration<P> {
     pub(super) params: P,
 }
 
-impl<P> schemer::Migration for Migration<P> {
+impl<P> schemerz::Migration<Uuid> for Migration<P> {
     fn id(&self) -> Uuid {
         MIGRATION_ID
     }
@@ -66,7 +66,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
             };
 
             let (default_addr, diversifier_index) = uivk.default_address(
-                UnifiedAddressRequest::unsafe_new(UA_ORCHARD, true, UA_TRANSPARENT),
+                UnifiedAddressRequest::unsafe_custom(UA_ORCHARD, Require, UA_TRANSPARENT),
             )?;
 
             let mut di_be = *diversifier_index.as_bytes();
@@ -92,19 +92,28 @@ mod tests {
     use secrecy::SecretVec;
     use tempfile::NamedTempFile;
 
-    use zcash_client_backend::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
-    use zcash_keys::address::Address;
-    use zcash_primitives::consensus::Network;
+    use zcash_keys::{
+        address::Address,
+        keys::{ReceiverRequirement::*, UnifiedAddressRequest, UnifiedSpendingKey},
+    };
+    use zcash_protocol::consensus::Network;
 
     use crate::{
-        wallet::init::{init_wallet_db, init_wallet_db_internal, migrations::addresses_table},
-        WalletDb, UA_ORCHARD, UA_TRANSPARENT,
+        UA_ORCHARD, UA_TRANSPARENT, WalletDb,
+        testing::db::{test_clock, test_rng},
+        wallet::init::{WalletMigrator, migrations::addresses_table},
     };
 
     #[test]
     fn init_migrate_add_orchard_receiver() {
         let data_file = NamedTempFile::new().unwrap();
-        let mut db_data = WalletDb::for_path(data_file.path(), Network::TestNetwork).unwrap();
+        let mut db_data = WalletDb::for_path(
+            data_file.path(),
+            Network::TestNetwork,
+            test_clock(),
+            test_rng(),
+        )
+        .unwrap();
 
         let seed = vec![0x10; 32];
         let account_id = 0u32;
@@ -117,12 +126,10 @@ mod tests {
         .to_unified_full_viewing_key();
 
         assert_matches!(
-            init_wallet_db_internal(
-                &mut db_data,
-                Some(SecretVec::new(seed.clone())),
-                &[addresses_table::MIGRATION_ID],
-                false
-            ),
+            WalletMigrator::new()
+                .with_seed(SecretVec::new(seed.clone()))
+                .ignore_seed_relevance()
+                .init_or_migrate_to(&mut db_data, &[addresses_table::MIGRATION_ID]),
             Ok(_)
         );
 
@@ -140,9 +147,9 @@ mod tests {
             .unwrap();
 
         let (addr, diversifier_index) = ufvk
-            .default_address(UnifiedAddressRequest::unsafe_new(
-                false,
-                true,
+            .default_address(UnifiedAddressRequest::unsafe_custom(
+                Omit,
+                Require,
                 UA_TRANSPARENT,
             ))
             .unwrap();
@@ -170,13 +177,15 @@ mod tests {
             Ok(Address::Unified(ua)) => {
                 assert!(!ua.has_orchard());
                 assert!(ua.has_sapling());
-                assert_eq!(ua.has_transparent(), UA_TRANSPARENT);
+                assert_eq!(ua.has_transparent(), UA_TRANSPARENT == Require);
             }
-            other => panic!("Unexpected result from address decoding: {:?}", other),
+            other => panic!("Unexpected result from address decoding: {other:?}"),
         }
 
         assert_matches!(
-            init_wallet_db(&mut db_data, Some(SecretVec::new(seed))),
+            WalletMigrator::new()
+                .with_seed(SecretVec::new(seed))
+                .init_or_migrate(&mut db_data),
             Ok(_)
         );
 
@@ -186,11 +195,11 @@ mod tests {
                 Ok(Address::decode(&db_data.params, &row.get::<_, String>(0)?).unwrap())
             }) {
             Ok(Address::Unified(ua)) => {
-                assert_eq!(ua.has_orchard(), UA_ORCHARD);
+                assert_eq!(ua.has_orchard(), UA_ORCHARD == Require);
                 assert!(ua.has_sapling());
-                assert_eq!(ua.has_transparent(), UA_TRANSPARENT);
+                assert_eq!(ua.has_transparent(), UA_TRANSPARENT == Require);
             }
-            other => panic!("Unexpected result from address decoding: {:?}", other),
+            other => panic!("Unexpected result from address decoding: {other:?}"),
         }
     }
 }

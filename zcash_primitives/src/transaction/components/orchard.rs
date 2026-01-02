@@ -1,19 +1,22 @@
-/// Functions for parsing & serialization of Orchard transaction components.
-use std::convert::TryFrom;
-use std::io::{self, Read, Write};
+//! Functions for parsing & serialization of Orchard transaction components.
+use crate::encoding::ReadBytesExt;
 
-use byteorder::{ReadBytesExt, WriteBytesExt};
+use alloc::vec::Vec;
+use core::convert::TryFrom;
+use core2::io::{self, Read, Write};
+
 use nonempty::NonEmpty;
+
 use orchard::{
+    Action, Anchor,
     bundle::{Authorization, Authorized, Flags},
     note::{ExtractedNoteCommitment, Nullifier, TransmittedNoteCiphertext},
     primitives::redpallas::{self, SigType, Signature, SpendAuth, VerificationKey},
     value::ValueCommitment,
-    Action, Anchor,
 };
 use zcash_encoding::{Array, CompactSize, Vector};
+use zcash_protocol::value::ZatBalance;
 
-use super::Amount;
 use crate::transaction::Transaction;
 
 pub const FLAG_SPENDS_ENABLED: u8 = 0b0000_0001;
@@ -47,7 +50,7 @@ impl MapAuth<Authorized, Authorized> for () {
 /// Reads an [`orchard::Bundle`] from a v5 transaction format.
 pub fn read_v5_bundle<R: Read>(
     mut reader: R,
-) -> io::Result<Option<orchard::Bundle<Authorized, Amount>>> {
+) -> io::Result<Option<orchard::Bundle<Authorized, ZatBalance>>> {
     #[allow(clippy::redundant_closure)]
     let actions_without_auth = Vector::read(&mut reader, |r| read_action_without_auth(r))?;
     if actions_without_auth.is_empty() {
@@ -81,6 +84,13 @@ pub fn read_v5_bundle<R: Read>(
     }
 }
 
+#[cfg(any(zcash_unstable = "zfuture", zcash_unstable = "nu7"))]
+pub fn read_v6_bundle<R: Read>(
+    reader: R,
+) -> io::Result<Option<orchard::Bundle<Authorized, ZatBalance>>> {
+    read_v5_bundle(reader)
+}
+
 pub fn read_value_commitment<R: Read>(mut reader: R) -> io::Result<ValueCommitment> {
     let mut bytes = [0u8; 32];
     reader.read_exact(&mut bytes)?;
@@ -89,7 +99,7 @@ pub fn read_value_commitment<R: Read>(mut reader: R) -> io::Result<ValueCommitme
     if cv.is_none().into() {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid Pallas point for value commitment".to_owned(),
+            "invalid Pallas point for value commitment",
         ))
     } else {
         Ok(cv.unwrap())
@@ -103,7 +113,7 @@ pub fn read_nullifier<R: Read>(mut reader: R) -> io::Result<Nullifier> {
     if nullifier_ctopt.is_none().into() {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid Pallas point for nullifier".to_owned(),
+            "invalid Pallas point for nullifier",
         ))
     } else {
         Ok(nullifier_ctopt.unwrap())
@@ -113,12 +123,8 @@ pub fn read_nullifier<R: Read>(mut reader: R) -> io::Result<Nullifier> {
 pub fn read_verification_key<R: Read>(mut reader: R) -> io::Result<VerificationKey<SpendAuth>> {
     let mut bytes = [0u8; 32];
     reader.read_exact(&mut bytes)?;
-    VerificationKey::try_from(bytes).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid verification key".to_owned(),
-        )
-    })
+    VerificationKey::try_from(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid verification key"))
 }
 
 pub fn read_cmx<R: Read>(mut reader: R) -> io::Result<ExtractedNoteCommitment> {
@@ -128,7 +134,7 @@ pub fn read_cmx<R: Read>(mut reader: R) -> io::Result<ExtractedNoteCommitment> {
     Option::from(cmx).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid Pallas base for field cmx".to_owned(),
+            "invalid Pallas base for field cmx",
         )
     })
 }
@@ -167,23 +173,15 @@ pub fn read_action_without_auth<R: Read>(mut reader: R) -> io::Result<Action<()>
 pub fn read_flags<R: Read>(mut reader: R) -> io::Result<Flags> {
     let mut byte = [0u8; 1];
     reader.read_exact(&mut byte)?;
-    Flags::from_byte(byte[0]).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid Orchard flags".to_owned(),
-        )
-    })
+    Flags::from_byte(byte[0])
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Orchard flags"))
 }
 
 pub fn read_anchor<R: Read>(mut reader: R) -> io::Result<Anchor> {
     let mut bytes = [0u8; 32];
     reader.read_exact(&mut bytes)?;
-    Option::from(Anchor::from_bytes(bytes)).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid Orchard anchor".to_owned(),
-        )
-    })
+    Option::from(Anchor::from_bytes(bytes))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Orchard anchor"))
 }
 
 pub fn read_signature<R: Read, T: SigType>(mut reader: R) -> io::Result<Signature<T>> {
@@ -194,7 +192,7 @@ pub fn read_signature<R: Read, T: SigType>(mut reader: R) -> io::Result<Signatur
 
 /// Writes an [`orchard::Bundle`] in the v5 transaction format.
 pub fn write_v5_bundle<W: Write>(
-    bundle: Option<&orchard::Bundle<Authorized, Amount>>,
+    bundle: Option<&orchard::Bundle<Authorized, ZatBalance>>,
     mut writer: W,
 ) -> io::Result<()> {
     if let Some(bundle) = &bundle {
@@ -208,7 +206,7 @@ pub fn write_v5_bundle<W: Write>(
         Vector::write(
             &mut writer,
             bundle.authorization().proof().as_ref(),
-            |w, b| w.write_u8(*b),
+            |w, b| w.write_all(&[*b]),
         )?;
         Array::write(
             &mut writer,
@@ -223,6 +221,14 @@ pub fn write_v5_bundle<W: Write>(
     }
 
     Ok(())
+}
+
+#[cfg(any(zcash_unstable = "zfuture", zcash_unstable = "nu7"))]
+pub fn write_v6_bundle<W: Write>(
+    bundle: Option<&orchard::Bundle<Authorized, ZatBalance>>,
+    writer: W,
+) -> io::Result<()> {
+    write_v5_bundle(bundle, writer)
 }
 
 pub fn write_value_commitment<W: Write>(mut writer: W, cv: &ValueCommitment) -> io::Result<()> {
@@ -270,20 +276,18 @@ pub mod testing {
     use proptest::prelude::*;
 
     use orchard::bundle::{
-        testing::{self as t_orch},
         Authorized, Bundle,
+        testing::{self as t_orch},
     };
+    use zcash_protocol::value::{ZatBalance, testing::arb_zat_balance};
 
-    use crate::transaction::{
-        components::amount::{testing::arb_amount, Amount},
-        TxVersion,
-    };
+    use crate::transaction::TxVersion;
 
     prop_compose! {
         pub fn arb_bundle(n_actions: usize)(
-            orchard_value_balance in arb_amount(),
+            orchard_value_balance in arb_zat_balance(),
             bundle in t_orch::arb_bundle(n_actions)
-        ) -> Bundle<Authorized, Amount> {
+        ) -> Bundle<Authorized, ZatBalance> {
             // overwrite the value balance, as we can't guarantee that the
             // value doesn't exceed the MAX_MONEY bounds.
             bundle.try_map_value_balance::<_, (), _>(|_| Ok(orchard_value_balance)).unwrap()
@@ -292,7 +296,7 @@ pub mod testing {
 
     pub fn arb_bundle_for_version(
         v: TxVersion,
-    ) -> impl Strategy<Value = Option<Bundle<Authorized, Amount>>> {
+    ) -> impl Strategy<Value = Option<Bundle<Authorized, ZatBalance>>> {
         if v.has_orchard() {
             Strategy::boxed((1usize..100).prop_flat_map(|n| prop::option::of(arb_bundle(n))))
         } else {

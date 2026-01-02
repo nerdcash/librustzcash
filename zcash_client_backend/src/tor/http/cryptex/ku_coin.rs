@@ -1,8 +1,7 @@
-use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use super::{Exchange, ExchangeData};
+use super::{Exchange, ExchangeData, RETRY_LIMIT, retry_filter};
 use crate::tor::{Client, Error};
 
 /// Querier for the KuCoin exchange.
@@ -46,16 +45,17 @@ struct KuCoinResponse {
     data: KuCoinData,
 }
 
-#[async_trait]
 impl Exchange for KuCoin {
     async fn query_zec_to_usd(&self, client: &Client) -> Result<ExchangeData, Error> {
         // API documentation:
         // https://www.kucoin.com/docs/rest/spot-trading/market-data/get-24hr-stats
         let res = client
-            .get_json::<KuCoinResponse>(
+            .http_get_json::<KuCoinResponse>(
                 "https://api.kucoin.com/api/v1/market/stats?symbol=ZEC-USDT"
                     .parse()
                     .unwrap(),
+                RETRY_LIMIT,
+                retry_filter,
             )
             .await?;
         let data = res.into_body().data;

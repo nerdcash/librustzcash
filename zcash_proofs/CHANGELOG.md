@@ -3,9 +3,60 @@ All notable changes to this library will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this library adheres to Rust's notion of
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Future releases are
+indicated by the `PLANNED` status in order to make it possible to correctly
+represent the transitive `semver` implications of changes within the enclosing
+workspace.
 
 ## [Unreleased]
+
+### Changed
+- MSRV is now 1.85.1.
+- Migrated to `sapling-crypto 0.6`.
+
+## [0.26.1] - 2025-10-18
+
+### Fixed
+- Adjusted doc features to fix builds on docs.rs after nightly Rust update.
+
+## [0.26.0] - 2025-10-02
+
+### Changed
+- Migrated to `zcash_primitives 0.26`
+
+## [0.25.0] - 2025-09-25
+
+### Changed
+- Migrated to `zcash_primitives 0.25`.
+
+## [0.24.0] - 2025-07-31
+
+### Changed
+- Migrated to `zcash_primitives 0.24`.
+
+## [0.23.0] - 2025-05-30
+
+### Changed
+- Migrated to `zcash_primitives 0.23`.
+
+## [0.22.0] - 2025-02-21
+
+### Changed
+- MSRV is now 1.81.0.
+- Migrated to `redjubjub 0.8`, `zcash_primitives 0.22`.
+
+## [0.21.0] - 2024-12-16
+### Added
+- `zcash_proofs::prover::LocalTxProver::verifying_keys`
+
+### Changed
+- Migrated to `sapling-crypto` version `0.4`, `zcash_primitives 0.21`.
+
+## [0.20.0] - 2024-11-14
+
+### Changed
+- Migrated to `zcash_primitives 0.20`.
+- MSRV is now 1.77.0.
 
 ## [0.19.0] - 2024-10-02
 

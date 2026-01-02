@@ -8,13 +8,13 @@
 //!
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, doc(auto_cfg))]
 // Catch documentation errors caused by code changes.
 #![deny(rustdoc::broken_intra_doc_links)]
 // Temporary until we have addressed all Result<T, ()> cases.
 #![allow(clippy::result_unit_err)]
 
-use bellman::groth16::{prepare_verifying_key, PreparedVerifyingKey, VerifyingKey};
+use bellman::groth16::{PreparedVerifyingKey, VerifyingKey, prepare_verifying_key};
 use bls12_381::Bls12;
 use sapling::circuit::{
     OutputParameters, PreparedOutputVerifyingKey, PreparedSpendVerifyingKey, SpendParameters,
@@ -77,15 +77,15 @@ pub struct SaplingParameterPaths {
 pub fn default_params_folder() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        use known_folders::{get_known_folder_path, KnownFolder};
+        use known_folders::{KnownFolder, get_known_folder_path};
         get_known_folder_path(KnownFolder::RoamingAppData).map(|base| base.join("ZcashParams"))
     }
 
     #[cfg(target_os = "macos")]
     {
         xdg::BaseDirectories::new()
-            .ok()
-            .map(|base_dirs| base_dirs.get_data_home().join("ZcashParams"))
+            .get_data_home()
+            .map(|data_home| data_home.join("ZcashParams"))
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -164,9 +164,8 @@ fn fetch_params(
     timeout: Option<u64>,
 ) -> Result<PathBuf, minreq::Error> {
     // Ensure that the default Zcash parameters location exists.
-    let params_dir = default_params_folder().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "Could not load default params folder")
-    })?;
+    let params_dir = default_params_folder()
+        .ok_or_else(|| io::Error::other("Could not load default params folder"))?;
     std::fs::create_dir_all(&params_dir)?;
 
     let params_path = params_dir.join(name);
@@ -243,9 +242,9 @@ fn stream_params_downloads_to_disk(
     // It's necessary for us to host these files in two parts,
     // because of CloudFlare's maximum cached file size limit of 512 MB.
     // The files must fit in the cache to prevent "denial of wallet" attacks.
-    let params_url_1 = format!("{}/{}.part.1", DOWNLOAD_URL, name);
+    let params_url_1 = format!("{DOWNLOAD_URL}/{name}.part.1");
     // TODO: skip empty part.2 files when downloading sapling spend and sapling output
-    let params_url_2 = format!("{}/{}.part.2", DOWNLOAD_URL, name);
+    let params_url_2 = format!("{DOWNLOAD_URL}/{name}.part.2");
 
     let mut params_download_1 = minreq::get(&params_url_1);
     let mut params_download_2 = minreq::get(&params_url_2);
@@ -273,7 +272,7 @@ fn stream_params_downloads_to_disk(
         expected_hash,
         expected_bytes,
         name,
-        &format!("{} + {}", params_url_1, params_url_2),
+        &format!("{params_url_1} + {params_url_2}"),
     )?;
 
     Ok(())
@@ -451,10 +450,9 @@ fn verify_file_size(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} failed validation:\n\
-                 expected: {} bytes,\n\
-                 actual:   {} bytes from {:?}",
-                name, expected_bytes, file_size, params_source,
+                "{name} failed validation:\n\
+                 expected: {expected_bytes} bytes,\n\
+                 actual:   {file_size} bytes from {params_source:?}",
             ),
         ));
     }
@@ -502,10 +500,9 @@ fn verify_hash<R: io::Read, W: io::Write>(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} failed validation:\n\
-                 expected: {} hashing {} bytes,\n\
-                 actual:   {} hashing {} bytes from {:?}",
-                name, expected_hash, expected_bytes, hash, byte_count, params_source,
+                "{name} failed validation:\n\
+                 expected: {expected_hash} hashing {expected_bytes} bytes,\n\
+                 actual:   {hash} hashing {byte_count} bytes from {params_source:?}",
             ),
         ));
     }

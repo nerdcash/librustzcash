@@ -2,9 +2,153 @@ All notable changes to this library will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this library adheres to Rust's notion of
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Future releases are
+indicated by the `PLANNED` status in order to make it possible to correctly
+represent the transitive `semver` implications of changes within the enclosing
+workspace.
 
 ## [Unreleased]
+
+### Added
+- `zcash_keys::keys::OutgoingViewingKey`
+- `zcash_keys::keys::UnifiedFullViewingKey::select_ovk`
+
+### Changed
+- MSRV is now 1.85.1.
+- Migrated to `orchard 0.12`, `sapling-crypto 0.6`.
+
+## [0.12.0] - 2025-10-13
+
+### Changed
+- Migrated to `zcash_protocol 0.7`, `zcash_address 0.10`, `zcash_transparent 0.6`
+
+## [0.11.0] - 2025-09-25
+
+### Added
+- `zcash_keys::address::UnifiedAddress::to_zcash_address`
+
+### Changed
+- Migrated to `zcash_transparent 0.5`.
+- `zcash_keys::keys::AddressGenerationError` has added variants `UnsupportedTransparentKeyScope`
+  and `Bip32DerivationError` when the `transparent-inputs` feature flag is enabled.
+
+## [0.10.1] - 2025-08-06
+
+### Fixed
+- Use of an incorrect prefix for transparent secret key Base58 encoding
+  (available under the `transparent-key-encoding` feature) has been fixed.
+
+## [0.10.0] - 2025-08-06
+
+### Added
+- `zcash_keys::keys::zcashd`, a module containing utilities that are useful
+  for interacting with key data from legacy zcashd wallets, has been added
+  under a newly-added `zcashd-compat` feature flag.
+- `zcash_keys::keys::transparent`, a module providing zcashd-flavored DER
+  encoding for transparent keys under a new `transparent-key-encoding` feature
+  flag.
+- `zcash_keys::address::UnifiedAddress::receivers`
+- `zcash_keys::address::Address::receivers`
+
+### Changed
+- Migrated to `zcash_protocol 0.6`, `zcash_address 0.9`, `zcash_transparent 0.4`
+
+## [0.9.0] - 2025-05-30
+
+### Added
+- `zcash_keys::keys::UnifiedAddressRequest::{SHIELDED, ORCHARD}`
+- `zcash_keys::keys::ReceiverRequirements::{SHIELDED, ORCHARD}`
+
+### Changed
+- Migrated to `zcash_address 0.8`, `zcash_transparent 0.3`.
+
+## [0.8.2] - 2025-07-18
+
+### Added
+- `zcash_keys::keys::{UnifiedFullViewingKey, UnifiedIncomingViewingKey}::default_transparent_address`
+  have been added under the `test-dependencies` feature.
+
+## [0.4.1, 0.5.1, 0.6.1, 0.7.1, 0.8.1] - 2025-05-09
+
+### Added
+- `zcash_keys::Address::to_sapling_address`
+
+## [0.8.0] - 2025-03-19
+
+### Added
+- `zcash_keys::keys::UnifiedIncomingViewingKey::{has_sapling, has_orchard,
+  has_transparent, receiver_requirements, to_receiver_requirements}`
+- `zcash_keys::keys::ReceiverRequirements`
+
+### Changed
+- `zcash_keys::keys::UnifiedAddressRequest` is now an enum instead of a struct.
+  The `new` and `unsafe_new` methods have been replaced by `custom` and
+  `unsafe_custom` respectively.
+- Arguments to `zcash_keys::keys::UnifiedIncomingViewingKey::address` have been
+  modified; the `request` argument to this method now has type
+  `UnifiedAddressRequest` instead of `Option<UnifiedAddressRequest>`. Use
+  `UnifiedAddressRequest::AllAvailableKeys` where `None` was previously
+  used to obtain the same semantics.
+
+### Removed
+- `UnifiedAddressRequest::{new, unsafe_new}`: use `{custom, unsafe_custom}`
+  respectively instead.
+- `UnifiedAddressRequest::intersect`: a replacement for this method is now
+  provided with the newly-added `ReceiverRequirements` type.
+
+## [0.7.0] - 2025-02-21
+
+### Added
+- `no-std` compatibility (`alloc` is required). A default-enabled `std` feature
+  flag has been added gating the `std::error::Error` usage.
+- `zcash_keys::keys::ReceiverRequirement`
+- `zcash_keys::Address::to_transparent_address`
+
+### Changed
+- MSRV is now 1.81.0.
+- Migrated to `bip32 =0.6.0-pre.1`, `nonempty 0.11`, `orchard 0.11`,
+  `sapling-crypto 0.5`, `zcash_encoding 0.3`, `zcash_protocol 0.5`,
+  `zcash_address 0.7`, `zcash_transparent 0.2`.
+- `zcash_keys::keys::UnifiedAddressRequest` has been substantially modified;
+  instead of a collection of boolean flags, it is now a collection of
+  `ReceiverRequirement` values that describe how addresses may be constructed
+  in the case that keys for a particular protocol are absent or it is not
+  possible to generate a specific receiver at a given diversifier index.
+  Behavior of methods that accept a `UnifiedAddressRequest` have been modified
+  accordingly. In addition, request construction methods that previously
+  returned `None` to indicate an attempt to generate an invalid request now
+  return `Err(())`
+
+### Removed
+- `zcash_keys::keys::UnifiedAddressRequest::all` (use
+  `UnifiedAddressRequest::ALLOW_ALL` or
+  `UnifiedFullViewingKey::to_address_request` instead)
+
+## [0.4.1, 0.5.1, 0.6.1] - 2025-05-09
+
+### Added
+- `zcash_keys::Address::to_transparent_address`
+
+## [0.6.0] - 2024-12-16
+
+### Changed
+- Migrated to `bech32 0.11`, `sapling-crypto 0.4`.
+- Added dependency on `zcash_transparent 0.1` to replace dependency
+  on `zcash_primitives`.
+- The `UnifiedAddressRequest` argument to the following methods is now optional:
+  - `zcash_keys::keys::UnifiedSpendingKey::address`
+  - `zcash_keys::keys::UnifiedSpendingKey::default_address`
+  - `zcash_keys::keys::UnifiedFullViewingKey::find_address`
+  - `zcash_keys::keys::UnifiedFullViewingKey::default_address`
+  - `zcash_keys::keys::UnifiedIncomingViewingKey::address`
+  - `zcash_keys::keys::UnifiedIncomingViewingKey::find_address`
+  - `zcash_keys::keys::UnifiedIncomingViewingKey::default_address`
+
+## [0.5.0] - 2024-11-14
+
+### Changed
+- Migrated to `zcash_primitives 0.20.0`
+- MSRV is now 1.77.0.
 
 ## [0.4.0] - 2024-10-04
 

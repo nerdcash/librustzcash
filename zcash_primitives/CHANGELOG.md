@@ -3,9 +3,224 @@ All notable changes to this library will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this library adheres to Rust's notion of
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Future releases are
+indicated by the `PLANNED` status in order to make it possible to correctly
+represent the transitive `semver` implications of changes within the enclosing
+workspace.
 
 ## [Unreleased]
+
+### Changed
+- MSRV is now 1.85.1.
+- Migrated to `orchard 0.12`, `sapling-crypto 0.6`.
+
+### Removed
+- `zcash_primitives::consensus` module (use `zcash_protocol::consensus` instead).
+- `zcash_primitives::constants` module (use `zcash_protocol::constants` instead).
+- `zcash_primitives::legacy` module (use the `zcash_transparent` crate instead).
+- `zcash_primitives::memo` module (use `zcash_protocol::memo` instead)
+- `zcash_primitives::transaction`:
+  - `components`:
+    - `amount::testing` module; use `zcash_protocol::value::testing` instead
+      with the following renames:
+      - `arb_positive_amount` to `zcash_protocol::value::testing::arb_positive_zat_balance`
+      - `arb_amount` to `zcash_protocol::value::testing::arb_zat_balance`
+      - `arb_nonnegative_amount` to `zcash_protocol::value::testing::arb_zatoshis`.
+    - `amount` module (use `zcash_protocol::value` instead).
+    - `transparent::builder` module (use `zcash_transparent::builder` instead).
+    - `transparent::pczt` module (use `zcash_transparent::pczt` instead).
+    - `transparent` module (use `zcash_transparent` instead).
+    - `Amount` (use `zcash_protocol::value::ZatBalance` instead).
+    - `Outpoint` (use `zcash_transparent::bundle::Outpoint` instead).
+    - `OutputDescription` (use `sapling_crypto::bundle::OutputDescription` instead).
+    - `SpendDescription` (use `sapling_crypto::bundle::SpendDescription` instead).
+    - `TxIn` (use `zcash_transparent::bundle::TxIn` instead).
+    - `TxOut` (use `zcash_transparent::bundle::TxOut` instead).
+  - `sighash`:
+    - `SIGHASH_ALL` (use `zcash_transparent::sighash::SIGHASH_ALL` instead).
+    - `SIGHASH_NONE` (use `zcash_transparent::sighash::SIGHASH_NONE` instead).
+    - `SIGHASH_SINGLE` (use `zcash_transparent::sighash::SIGHASH_SINGLE` instead).
+    - `SIGHASH_MASK` (use `zcash_transparent::sighash::SIGHASH_MASK` instead).
+    - `SIGHASH_ANYONECANPAY` (use `zcash_transparent::sighash::SIGHASH_ANYONECANPAY` instead).
+    - `SighashType` (use `zcash_transparent::sighash::SighashType` instead).
+- `zcash_primitives::zip32` module (use the `zip32` crate instead).
+
+## [0.26.1] - 2025-10-18
+
+### Fixed
+- Adjusted doc features to fix builds on docs.rs after nightly Rust update.
+
+## [0.26.0] - 2025-10-02
+
+### Added
+- `zcash_primitives::transaction::builder::Builder::add_transparent_p2sh_input`
+  (only for use in combination with `Builder::build_for_pczt`).
+
+### Changed
+- Migrated to `zcash_protocol 0.7`, `zcash_address 0.10`, `zcash_transparent 0.6`
+- `zcash_primitives::transaction::fees::zip317`:
+  - `FeeError::NonP2pkhInputs` has been renamed to `UnknownP2shInputs`.
+
+## [0.25.0] - 2025-09-25
+
+### Added
+- `zcash_primitives::transaction::builder::Builder::add_transparent_null_data_output`
+
+### Changed
+- Migrated to `zcash_transparent 0.5`.
+
+## [0.24.1] - 2025-09-09
+
+### Added
+- `zcash_primitives::transaction::tests::data` has been exposed under the
+  `test-dependencies` feature to provide access to test vectors.
+
+### Changed
+- This release provides pre-release support for some planned Network Upgrade 7
+  features under the `zcash_unstable=nu7` configuration flag. This
+  configuration flag guards SemVer-breaking changes that will appear in a
+  future `zcash_primitives` release.
+
+## [0.24.0] - 2025-07-31
+
+### Changed
+- Migrated to `zcash_protocol 0.6`, `zcash_address 0.9`, `zcash_transparent 0.4`
+- The type of `zcash_primitives::transaction::TransactionData::fee_paid` has
+  changed. The closure provided to this method for input retrieval can now
+  indicate that an input for the given outpoint is not available, and
+  `fee_paid` will return `Ok(None)` when this is the case. In addition, this
+  method now requires nonnegative input values be provided by the closure, and
+  will only return positive fee value; negative fee value will result in an
+  error instead of reporting a potentially invalid result.
+
+## [0.23.1] - 2025-07-16
+
+### Changed
+- Migrated to `zcash_protocol 0.5.4` to alleviate a type inference issue
+  observed by downstream users.
+
+## [0.23.0] - 2025-05-30
+
+### Changed
+- Migrated to `zcash_address 0.8`, `zcash_transparent 0.3`
+- Variants of `zcash_primitives::transaction::TxVersion` have changed. They
+  now represent explicit transaction versions, in order to avoid accidental
+  confusion with the names of the network upgrades that they were introduced
+  in.
+
+## [0.22.1] - 2025-07-18
+
+### Fixed
+- This fixes a potential build error caused by incautious use of `into()`,
+  where the addition of a `From` impl can cause resolution failure.
+
+## [0.22.0] - 2025-02-21
+
+### Changed
+- MSRV is now 1.81.0.
+- Migrated to `bip32 =0.6.0-pre.1`, `nonempty 0.11`, `secp256k1 0.29`,
+  `incrementalmerkletree 0.8`, `redjubjub 0.8`, `orchard 0.11`,
+  `sapling-crypto 0.5`, `zcash_encoding 0.3`, `zcash_protocol 0.5`,
+  `zcash_address 0.7`, `zcash_transparent 0.2`.
+
+### Deprecated
+- `zcash_primitives::consensus` (use `zcash_protocol::consensus` instead)
+- `zcash_primitives::constants` (use `zcash_protocol::constants` instead)
+- `zcash_primitives::memo` (use `zcash_protocol::memo` instead)
+- `zcash_primitives::zip32` (use the `zip32` crate instead)
+- `zcash_primitives::legacy` (use the `zcash_transparent` crate instead)
+- `zcash_primitives::transaction::components::Amount` (use `zcash_protocol::value::ZatBalance` instead)
+- `zcash_primitives::transaction::components::amount`:
+  - `BalanceError` (use `zcash_protocol::value::BalanceError` instead)
+  - `Amount` (use `zcash_protocol::value::ZatBalance` instead)
+  - `NonNegativeAmount` (use `zcash_protocol::value::Zatoshis` instead)
+  - `COIN` (use `zcash_protocol::value::COIN` instead)
+  - module `testing` (use `zcash_protocol::value::testing` instead)
+    - `arb_positive_amount` (use `zcash_protocol::value::testing::arb_positive_zat_balance` instead.)
+    - `arb_amount` (use `zcash_protocol::value::testing::arb_zat_balance` instead.)
+    - `arb_nonnegative_amount` (use `::zcash_protocol::value::testing::arb_zatoshis` instead.)
+
+### Removed
+- `zcash_primitives::transaction::sighash::TransparentAuthorizingContext` was
+  removed as there is no way to deprecate a previously-reexported trait name.
+  Use `zcash_transparent::sighash::TransparentAuthorizingContext` instead.
+
+## [0.21.0] - 2024-12-16
+
+### Added
+- `zcash_primitives::legacy::Script::address`
+- `zcash_primitives::transaction`
+  - `TransactionData::try_map_bundles`
+  - `builder::{PcztResult, PcztParts}`
+  - `builder::Builder::build_for_pczt`
+  - `components::transparent`:
+    - `pczt` module.
+    - `EffectsOnly`
+    - `impl MapAuth<Authorized, Authorized> for ()`
+    - `builder::TransparentSigningSet`
+  - `sighash::SighashType`
+
+### Changed
+- Migrated to `sapling-crypto` version `0.4`.
+- `zcash_primitives::transaction::components::transparent`:
+  - `builder::TransparentBuilder::add_input` now takes `secp256k1::PublicKey`
+    instead of `secp256k1::SecretKey`.
+  - `Bundle<Unauthorized>::apply_signatures` has had its arguments replaced with
+    a function providing the sighash calculation, and `&TransparentSigningSet`.
+  - `builder::Error` has a new variant `MissingSigningKey`.
+- `zcash_primitives::transaction::builder`:
+  - `Builder::add_orchard_spend` now takes `orchard::keys::FullViewingKey`
+    instead of `&orchard::keys::SpendingKey`.
+  - `Builder::add_sapling_spend` now takes `sapling::keys::FullViewingKey`
+    instead of `&sapling::zip32::ExtendedSpendingKey`.
+  - `Builder::add_transparent_input` now takes `secp256k1::PublicKey` instead of
+    `secp256k1::SecretKey`.
+  - `Builder::build` now takes several additional arguments:
+    - `&TransparentSigningSet`
+    - `&[sapling::zip32::ExtendedSpendingKey]`
+    - `&[orchard::keys::SpendAuthorizingKey]`
+- `zcash_primitives::transaction::sighash`:
+  - `SignableInput::Transparent` is now a wrapper around
+    `zcash_transparent::sighash::SignableInput`.
+
+## [0.19.1, 0.20.1] - 2025-05-09
+
+### Fixed
+- Migrated to `orchard 0.10.2` to fix a missing feature dependency.
+
+## [0.20.0] - 2024-11-14
+
+### Added
+- A new feature flag, `non-standard-fees`, has been added. This flag is now
+  required in order to make use of any types or methods that enable non-standard
+  fee calculation.
+
+### Changed
+- MSRV is now 1.77.0.
+- `zcash_primitives::transaction::fees`:
+  - The `fixed` module has been moved behind the `non-standard-fees` feature
+    flag. Using a fixed fee may result in a transaction that cannot be mined on
+    the current Zcash network. To calculate the ZIP 317 fee, use
+    `zip317::FeeRule::standard()`.
+  - `zip317::FeeRule::non_standard` has been moved behind the `non-standard-fees`
+    feature flag. Using a non-standard fee may result in a transaction that cannot
+    be mined on the current `Zcash` network.
+
+### Deprecated
+- `zcash_primitives::transaction::fees`:
+  - `StandardFeeRule` has been deprecated. It was never used within `zcash_primitives`
+    and should have been a member of `zcash_client_backend::fees` instead.
+
+### Removed
+- `zcash_primitives::transaction::fees`:
+  - `StandardFeeRule` itself has been removed; it was not used in this crate.
+    Its use in `zcash_client_backend` has been replaced with
+    `zcash_client_backend::fees::StandardFeeRule`.
+  - `fixed::FeeRule::standard`. This constructor was misleadingly named: using a
+    fixed fee does not conform to any current Zcash standard. To calculate the
+    ZIP 317 fee, use `zip317::FeeRule::standard()`. To preserve the current
+    behaviour, use `fixed::FeeRule::non_standard(zip317::MINIMUM_FEE)`,
+    but note that this is likely to result in transactions that cannot be mined.
 
 ## [0.19.0] - 2024-10-02
 

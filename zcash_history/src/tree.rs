@@ -27,7 +27,7 @@ pub struct Tree<V: Version> {
 
 impl<V: Version> Tree<V> {
     /// Resolve link originated from this tree
-    pub fn resolve_link(&self, link: EntryLink) -> Result<IndexedNode<V>, Error> {
+    pub fn resolve_link(&self, link: EntryLink) -> Result<IndexedNode<'_, V>, Error> {
         match link {
             EntryLink::Generated(index) => self.generated.get(index as usize),
             EntryLink::Stored(index) => self.stored.get(&index),
@@ -91,9 +91,9 @@ impl<V: Version> Tree<V> {
         result.stored_count = length;
 
         let mut root = EntryLink::Stored(peaks[0].0);
-        for (gen, (idx, node)) in peaks.into_iter().enumerate() {
+        for (r#gen, (idx, node)) in peaks.into_iter().enumerate() {
             result.stored.insert(idx, node);
-            if gen != 0 {
+            if r#gen != 0 {
                 let next_generated = combine_nodes(
                     result
                         .resolve_link(root)
@@ -245,7 +245,7 @@ impl<V: Version> Tree<V> {
             }
         }
 
-        let mut new_root = *peaks.get(0).expect("At lest 1 elements in peaks");
+        let mut new_root = *peaks.first().expect("At lest 1 elements in peaks");
 
         for next_peak in peaks.into_iter().skip(1) {
             new_root = self.push_generated(combine_nodes(
@@ -274,7 +274,7 @@ impl<V: Version> Tree<V> {
     }
 
     /// Reference to the root node.
-    pub fn root_node(&self) -> Result<IndexedNode<V>, Error> {
+    pub fn root_node(&self) -> Result<IndexedNode<'_, V>, Error> {
         self.resolve_link(self.root)
     }
 
@@ -291,7 +291,7 @@ pub struct IndexedNode<'a, V: Version> {
     link: EntryLink,
 }
 
-impl<'a, V: Version> IndexedNode<'a, V> {
+impl<V: Version> IndexedNode<'_, V> {
     fn left(&self) -> Result<EntryLink, Error> {
         self.node.left().map_err(|e| e.augment(self.link))
     }
@@ -326,7 +326,7 @@ fn combine_nodes<'a, V: Version>(left: IndexedNode<'a, V>, right: IndexedNode<'a
 #[cfg(test)]
 mod tests {
     use super::{Entry, EntryKind, EntryLink, Tree};
-    use crate::{node_data, NodeData, Version, V2};
+    use crate::{NodeData, V2, Version, node_data};
 
     use assert_matches::assert_matches;
     use proptest::prelude::*;

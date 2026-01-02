@@ -1,22 +1,21 @@
-use std::iter;
-
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ff::Field;
 use rand_core::OsRng;
 use sapling::{
-    self,
+    self, Diversifier, SaplingIvk,
     note_encryption::{
-        try_sapling_compact_note_decryption, try_sapling_note_decryption, CompactOutputDescription,
-        PreparedIncomingViewingKey, SaplingDomain,
+        CompactOutputDescription, PreparedIncomingViewingKey, SaplingDomain,
+        try_sapling_compact_note_decryption, try_sapling_note_decryption,
     },
     prover::mock::{MockOutputProver, MockSpendProver},
     value::NoteValue,
-    Diversifier, SaplingIvk,
 };
 use zcash_note_encryption::batch;
-use zcash_primitives::{
+use zcash_primitives::transaction::components::sapling::zip212_enforcement;
+use zcash_protocol::{
     consensus::{NetworkUpgrade::Canopy, Parameters, TEST_NETWORK},
-    transaction::components::{sapling::zip212_enforcement, Amount},
+    memo::Memo,
+    value::ZatBalance,
 };
 
 #[cfg(unix)]
@@ -43,10 +42,15 @@ fn bench_note_decryption(c: &mut Criterion) {
             sapling::Anchor::empty_tree(),
         );
         builder
-            .add_output(None, pa, NoteValue::from_raw(100), None)
+            .add_output(
+                None,
+                pa,
+                NoteValue::from_raw(100),
+                Memo::Empty.encode().into_bytes(),
+            )
             .unwrap();
         let (bundle, _) = builder
-            .build::<MockSpendProver, MockOutputProver, _, Amount>(&mut rng)
+            .build::<MockSpendProver, MockOutputProver, _, ZatBalance>(&[], &mut rng)
             .unwrap()
             .unwrap();
         bundle.shielded_outputs()[0].clone()
@@ -87,21 +91,19 @@ fn bench_note_decryption(c: &mut Criterion) {
         let mut group = c.benchmark_group("sapling-batch-note-decryption");
 
         for (nivks, noutputs) in [(1, 10), (10, 1), (10, 10), (50, 50)] {
-            let invalid_ivks: Vec<_> = iter::repeat(invalid_ivk.clone()).take(nivks).collect();
-            let valid_ivks: Vec<_> = iter::repeat(valid_ivk.clone()).take(nivks).collect();
+            let invalid_ivks: Vec<_> = std::iter::repeat_n(invalid_ivk.clone(), nivks).collect();
+            let valid_ivks: Vec<_> = std::iter::repeat_n(valid_ivk.clone(), nivks).collect();
 
-            let outputs: Vec<_> = iter::repeat(output.clone())
-                .take(noutputs)
+            let outputs: Vec<_> = std::iter::repeat_n(output.clone(), noutputs)
                 .map(|output| (SaplingDomain::new(zip212_enforcement), output))
                 .collect();
 
-            group.bench_function(
-                BenchmarkId::new(format!("valid-{}", nivks), noutputs),
-                |b| b.iter(|| batch::try_note_decryption(&valid_ivks, &outputs)),
-            );
+            group.bench_function(BenchmarkId::new(format!("valid-{nivks}"), noutputs), |b| {
+                b.iter(|| batch::try_note_decryption(&valid_ivks, &outputs))
+            });
 
             group.bench_function(
-                BenchmarkId::new(format!("invalid-{}", nivks), noutputs),
+                BenchmarkId::new(format!("invalid-{nivks}"), noutputs),
                 |b| b.iter(|| batch::try_note_decryption(&invalid_ivks, &outputs)),
             );
 
@@ -111,12 +113,12 @@ fn bench_note_decryption(c: &mut Criterion) {
                 .collect();
 
             group.bench_function(
-                BenchmarkId::new(format!("compact-valid-{}", nivks), noutputs),
+                BenchmarkId::new(format!("compact-valid-{nivks}"), noutputs),
                 |b| b.iter(|| batch::try_compact_note_decryption(&valid_ivks, &compact)),
             );
 
             group.bench_function(
-                BenchmarkId::new(format!("compact-invalid-{}", nivks), noutputs),
+                BenchmarkId::new(format!("compact-invalid-{nivks}"), noutputs),
                 |b| b.iter(|| batch::try_compact_note_decryption(&invalid_ivks, &compact)),
             );
         }

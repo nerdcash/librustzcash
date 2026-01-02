@@ -1,10 +1,9 @@
 //! A migration that adds an identifier for the account that received a UTXO to the utxos table
-use rusqlite;
-use schemer;
-use schemer_rusqlite::RusqliteMigration;
+
+use schemerz_rusqlite::RusqliteMigration;
 use std::collections::HashSet;
 use uuid::Uuid;
-use zcash_primitives::consensus;
+use zcash_protocol::consensus;
 
 use super::{addresses_table, utxos_table};
 use crate::wallet::init::WalletMigrationError;
@@ -12,17 +11,15 @@ use crate::wallet::init::WalletMigrationError;
 #[cfg(feature = "transparent-inputs")]
 use {
     crate::error::SqliteClientError,
-    rusqlite::{named_params, OptionalExtension},
-    std::collections::HashMap,
-    zcash_client_backend::{
-        encoding::AddressCodec, keys::UnifiedFullViewingKey, wallet::TransparentAddressMetadata,
-    },
-    zcash_keys::address::Address,
-    zcash_primitives::legacy::{
+    ::transparent::{
+        address::TransparentAddress,
         keys::{IncomingViewingKey, NonHardenedChildIndex},
-        TransparentAddress,
     },
-    zip32::{AccountId, DiversifierIndex, Scope},
+    rusqlite::{OptionalExtension, named_params},
+    std::collections::HashMap,
+    zcash_client_backend::wallet::TransparentAddressMetadata,
+    zcash_keys::{address::Address, encoding::AddressCodec, keys::UnifiedFullViewingKey},
+    zip32::{AccountId, Scope},
 };
 
 /// This migration adds an account identifier column to the UTXOs table.
@@ -34,7 +31,7 @@ pub(super) struct Migration<P> {
     pub(super) _params: P,
 }
 
-impl<P> schemer::Migration for Migration<P> {
+impl<P> schemerz::Migration<Uuid> for Migration<P> {
     fn id(&self) -> Uuid {
         MIGRATION_ID
     }
@@ -76,8 +73,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                             WalletMigrationError::CorruptedData(s)
                         }
                         other => WalletMigrationError::CorruptedData(format!(
-                            "Unexpected error in migration: {}",
-                            other
+                            "Unexpected error in migration: {other}"
                         )),
                     })?;
 
@@ -135,6 +131,11 @@ fn get_transparent_receivers<P: consensus::Parameters>(
     params: &P,
     account: AccountId,
 ) -> Result<HashMap<TransparentAddress, Option<TransparentAddressMetadata>>, SqliteClientError> {
+    use transparent::keys::TransparentKeyScope;
+    use zcash_client_backend::wallet::Exposure;
+
+    use crate::wallet::encoding::decode_diversifier_index_be;
+
     let mut ret: HashMap<TransparentAddress, Option<TransparentAddressMetadata>> = HashMap::new();
 
     // Get all UAs derived
@@ -144,11 +145,12 @@ fn get_transparent_receivers<P: consensus::Parameters>(
 
     while let Some(row) = rows.next()? {
         let ua_str: String = row.get(0)?;
-        let di_vec: Vec<u8> = row.get(1)?;
-        let mut di: [u8; 11] = di_vec.try_into().map_err(|_| {
-            SqliteClientError::CorruptedData("Diversifier index is not an 11-byte value".to_owned())
+        let di = decode_diversifier_index_be(row.get(1)?)?.ok_or_else(|| {
+            SqliteClientError::CorruptedData(
+                "Only derived (not imported) addresses are supported as of this migration."
+                    .to_owned(),
+            )
         })?;
-        di.reverse(); // BE -> LE conversion
 
         let ua = Address::decode(params, &ua_str)
             .ok_or_else(|| {
@@ -157,19 +159,16 @@ fn get_transparent_receivers<P: consensus::Parameters>(
             .and_then(|addr| match addr {
                 Address::Unified(ua) => Ok(ua),
                 _ => Err(SqliteClientError::CorruptedData(format!(
-                    "Addresses table contains {} which is not a unified address",
-                    ua_str,
+                    "Addresses table contains {ua_str} which is not a unified address",
                 ))),
             })?;
 
         if let Some(taddr) = ua.transparent() {
-            let index = NonHardenedChildIndex::from_index(
-                DiversifierIndex::from(di).try_into().map_err(|_| {
-                    SqliteClientError::CorruptedData(
-                        "Unable to get diversifier for transparent address.".to_owned(),
-                    )
-                })?,
-            )
+            let index = NonHardenedChildIndex::from_index(u32::try_from(di).map_err(|_| {
+                SqliteClientError::CorruptedData(
+                    "Unable to get diversifier for transparent address.".to_owned(),
+                )
+            })?)
             .ok_or_else(|| {
                 SqliteClientError::CorruptedData(
                     "Unexpected hardened index for transparent address.".to_owned(),
@@ -178,9 +177,11 @@ fn get_transparent_receivers<P: consensus::Parameters>(
 
             ret.insert(
                 *taddr,
-                Some(TransparentAddressMetadata::new(
-                    Scope::External.into(),
+                Some(TransparentAddressMetadata::derived(
+                    TransparentKeyScope::from(Scope::External),
                     index,
+                    Exposure::Unknown,
+                    None,
                 )),
             );
         }
@@ -189,9 +190,11 @@ fn get_transparent_receivers<P: consensus::Parameters>(
     if let Some((taddr, address_index)) = get_legacy_transparent_address(params, conn, account)? {
         ret.insert(
             taddr,
-            Some(TransparentAddressMetadata::new(
-                Scope::External.into(),
+            Some(TransparentAddressMetadata::derived(
+                TransparentKeyScope::from(Scope::External),
                 address_index,
+                Exposure::Unknown,
+                None,
             )),
         );
     }

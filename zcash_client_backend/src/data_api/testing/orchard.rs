@@ -15,17 +15,19 @@ use zcash_keys::{
 use zcash_note_encryption::try_output_recovery_with_ovk;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
+    ShieldedProtocol,
     consensus::{self, BlockHeight},
     memo::MemoBytes,
     value::Zatoshis,
-    ShieldedProtocol,
 };
 
 use crate::{
     data_api::{
+        DecryptedTransaction, InputSource, TargetValue, WalletCommitmentTrees, WalletSummary,
+        WalletTest,
         chain::{CommitmentTreeRoot, ScanSummary},
-        testing::{pool::ShieldedPoolTester, TestState},
-        DecryptedTransaction, InputSource, WalletCommitmentTrees, WalletSummary, WalletTest,
+        testing::{TestState, pool::ShieldedPoolTester},
+        wallet::{ConfirmationsPolicy, TargetHeight},
     },
     wallet::{Note, ReceivedNote},
 };
@@ -104,11 +106,16 @@ impl ShieldedPoolTester for OrchardPoolTester {
         s.next_orchard_subtree_index()
     }
 
+    fn note_value(note: &Self::Note) -> Zatoshis {
+        Zatoshis::const_from_u64(note.value().inner())
+    }
+
     fn select_spendable_notes<Cache, DbT: InputSource + WalletTest, P>(
         st: &TestState<Cache, DbT, P>,
         account: <DbT as InputSource>::AccountId,
-        target_value: Zatoshis,
-        anchor_height: BlockHeight,
+        target_value: TargetValue,
+        target_height: TargetHeight,
+        confirmations_policy: ConfirmationsPolicy,
         exclude: &[DbT::NoteRef],
     ) -> Result<Vec<ReceivedNote<DbT::NoteRef, Self::Note>>, <DbT as InputSource>::Error> {
         st.wallet()
@@ -116,7 +123,24 @@ impl ShieldedPoolTester for OrchardPoolTester {
                 account,
                 target_value,
                 &[ShieldedProtocol::Orchard],
-                anchor_height,
+                target_height,
+                confirmations_policy,
+                exclude,
+            )
+            .map(|n| n.take_orchard())
+    }
+
+    fn select_unspent_notes<Cache, DbT: InputSource + WalletTest, P>(
+        st: &TestState<Cache, DbT, P>,
+        account: <DbT as InputSource>::AccountId,
+        target_height: TargetHeight,
+        exclude: &[DbT::NoteRef],
+    ) -> Result<Vec<ReceivedNote<DbT::NoteRef, Self::Note>>, <DbT as InputSource>::Error> {
+        st.wallet()
+            .select_unspent_notes(
+                account,
+                &[ShieldedProtocol::Orchard],
+                target_height,
                 exclude,
             )
             .map(|n| n.take_orchard())
@@ -169,5 +193,40 @@ impl ShieldedPoolTester for OrchardPoolTester {
 
     fn received_note_count(summary: &ScanSummary) -> usize {
         summary.received_orchard_note_count()
+    }
+
+    #[cfg(feature = "pczt")]
+    fn add_proof_generation_keys(
+        pczt: pczt::Pczt,
+        _: &UnifiedSpendingKey,
+    ) -> Result<pczt::Pczt, pczt::roles::updater::SaplingError> {
+        // No-op; Orchard doesn't have proof generation keys.
+        Ok(pczt)
+    }
+
+    #[cfg(feature = "pczt")]
+    fn apply_signatures_to_pczt(
+        signer: &mut pczt::roles::signer::Signer,
+        usk: &UnifiedSpendingKey,
+    ) -> Result<(), pczt::roles::signer::Error> {
+        let sk = Self::usk_to_sk(usk);
+        let ask = orchard::keys::SpendAuthorizingKey::from(sk);
+
+        // Figuring out which one is for us is hard. Let's just try signing all of them!
+        for index in 0.. {
+            match signer.sign_orchard(index, &ask) {
+                // Loop termination.
+                Err(pczt::roles::signer::Error::InvalidIndex) => break,
+                // Ignore any errors due to using the wrong key.
+                Ok(())
+                | Err(pczt::roles::signer::Error::OrchardSign(
+                    orchard::pczt::SignerError::WrongSpendAuthorizingKey,
+                )) => Ok(()),
+                // Raise any unexpected errors.
+                Err(e) => Err(e),
+            }?;
+        }
+
+        Ok(())
     }
 }

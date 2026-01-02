@@ -4,11 +4,11 @@
 //! for working with Zcash.
 //!
 //! ## Feature flags
-#![doc = document_features::document_features!()]
+#![cfg_attr(feature = "std", doc = document_features::document_features!())]
 //!
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, doc(auto_cfg))]
 // Catch documentation errors caused by code changes.
 #![deny(rustdoc::broken_intra_doc_links)]
 // Temporary until we have addressed all Result<T, ()> cases.
@@ -16,15 +16,17 @@
 // Present to reduce refactoring noise from changing all the imports inside this crate for
 // the `sapling` crate extraction.
 #![allow(clippy::single_component_path_imports)]
+#![no_std]
+
+#[cfg(feature = "std")]
+extern crate std;
+
+#[macro_use]
+extern crate alloc;
 
 pub mod block;
-pub use zcash_protocol::consensus;
-pub use zcash_protocol::constants;
-pub mod legacy;
-pub use zcash_protocol::memo;
-pub mod merkle_tree;
-use sapling;
-pub mod transaction;
-pub use zip32;
+pub(crate) mod encoding;
 #[cfg(zcash_unstable = "zfuture")]
 pub mod extensions;
+pub mod merkle_tree;
+pub mod transaction;

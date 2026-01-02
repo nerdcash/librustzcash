@@ -3,9 +3,579 @@ All notable changes to this library will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this library adheres to Rust's notion of
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Future releases are
+indicated by the `PLANNED` status in order to make it possible to correctly
+represent the transitive `semver` implications of changes within the enclosing
+workspace.
 
 ## [Unreleased]
+
+### Changed
+- Migrated to `orchard 0.12`, `sapling-crypto 0.6`.
+- `zcash_client_backend::wallet::OvkPolicy` has been substantially modified
+  to reflect the view that a single outgoing viewing key should be uniformly
+  applied to encrypt all external transaction outputs, irrespective of which
+  pool those outputs are produced into, and that by default wallet-internal
+  outputs should not be decryptable using an OVK (and will therefore only
+  be recoverable using the wallet's internal IVK).
+  - The semantics of `OvkPolicy::Sender` have changed. In addition to using
+    a single OVK for all shielded outputs irrespective of pools, it now
+    specifies that wallet-internal change outputs should be treated as though
+    the policy for those outputs were `OvkPolicy::None`, rendering them only
+    recoverable using the wallet's internal IVK. 
+  - The `OvkPolicy::Custom` variant has changed. Instead of pool-specific
+    OVKs, this now encapsulates a pair of OVKs, one to be used for all
+    shielded external outputs of the transaction, and a second (optional)
+    key that will be used to encrypt any wallet-internal change outputs
+    that would otherwise only be recoverable using the wallet's internal
+    IVK.
+
+## [0.21.0] - 2025-11-05
+
+### Added
+- `zcash_client_backend::data_api::WalletUtxo`
+- `zcash_client_backend::tor::http::cryptex`:
+    - `exchanges::{CoinEx, DigiFinex, Kraken, Xt}`
+- `zcash_client_backend::wallet`:
+  - `Exposure, GapMetadata`
+  - `TransparentAddressSource`
+  - `TransparentAddressMetadata` methods:
+    - `derived`
+    - `standalone`
+    - `exposure`
+    - `next_check_time`
+    - `with_exposure_at`
+
+### Changed
+- MSRV is now 1.85.1.
+- Migrated to `zcash_protocol 0.7`, `zcash_address 0.10`, `zip321 0.6`,
+  `zcash_transparent 0.6`, `zcash_primitives 0.26`, `zcash_proofs 0.26`,
+  `pczt 0.5`, `arti-client 0.35`, `fs-mistrust 0.12`, `tonic 0.14`.
+- The wallet no longer restricts the caller from constructing payments to
+  explicit ephemeral transparent addresses, in order to allow for gap limit
+  management operations to be performed by the wallet application. If it is
+  desired to maintain the previous policy of excluding explicit payments to
+  ephemeral addresses, call `WalletRead::get_transparent_address_metadata` on
+  the address and check whether its `scope` is `TransparentKeyScope::EPHEMERAL`
+  if it is `TransparentAddressMetadata::Derived`.
+- `zcash_client_backend::data_api`:
+  - Changes to the `InputSource` trait:
+    - `InputSource::{get_spendable_note, get_account_metadata, get_unspent_transparent_output}`
+      each now take an additional `target_height` argument; spendability isn't a
+      well-defined property in absence of target height information.
+    - The result types of `InputSource::get_unspent_transparent_output` and
+      `InputSource::get_unspent_transparent_outputs` have each changed; instead
+      of returning bare `WalletTransparentOutput`s, these now return `WalletUtxo`
+      values that include the `WalletTransparentOutput` data along with additional
+      derivation metadata.
+  - Changes to the `WalletRead` trait:
+    - Added `WalletRead::get_ephemeral_transparent_receivers` method.
+    - The result type of `WalletRead::get_transparent_receivers` has changed.
+      The value type of the returned `HashMap` is now non-optional.
+    - The result type of `WalletRead::get_transparent_balances` has changed. The
+      key scope for the address must now be returned along with the balance. The
+      semantics of this method have been changed such that it may now return
+      balance received by ephemeral addresses.
+    - Removed `WalletRead::get_known_ephemeral_addresses` and
+      `WalletRead::find_account_for_ephemeral_address`; they were previously
+      only used in tests and are not well-designed for wallet use. Use the new
+      `WalletTest` methods instead in tests.
+    - The inefficient default impl for `WalletRead::get_transparent_address_metadata`
+      has been removed. Implementers of `WalletRead` must provide their own
+      implementation.
+  - Changes to the `WalletWrite` trait:
+    - Added `WalletWrite::delete_account` method.
+    - Added `WalletWrite::schedule_next_check` method.
+    - Added `WalletWrite::set_tx_trust` method.
+  - Changes to the `WalletTest` trait:
+    - Added `WalletTest::get_known_ephemeral_addresses` method.
+    - Added `WalletTest::find_account_for_ephemeral_address` method.
+    - `WalletTest::get_transparent_output` now takes an `Option<TargetHeight>`
+      instead of an `allow_unspendable` flag. See the method documentation for
+      details.
+  - Changes to the `error::Error` enum:
+    - Removed the `PaysEphemeralTransparentAddress` variant.
+  - Changes to the `testing::TestFvk` trait:
+    - Added `OutgoingViewingKey` associated type.
+    - Changed `add_output` and `add_logical_action` methods to take an explicit
+      `sender_ovk` argument.
+    - Removed `sapling_fvk` and `orchard_fvk` methods.
+    - Added `to_ovk` and `to_ovk_bytes` methods.
+  - Changes to the `testing::pool::ShieldedPoolTester` trait:
+    - Added `note_value` method.
+    - Added `select_unspent_notes` method.
+- `zcash_client_backend::fees::ChangeStrategy::fetch_wallet_meta` now takes
+  an additional `target_height` argument.
+- Changes to the `zcash_client_backend::proposal::ProposalError` enum:
+  - Added `EphemeralAddressLinkability` variant, to represent the case where a
+    caller attempts to construct a shielding transaction that would link an
+    ephemeral address to any other transparent address in the wallet on-chain.
+- `zcash_client_backend::wallet`:
+  - `TransparentAddressMetadata` has been converted from an enum to a struct
+    that contains both source metadata and information about when the address
+    was exposed by the wallet. The derivation information that this type
+    previously provided is now provided by `TranparentAddressSource`. As a
+    consequence of this change, the signature of
+    `TransparentAddressMetadata::new` has changed; use
+    `TransparentAddressMetadata::derived` instead.
+- `zcash_client_backend::testing`:
+  - `DataStoreFactory::new_data_store` now takes its `GapLimits` argument
+    as an optional value. This avoids the need for the test builder to
+    hardcode a set of gap limits that might inadvertently conflict
+    with defaults provided by a particular backend.
+
+### Removed
+- `zcash_client_backend::tor::http::cryptex::exchanges::GateIo`
+
+## [0.20.0] - 2025-09-25
+
+### Added
+- `zcash_client_backend::data_api`:
+  - `AccountBalance::uneconomic_value`
+  - `AccountBirthday::{from_parts, prior_chain_state}`
+  - `AddressSource`
+  - `AddressInfo::source` replaces `AddressInfo::diversifier_index`
+  - `Balance::uneconomic_value`
+  - `MaxSpendMode`
+  - `ReceivedNotes` (replaces `SpendableNotes` globally)
+  - `TransactionsInvolvingAddress`
+  - `TransactionDataRequest::transactions_involving_address`
+  - `wallet::ConfirmationsPolicy`
+  - `wallet::SpendingKeys`
+  - `wallet::TargetHeight`
+  - `wallet::propose_send_max_transfer`: Selects transaction inputs, computes fees, and
+    constructs a proposal for a transaction (or series of them) that would spend all
+    the available funds from the given spend pools.
+  - `ProposeSendMaxErrT` (type alias)
+- `zcash_client_backend::fees`:
+  - `impl sapling::OutputView for Zatoshis`
+  - `impl orchard::OutputView for Zatoshis`
+- `zcash_client_backend::wallet::ReceivedNote::mined_height`
+- A `zcashd-compat` feature flag has been added in service of being able to
+  import data from the zcashd `wallet.dat` format. It enables functionality
+  needed in order to represent the nonstandard derivations for keys and
+  addresses produced by the embedded `zcashd` wallet as part of the `zcashd
+  v4.7.0` migration to permit use of a mnemonic seed for wallet backup.
+  The following additions are guarded by this feature flag:
+  - `zcash_client_backend::data_api::Zip32Derivation::legacy_address_index`
+- `impl Add<Balance> for zcash_client_backend::data_api::Balance`
+- `impl Hash for zcash_client_backend::wallet::NoteId`
+- `impl {PartialEq, Eq}` for:
+  - `zcash_client_backend::data_api::TransactionStatus`
+  - `zcash_client_backend::data_api::AccountBirthday`
+  - `zcash_client_backend::data_api::chain::ChainState`
+  - `zcash_client_backend::wallet::Recipient`
+- `impl Clone` for:
+  - `zcash_client_backend::wallet::{WalletTx, WalletSpend, WalletOutput}`
+- A new `transparent-key-import` feature flag has been added, and introduces
+  functionality that allows arbitrary transparent pubkeys to be imported to
+  the wallet and associated with an account. These features are introduced
+  primarily in the interest of providing compatibility with legacy `zcashd`
+  wallets; users of these APIs must ensure that when importing keys to a
+  spending account that they control the spending key corresponding to each
+  imported pubkey.
+
+### Changed
+- Migrated to `zcash_protocol 0.6.2`, `zcash_address 0.9`, `zip321 0.5`,
+  `zcash_transparent 0.5`, `zcash_primitives 0.25`, `zcash_proofs 0.25`,
+  `pczt 0.4`, `zcash_keys 0.11`.
+- `zcash_client_backend::data_api`:
+  - `WalletWrite` has added method `notify_address_checked` when the
+    `transparent-inputs` feature flag is enabled.
+  - The `TransactionDataRequest::TransactionsInvolvingAddress` variant is no
+    longer structured, but takes a `TransactionsInvolvingAddress` struct value
+    as its payload. This permits the `TransactionsInvolvingAddress` type
+    to be used independent of the rest of the `TransactionDataRequest` variants.
+  - `WalletRead::get_derived_account` now takes a `Zip32Derivation` value
+    as its argument instead of its parts. This minimizes the API complexity
+    that would otherwise arise due to the presence of the `zcashd-compat`
+    feature flag.
+  - `InputSource` has added method `select_unspent_notes`.
+  - The following methods now take `TargetHeight` and `ConfirmationsPolicy`
+    arguments instead of an anchor height:
+    - `InputSource::select_spendable_notes`
+    - `wallet::input_selection::InputSelector::propose_transaction`
+    The signatures of `wallet::propose_transfer` and
+    `wallet::propose_standard_transfer_to_address` have also been modified to
+    take these changes into account, as have the signatures of the
+    `test-dependencies`-flagged methods
+    `testing::TestState::{spend, propose_transfer, propose_standard_transfer}`.
+  - The following methods now use `TargetHeight` instead of `BlockHeight` in
+    their arguments and return values:
+    - `InputSource::get_spendable_transparent_outputs`
+    - `WalletRead::get_target_and_anchor_heights`
+    - `wallet::input_selection::ShieldingSelector::propose_shielding`
+    Related `test-dependencies`-flagged methods on `testing::TestState` have
+    also been changed accordingly.
+  - The following methods now take a `ConfirmationsPolicy` instead of a `u32`
+    `min_confirmations` argument:
+    - `InputSource::get_spendable_transparent_outputs`
+    - `WalletRead::get_wallet_summary`
+    - `wallet::propose_shielding`
+    - `wallet::shield_transparent_funds`
+    - `wallet::input_selection::ShieldingSelector::propose_shielding`
+  - `WalletRead::get_transparent_balances` now retrieves the balance in terms of
+    a target height and confirmations policy.
+  - The semantics of `Balance::total` and `AccountBalance::total` have changed;
+    these totals no longer include value that is uneconomic to spend ("dust").
+  - `WalletRead::get_transparent_receivers` now takes an additional
+    `include_standalone` argument, which can be used to indicate that
+    standalone (imported) transparent addresses should be included in the
+    result.
+  - `Zip32Derivation::new` arguments have changed when the `zcashd-compat`
+    feature is enabled; in this circumstance, `new` takes an additional
+    `legacy_address_index` argument.
+  - Arguments to `SentTransaction::new` have changed; it now takes a
+    `TargetHeight` instead of a `BlockHeight` for its `target_height` argument,
+    and the `SentTransaction::target_height` accessor now returns a
+    `TargetHeight`.
+  - `TargetValue` has a new `AllFunds(MaxSpendMode)` variant to choose whether
+    to consider "All" funds being the `MaxSpendable` amount that it is
+    currently in the wallet (there could be pending funds or wallet could be
+    unsynced) or if "All" means `Everything` where the presence of unconfirmed
+    funds or pending shards to be scanned would trigger an error.
+  - `zcash_client_backend::proposal::ProposalError` has added variant:
+    - `Zip321(Zip321Error)`
+  - `WalletTest` (available only under the `test-dependencies` feature) has
+    added method `finally`
+  - The following methods have had their default (or absent) implementations
+    replaced by invocations of the `unimplemented!()` macro, so that
+    applications that inadvertently use these default impls will panic instead
+    of returning incorrect results and so that transitively enabling a feature
+    flag of an upstream dependency does not result in an unbuildable state.
+    - `InputSource::get_unspent_transparent_output`
+    - `InputSource::get_spendable_transparent_outputs`
+    - `WalletRead::get_orchard_nullifiers`
+    - `WalletRead::get_transparent_receivers`
+    - `WalletRead::get_transparent_balances`
+    - `WalletRead::utxo_query_height`
+    - `WalletRead::get_known_ephemeral_addresses`
+    - `WalletRead::get_transparent_output`
+    - `WalletWrite::reserve_next_n_ephemeral_addresses`
+    - `WalletWrite::notify_address_checked`
+- `zcash_client_backend::fees`:
+  - Arguments to `ChangeStrategy::compute_balance` have changed; it now takes
+    a `TargetHeight` instead of a `BlockHeight`. Also, the type of the
+    `ephemeral_balance` argument has changed slightly.
+  - The associated error type `ChangeStrategy::Error` is now additionally
+    bounded on `From<(Self::FeeRule as FeeRule>::Error>`.
+- `zcash_client_backend::proposal`:
+  - Arguments to `Proposal::{single_step, multi_step}` have changed; it now takes
+    a `TargetHeight` instead of a `BlockHeight`.
+  - `Proposal::min_target_height` now returns `TargetHeight` instead of `BlockHeight`
+- `zcash_client_backend::wallet::ReceivedNote::from_parts` takes an additional
+  `mined_height` argument.
+  - `AddressInfo::from_parts` now takes an `AddressSource` value instead
+    of a `DiversifierIndex`.
+  - `WalletWrite` has added method `import_standalone_transparent_pubkey`
+    when the `transparent-key-import` feature flag is enabled.
+- The following `zcash_client_backend::data_api::wallet` methods have changed;
+  they now each take a `SpendingKeys` value instead of a `UnifiedSpendingKey`.
+  This permits the spending of funds controlled by standalone keys not
+  derived from the root spending authority of the account; this is useful in
+  cases where the account represents a "bucket of funds", such as in the case
+  of imported standalone spending keys or legacy `zcash` transparent keys
+  that were derived from system randomness.
+  - `create_proposed_transactions`
+  - `shield_transparent_funds`
+- `zcash_client_backend::wallet::TransparentAddressMetadata` is now an
+  enum instead of a struct. This change enables it to represent either
+  metadata for a derived address or a standalone secp256k1 pubkey. Call
+  sites that previously used `TransparentAddressMetadata` will now use
+  the `TransparentAddressMetadata::Derived` variant.
+- `zcash_client_backend::wallet::TransparentAddressMetadata::scope` now
+  returns `Option<TransparentKeyScope>` instead of `TransparentKeyScope`.
+- `zcash_client_backend::wallet::TransparentAddressMetadata::address_index`
+  now returns `Option<NonHardenedChildIndex>` instead of `NonHardenedChildIndex`.
+
+### Removed
+- `zcash_client_backend::data_api`:
+  - `AddressInfo::diversifier_index` (use `AddressInfo::source` instead)
+  - `SpendableNotes` (renamed to `ReceivedNotes`)
+
+## [0.18.1, 0.19.1] - 2025-07-19
+
+### Changed
+- The signature of `zcash_client_backend::data_api::testing::TestState::create_proposed_transaction`
+  has been modified to allow transactions to be created from shielding
+  proposals; this API was previously overconstrained. This only affects users
+  of the `test-dependencies` feature.
+- Documentation of the `test-dependencies` feature has been updated to indicate
+  that breaking changes to the APIs exposed by this feature flag may appear
+  in any release version of this crate, including patch releases.
+
+## [0.19.0] - 2025-05-30
+
+### Added
+- `zcash_client_backend::data_api`:
+  - `TargetValue`: An intent of representing spendable value to reach a certain
+    targeted amount.
+- `zcash_client_backend::proto::service`:
+  - `LightdInfo.donation_address` field.
+  - Helper methods for parsing `LightdInfo` fields:
+    - `LightdInfo::chain_name`
+    - `LightdInfo::sapling_activation_height`
+    - `LightdInfo::consensus_branch_id`
+    - `LightdInfo::block_height`
+    - `LightdInfo::estimated_height`
+    - `LightdInfo::donation_address`
+- `zcash_client_backend::tor`:
+  - `http::Retry`
+  - `Client::http_get`
+  - `Client::http_get_json`
+  - `Client::http_post`
+  - `Client::set_dormant`
+  - `DormantMode`
+
+### Changed
+- Migrated to `arti-client 0.28`, `dynosaur 0.2`, `tonic 0.13`, `zcash_address 0.8`,
+  `zip321 0.4`, `zcash_transparent 0.3`, `zcash_primitives 0.23`,
+  `zcash_proofs 0.23`, `zcash_keys 0.9`, `pczt 0.3`
+- `zcash_client_backend::data_api`:
+  - `select_spendable_notes`: parameter `target_value` now is a `TargetValue`.
+    Existing calls to this function that used `Zatoshis` now use
+    `TargetValue::AtLeast(Zatoshis)`
+- `zcash_client_backend::tor`:
+  - `Client::{connect_to_lightwalletd, get_latest_zec_to_usd_rate}` now ensure
+    that the inner Tor client is ready for traffic, and re-bootstrap it if
+    necessary.
+  - The exchanges in `http::cryptex::exchanges` will now retry queries once on
+    failure, and will use isolated circuits for the retry if the error looks
+    like a blocked Tor exit node.
+
+## [0.18.0] - 2025-03-19
+
+### Added
+- `zcash_client_backend::data_api`:
+  - `AddressInfo`
+- `zcash_client_backend::data_api::testing`:
+  - `struct transparent::GapLimits`
+  - `transparent::gap_limits` high-level test for gap limit handling
+- `zcash_client_backend::data_api::{TransactionStatusFilter, OutputStatusFilter}`
+
+### Changed
+- Updated to `zcash_keys 0.8`
+- `zcash_client_backend::data_api::WalletRead`:
+  - `get_transparent_receivers` now takes additional `include_change` and
+    `include_ephemeral` arguments.
+  - `get_known_ephemeral_addresses` now takes a
+    `Range<zcash_transparent::keys::NonHardenedChildIndex>` as its argument
+    instead of a `Range<u32>`
+  - Has added method `utxo_query_height` when the `transparent-inputs` feature
+    flag is active.
+  - has removed method `get_current_address`. It has been replaced by
+    added method `WalletRead::get_last_generated_address_matching`
+  - Has added method `list_addresses`.
+- `zcash_client_backend::data_api::WalletWrite`:
+  - has added method `get_address_for_index`. Please note the WARNINGS section
+    in the documentation for use of this method.
+  - `get_next_available_address` now returns the diversifier index at which the
+    address was generated in addition to the address. In addition, the
+    `UnifiedAddressRequest` argument is now non-optional; use
+    `UnifiedAddressRequest::AllAvailableKeys` to indicate that all available
+    keys should be used to generate receivers instead of `None`.
+  - Arguments to `get_address_for_index` have changed: the
+    `UnifiedAddressRequest` argument is now non-optional; use
+    `UnifiedAddressRequest::AllAvailableKeys` to indicate that all available
+    keys should be used to generate receivers instead of `None`.
+  - `TransactionDataRequest::SpendsFromAddress` has been renamed to
+    `TransactionDataRequest::TransactionsInvolvingAddress` and has added struct
+    fields `request_at`, `tx_status_filter`, and `output_status_filter`.
+- Arguments to `zcash_client_backend::decrypt::decrypt_transaction` have changed.
+  It now takes separate `mined_height` and `chain_tip_height` parameters; this
+  fixes https://github.com/zcash/librustzcash/issues/1746 as described in the
+  `Fixed` section below.
+
+### Removed
+- `zcash_client_backend::data_api::GAP_LIMIT` gap limits are now configured
+  based upon the key scope that they're associated with; there is no longer a
+  globally applicable gap limit.
+
+### Fixed
+- This release fixes https://github.com/zcash/librustzcash/issues/1746, which
+  made it possible for `zcash_client_backend::decrypt_and_store_transaction`
+  to incorrectly set a `mined_height` value for a mempool transaction.
+
+## [0.17.0] - 2025-02-21
+
+### Added
+- `zcash_client_backend::data_api::testing::TransactionSummary` has added
+  accessor methods `total_spent` and `total_received`.
+
+### Changed
+- MSRV is now 1.81.0.
+- Migrated to `bip32 =0.6.0-pre.1`, `nonempty 0.11`, `incrementalmerkletree 0.8`,
+  `shardtree 0.6`, `orchard 0.11`, `pczt 0.2`, `sapling-crypto 0.5`, `zcash_encoding 0.3`,
+  `zcash_protocol 0.5`, `zcash_address 0.7`, `zip321 0.3`, `zcash_transparent 0.2`,
+  `zcash_primitives 0.22`, `zcash_proofs 0.22`, `zcash_keys 0.7`.
+- `zcash_client_backend::tor`:
+  - `tor::Client::create` now takes a `with_permissions` argument for configuring
+    `fs_mistrust::Mistrust`. If you don't need to configure it, pass `|_| ()`
+    (the empty closure).
+- `zcash_client_backend::wallet::Recipient` has changed:
+  - The `Recipient::External` variant is now a structured variant.
+  - The `Recipient::EphemeralTransparent` variant is now only available if
+    `zcash_client_backend` is built using the `transparent-inputs` feature flag.
+  - The `N` and `O` type pararameters to this type have been replaced by
+    concrete uses of `Box<Note>` and `Outpoint` instead. The
+    `map_internal_account_note` and `map_ephemeral_transparent_outpoint` and
+    `internal_account_note_transpose_option` methods have consequently been
+    removed.
+- `zcash_client_backend::data_api::testing::TransactionSummary::from_parts`
+  has been modified; it now requires additional `total_spent` and `total_received`
+  arguments.
+
+### Deprecated
+- `zcash_client_backend::address` (use `zcash_keys::address` instead)
+- `zcash_client_backend::encoding` (use `zcash_keys::encoding` instead)
+- `zcash_client_backend::keys` (use `zcash_keys::keys` instead)
+- `zcash_client_backend::zip321` (use the `zip321` crate instead)
+- `zcash_client_backend::PoolType` (use `zcash_protocol::PoolType` instead)
+- `zcash_client_backend::ShieldedProtocol` (use `zcash_protocol::ShieldedProtocol` instead)
+
+## [0.16.0] - 2024-12-16
+
+### Added
+- `zcash_client_backend::data_api`
+  - `AccountSource::key_derivation`
+  - `error::PcztError`
+  - `wallet::ExtractErrT`
+  - `wallet::create_pczt_from_proposal`
+  - `wallet::extract_and_store_transaction_from_pczt`
+
+### Changed
+- Migrated to `sapling-crypto 0.4`, `zcash_keys 0.6`, `zcash_primitives 0.21`,
+  `zcash_proofs 0.21`.
+- `zcash_client_backend::data_api::AccountBalance`: Refactored to use `Balance`
+  for transparent funds (issue #1411). It now has an `unshielded_balance()`
+  method that returns `Balance`, allowing the unshielded spendable, unshielded
+  pending change, and unshielded pending non-change values to be tracked
+  separately.
+- `zcash_client_backend::data_api::WalletRead`:
+  - The `create_account`, `import_account_hd`, and `import_account_ufvk`
+    methods now each take additional `account_name` and `key_source` arguments.
+    These allow the wallet backend to store additional metadata that is useful
+    to applications managing these accounts.
+- `zcash_client_backend::data_api::AccountSource`:
+  - Both `Derived` and `Imported` alternatives of `AccountSource` now have an
+    additional `key_source` field that is used to convey application-specific
+    key source metadata.
+  - The `Copy` impl for this type has been removed.
+  - The `request` argument to `WalletRead::get_next_available_address` is now optional.
+- `zcash_client_backend::data_api::Account` has an additional `name` method
+  that returns the human-readable name of the account, if any.
+- `zcash_client_backend::data_api::error::Error` has new variants:
+    - `AccountIdNotRecognized`
+    - `AccountCannotSpend`
+    - `Pczt`
+
+### Deprecated
+- `AccountBalance::unshielded`. Instead use `unshielded_balance` which
+  provides a `Balance` value. Its `total()` method can be used to obtain the
+  total of transparent funds.
+
+### Removed
+- `zcash_client_backend::AccountBalance::add_unshielded_value`. Instead use
+  `AccountBalance::with_unshielded_balance_mut` with a closure that calls
+  the appropriate `add_*_value` method(s) of `Balance` on its argument.
+  Note that the appropriate method(s) depend on whether the funds are
+  spendable, pending change, or pending non-change (previously, only the
+  total unshielded value was tracked).
+
+## [0.15.0] - 2024-11-14
+
+### Added
+- `zcash_client_backend::data_api`:
+  - `Progress`
+  - `WalletSummary::progress`
+  - `PoolMeta`
+  - `AccountMeta`
+  - `impl Default for wallet::input_selection::GreedyInputSelector`
+  - `BoundedU8`
+  - `NoteFilter`
+- `zcash_client_backend::fees`
+  - `SplitPolicy`
+  - `StandardFeeRule` has been moved here from `zcash_primitives::fees`. Relative
+    to that type, the deprecated `PreZip313` and `Zip313` variants have been
+    removed.
+  - `zip317::{MultiOutputChangeStrategy, Zip317FeeRule}`
+  - `standard::MultiOutputChangeStrategy`
+- A new feature flag, `non-standard-fees`, has been added. This flag is now
+  required in order to make use of any types or methods that enable non-standard
+  fee calculation.
+- `zcash_client_backend::tor::http::cryptex`:
+  - `LocalExchange`, a variant of the `Exchange` trait without `Send` bounds.
+  - `DynExchange`
+  - `DynLocalExchange`
+
+### Changed
+- MSRV is now 1.77.0.
+- Migrated to `zcash_primitives 0.20.0`, `zcash_keys 0.5.0`.
+- Migrated to `arti-client 0.23`.
+- `zcash_client_backend::data_api`:
+  - `InputSource` has an added method `get_account_metadata`
+  - `error::Error` has additional variant `Error::Change`. This necessitates
+    the addition of two type parameters to the `Error` type,
+    `ChangeErrT` and `NoteRefT`.
+  - The following methods each now take an additional `change_strategy`
+    argument, along with an associated `ChangeT` type parameter:
+    - `wallet::spend`
+    - `wallet::propose_transfer`
+    - `wallet::propose_shielding`. This method also now takes an additional
+      `to_account` argument.
+    - `wallet::shield_transparent_funds`. This method also now takes an
+      additional `to_account` argument.
+  - `wallet::input_selection::InputSelectionError` now has an additional `Change`
+    variant. This necessitates the addition of two type parameters.
+  - `wallet::input_selection::InputSelector::propose_transaction` takes an
+    additional `change_strategy` argument, along with an associated `ChangeT`
+    type parameter.
+  - The `wallet::input_selection::InputSelector::FeeRule` associated type has
+    been removed. The fee rule is now part of the change strategy passed to
+    `propose_transaction`.
+  - `wallet::input_selection::ShieldingSelector::propose_shielding` takes an
+    additional `change_strategy` argument, along with an associated `ChangeT`
+    type parameter. In addition, it also takes a new `to_account` argument
+    that identifies the destination account for the shielded notes.
+  - The `wallet::input_selection::ShieldingSelector::FeeRule` associated type
+    has been removed. The fee rule is now part of the change strategy passed to
+    `propose_shielding`.
+  - The `Change` variant of `wallet::input_selection::GreedyInputSelectorError`
+    has been removed, along with the additional type parameters it necessitated.
+  - The arguments to `wallet::input_selection::GreedyInputSelector::new` have
+    changed.
+- `zcash_client_backend::fees`:
+  - `ChangeStrategy` has changed. It has two new associated types, `MetaSource`
+    and `AccountMetaT`, and its `FeeRule` associated type now has an additional
+    `Clone` bound. In addition, it defines a new `fetch_wallet_meta` method, and
+    the arguments to `compute_balance` have changed.
+  - `zip317::SingleOutputChangeStrategy` has been made polymorphic in the fee
+    rule type, and takes an additional type parameter as a consequence.
+  - The following methods now take an additional `DustOutputPolicy` argument,
+    and carry an additional type parameter:
+    - `fixed::SingleOutputChangeStrategy::new`
+    - `standard::SingleOutputChangeStrategy::new`
+    - `zip317::SingleOutputChangeStrategy::new`
+- `zcash_client_backend::proto::ProposalDecodingError` has modified variants.
+  `ProposalDecodingError::FeeRuleNotSpecified` has been removed, and
+  `ProposalDecodingError::FeeRuleNotSupported` has been added to replace it.
+- `zcash_client_backend::data_api::fees::fixed` is now available only via the
+  use of the `non-standard-fees` feature flag.
+- `zcash_client_backend::tor::http::cryptex`:
+  - The `Exchange` trait is no longer object-safe. Replace any existing uses of
+    `dyn Exchange` with `DynExchange`.
+
+### Removed
+- `zcash_client_backend::data_api`:
+  - `WalletSummary::scan_progress` and `WalletSummary::recovery_progress` have
+    been removed. Use `WalletSummary::progress` instead.
+  - `testing::input_selector` use explicit `InputSelector` constructors
+    directly instead.
+  - The deprecated `wallet::create_spend_to_address` and `wallet::spend`
+    methods have been removed. Use `propose_transfer` and
+    `create_proposed_transaction` instead.
+- `zcash_client_backend::fees`:
+  - `impl From<BalanceError> for ChangeError<...>`
 
 ## [0.14.0] - 2024-10-04
 
@@ -14,7 +584,7 @@ and this library adheres to Rust's notion of
   - `GAP_LIMIT`
   - `WalletSummary::recovery_progress`
   - `SpendableNotes::{take_sapling, take_orchard}`
-  - Tests and testing infrastructure have been migrated from the 
+  - Tests and testing infrastructure have been migrated from the
     `zcash_client_sqlite` internal tests to the `testing` module, and have been
     generalized so that they may be used for testing arbitrary implementations
     of the `zcash_client_backend::data_api` interfaces. The following have been
@@ -253,9 +823,6 @@ funds to those addresses. See [ZIP 320](https://zips.z.cash/zip-0320) for detail
   - `ReceivedNote<_, sapling::Note>::note_value`
   - `ReceivedNote<_, orchard::note::Note>::note_value`
 - `zcash_client_backend::zip321::Payment::without_memo`
-- `WalletWrite::insert_address_with_diversifier_index`
-- `WalletWrite::put_latest_scanned_block_for_transparent`
-- `WalletRead::get_transparent_addresses_and_sync_heights`
 
 ### Changed
 - `zcash_client_backend::data_api`:

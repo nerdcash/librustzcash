@@ -1,18 +1,18 @@
 //! Types related to computation of fees and change related to the transparent components
 //! of a transaction.
 
-use std::convert::Infallible;
+use core::convert::Infallible;
 
-use crate::{
-    legacy::{Script, TransparentAddress},
-    transaction::{
-        components::{amount::NonNegativeAmount, transparent::TxOut, OutPoint},
-        fees::zip317::P2PKH_STANDARD_INPUT_SIZE,
-    },
+use crate::transaction::fees::zip317::P2PKH_STANDARD_INPUT_SIZE;
+use transparent::{
+    address::Script,
+    bundle::{OutPoint, TxOut},
 };
+use zcash_protocol::value::Zatoshis;
+use zcash_script::{script, solver};
 
 #[cfg(feature = "transparent-inputs")]
-use crate::transaction::components::transparent::builder::TransparentInputInfo;
+use transparent::builder::TransparentInputInfo;
 
 /// The size of a transparent input, or the outpoint corresponding to the input
 /// if the size of the script required to spend that input is unknown.
@@ -32,17 +32,23 @@ impl InputSize {
 
 /// This trait provides a minimized view of a transparent input suitable for use in
 /// fee and change computation.
-pub trait InputView: std::fmt::Debug {
+pub trait InputView: core::fmt::Debug {
     /// The outpoint to which the input refers.
     fn outpoint(&self) -> &OutPoint;
 
     /// The previous output being spent.
     fn coin(&self) -> &TxOut;
 
-    /// The size of the transparent script required to spend this input.
+    /// The size of this transparent input in a transaction, as used in [ZIP 317].
+    ///
+    /// [ZIP 317]: https://zips.z.cash/zip-0317#rationale-for-the-chosen-parameters
     fn serialized_size(&self) -> InputSize {
-        match self.coin().script_pubkey.address() {
-            Some(TransparentAddress::PublicKeyHash(_)) => InputSize::STANDARD_P2PKH,
+        match script::PubKey::parse(&self.coin().script_pubkey().0)
+            .ok()
+            .as_ref()
+            .and_then(solver::standard)
+        {
+            Some(solver::ScriptKind::PubKeyHash { .. }) => InputSize::STANDARD_P2PKH,
             _ => InputSize::Unknown(self.outpoint().clone()),
         }
     }
@@ -57,6 +63,13 @@ impl InputView for TransparentInputInfo {
     fn coin(&self) -> &TxOut {
         self.coin()
     }
+
+    fn serialized_size(&self) -> InputSize {
+        self.serialized_len().map_or(
+            InputSize::Unknown(self.outpoint().clone()),
+            InputSize::Known,
+        )
+    }
 }
 
 impl InputView for Infallible {
@@ -70,9 +83,9 @@ impl InputView for Infallible {
 
 /// This trait provides a minimized view of a transparent output suitable for use in
 /// fee and change computation.
-pub trait OutputView: std::fmt::Debug {
+pub trait OutputView: core::fmt::Debug {
     /// Returns the value of the output being created.
-    fn value(&self) -> NonNegativeAmount;
+    fn value(&self) -> Zatoshis;
 
     /// Returns the script corresponding to the newly created output.
     fn script_pubkey(&self) -> &Script;
@@ -86,11 +99,11 @@ pub trait OutputView: std::fmt::Debug {
 }
 
 impl OutputView for TxOut {
-    fn value(&self) -> NonNegativeAmount {
-        self.value
+    fn value(&self) -> Zatoshis {
+        self.value()
     }
 
     fn script_pubkey(&self) -> &Script {
-        &self.script_pubkey
+        self.script_pubkey()
     }
 }

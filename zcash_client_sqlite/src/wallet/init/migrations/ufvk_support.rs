@@ -1,28 +1,30 @@
 //! Migration that adds support for unified full viewing keys.
 use std::{collections::HashSet, rc::Rc};
 
-use rusqlite::{self, named_params, params};
-use schemer;
-use schemer_rusqlite::RusqliteMigration;
+use rusqlite::{named_params, params};
+use schemerz_rusqlite::RusqliteMigration;
 use secrecy::{ExposeSecret, SecretVec};
 use uuid::Uuid;
 
-use zcash_client_backend::{address::Address, keys::UnifiedSpendingKey, PoolType};
-use zcash_keys::keys::UnifiedAddressRequest;
-use zcash_primitives::{consensus, zip32::AccountId};
+use zcash_keys::{
+    address::Address,
+    keys::{ReceiverRequirement::*, UnifiedAddressRequest, UnifiedSpendingKey},
+};
+use zcash_protocol::{PoolType, consensus};
+use zip32::AccountId;
 
 #[cfg(feature = "transparent-inputs")]
-use zcash_primitives::legacy::keys::IncomingViewingKey;
+use ::transparent::keys::IncomingViewingKey;
 
 #[cfg(feature = "transparent-inputs")]
-use zcash_client_backend::encoding::AddressCodec;
+use zcash_keys::encoding::AddressCodec;
 
 use crate::{
+    UA_TRANSPARENT,
     wallet::{
-        init::{migrations::initial_setup, WalletMigrationError},
+        init::{WalletMigrationError, migrations::initial_setup},
         pool_code,
     },
-    UA_TRANSPARENT,
 };
 
 pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xbe57ef3b_388e_42ea_97e2_678dafcf9754);
@@ -34,7 +36,7 @@ pub(super) struct Migration<P> {
     pub(super) seed: Option<Rc<SecretVec<u8>>>,
 }
 
-impl<P> schemer::Migration for Migration<P> {
+impl<P> schemerz::Migration<Uuid> for Migration<P> {
     fn id(&self) -> Uuid {
         MIGRATION_ID
     }
@@ -83,7 +85,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
         //   our second assumption above, and we report this as corrupted data.
         let mut seed_is_relevant = false;
 
-        let ua_request = UnifiedAddressRequest::unsafe_new(false, true, UA_TRANSPARENT);
+        let ua_request = UnifiedAddressRequest::unsafe_custom(Omit, Require, UA_TRANSPARENT);
         let mut rows = stmt_fetch_accounts.query([])?;
         while let Some(row) = rows.next()? {
             // We only need to check for the presence of the seed if we have keys that
@@ -110,8 +112,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                 let address: String = row.get(1)?;
                 let decoded = Address::decode(&self.params, &address).ok_or_else(|| {
                     WalletMigrationError::CorruptedData(format!(
-                        "Could not decode {} as a valid Zcash address.",
-                        address
+                        "Could not decode {address} as a valid Zcash address."
                     ))
                 })?;
                 match decoded {
@@ -121,11 +122,12 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                         let (idx, expected_address) = dfvk.default_address();
                         if decoded_address != expected_address {
                             return Err(if seed_is_relevant {
-                                WalletMigrationError::CorruptedData(
-                                format!("Decoded Sapling address {} does not match the ufvk's Sapling address {} at {:?}.",
+                                WalletMigrationError::CorruptedData(format!(
+                                    "Decoded Sapling address {} does not match the ufvk's Sapling address {} at {:?}.",
                                     address,
                                     Address::Sapling(expected_address).encode(&self.params),
-                                    idx))
+                                    idx
+                                ))
                             } else {
                                 WalletMigrationError::SeedNotRelevant
                             });
@@ -139,11 +141,12 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                         let (expected_address, idx) = ufvk.default_address(ua_request)?;
                         if decoded_address != expected_address {
                             return Err(if seed_is_relevant {
-                                WalletMigrationError::CorruptedData(
-                                format!("Decoded unified address {} does not match the ufvk's default address {} at {:?}.",
+                                WalletMigrationError::CorruptedData(format!(
+                                    "Decoded unified address {} does not match the ufvk's default address {} at {:?}.",
                                     address,
                                     Address::Unified(expected_address).encode(&self.params),
-                                    idx))
+                                    idx
+                                ))
                             } else {
                                 WalletMigrationError::SeedNotRelevant
                             });
@@ -257,8 +260,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
 
                 let decoded_address = Address::decode(&self.params, &address).ok_or_else(|| {
                     WalletMigrationError::CorruptedData(format!(
-                        "Could not decode {} as a valid Zcash address.",
-                        address
+                        "Could not decode {address} as a valid Zcash address."
                     ))
                 })?;
                 let output_pool = match decoded_address {

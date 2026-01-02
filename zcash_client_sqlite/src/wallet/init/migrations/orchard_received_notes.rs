@@ -3,9 +3,10 @@
 
 use std::collections::HashSet;
 
-use schemer_rusqlite::RusqliteMigration;
+use schemerz_rusqlite::RusqliteMigration;
 use uuid::Uuid;
-use zcash_client_backend::PoolType;
+
+use zcash_protocol::PoolType;
 
 use super::full_account_ids;
 use crate::wallet::{init::WalletMigrationError, pool_code};
@@ -16,7 +17,7 @@ const DEPENDENCIES: &[Uuid] = &[full_account_ids::MIGRATION_ID];
 
 pub(super) struct Migration;
 
-impl schemer::Migration for Migration {
+impl schemerz::Migration<Uuid> for Migration {
     fn id(&self) -> Uuid {
         MIGRATION_ID
     }
@@ -73,10 +74,10 @@ impl RusqliteMigration for Migration {
             );",
         )?;
 
-        transaction.execute_batch({
+        let stmt_create_v_received_notes = {
             let sapling_pool_code = pool_code(PoolType::SAPLING);
             let orchard_pool_code = pool_code(PoolType::ORCHARD);
-            &format!(
+            format!(
                 "CREATE VIEW v_received_notes AS
                     SELECT
                         sapling_received_notes.id AS id_within_pool_table,
@@ -108,12 +109,13 @@ impl RusqliteMigration for Migration {
                     ON (sent_notes.tx, sent_notes.output_pool, sent_notes.output_index) =
                        (orchard_received_notes.tx, {orchard_pool_code}, orchard_received_notes.action_index);"
             )
-        })?;
+        };
+        transaction.execute_batch(&stmt_create_v_received_notes)?;
 
-        transaction.execute_batch({
+        let stmt_create_v_received_note_spends = {
             let sapling_pool_code = pool_code(PoolType::SAPLING);
             let orchard_pool_code = pool_code(PoolType::ORCHARD);
-            &format!(
+            format!(
                 "CREATE VIEW v_received_note_spends AS
                 SELECT
                     {sapling_pool_code} AS pool,
@@ -127,11 +129,12 @@ impl RusqliteMigration for Migration {
                     transaction_id
                 FROM orchard_received_note_spends;"
             )
-        })?;
+        };
+        transaction.execute_batch(&stmt_create_v_received_note_spends)?;
 
-        transaction.execute_batch({
+        let stmt_update_v_transactions = {
             let transparent_pool_code = pool_code(PoolType::TRANSPARENT);
-            &format!(
+            format!(
                 "DROP VIEW v_transactions;
                 CREATE VIEW v_transactions AS
                 WITH
@@ -256,11 +259,12 @@ impl RusqliteMigration for Migration {
                      AND sent_note_counts.txid = notes.txid
                 GROUP BY notes.account_id, notes.txid;"
             )
-        })?;
+        };
+        transaction.execute_batch(&stmt_update_v_transactions)?;
 
-        transaction.execute_batch({
+        let stmt_update_v_tx_outputs = {
             let transparent_pool_code = pool_code(PoolType::TRANSPARENT);
-            &format!(
+            format!(
                 "DROP VIEW v_tx_outputs;
                 CREATE VIEW v_tx_outputs AS
                 SELECT transactions.txid              AS txid,
@@ -305,7 +309,8 @@ impl RusqliteMigration for Migration {
                     ON sent_notes.id = v_received_notes.sent_note_id
                 WHERE COALESCE(v_received_notes.is_change, 0) = 0;"
             )
-        })?;
+        };
+        transaction.execute_batch(&stmt_update_v_tx_outputs)?;
 
         Ok(())
     }

@@ -3,8 +3,8 @@
 
 use std::collections::HashSet;
 
-use rusqlite::{named_params, OptionalExtension};
-use schemer_rusqlite::RusqliteMigration;
+use rusqlite::{OptionalExtension, named_params};
+use schemerz_rusqlite::RusqliteMigration;
 use tracing::debug;
 use uuid::Uuid;
 use zcash_client_backend::data_api::scanning::ScanPriority;
@@ -21,7 +21,7 @@ pub(super) struct Migration<P> {
     pub(super) params: P,
 }
 
-impl<P> schemer::Migration for Migration<P> {
+impl<P> schemerz::Migration<Uuid> for Migration<P> {
     fn id(&self) -> Uuid {
         MIGRATION_ID
     }

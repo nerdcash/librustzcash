@@ -1,7 +1,7 @@
-use std::cmp::{max, Ordering};
+use std::cmp::{Ordering, max};
 use std::ops::{Not, Range};
 
-use zcash_primitives::consensus::BlockHeight;
+use zcash_protocol::consensus::BlockHeight;
 
 use super::{ScanPriority, ScanRange};
 
@@ -397,7 +397,7 @@ impl SpanningTree {
 pub mod testing {
     use std::ops::Range;
 
-    use zcash_primitives::consensus::BlockHeight;
+    use zcash_protocol::consensus::BlockHeight;
 
     use crate::data_api::scanning::{ScanPriority, ScanRange};
 
@@ -413,9 +413,9 @@ pub mod testing {
 mod tests {
     use std::ops::Range;
 
-    use zcash_primitives::consensus::BlockHeight;
+    use zcash_protocol::consensus::BlockHeight;
 
-    use super::{join_nonoverlapping, testing::scan_range, Joined, RangeOrdering, SpanningTree};
+    use super::{Joined, RangeOrdering, SpanningTree, join_nonoverlapping, testing::scan_range};
     use crate::data_api::scanning::{ScanPriority, ScanRange};
 
     #[test]

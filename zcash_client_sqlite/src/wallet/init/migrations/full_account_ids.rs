@@ -1,21 +1,19 @@
 use std::{collections::HashSet, rc::Rc};
 
-use crate::wallet::{account_kind_code, init::WalletMigrationError};
-use rusqlite::{named_params, OptionalExtension, Transaction};
-use schemer_rusqlite::RusqliteMigration;
+use rusqlite::{OptionalExtension, Transaction, named_params};
+use schemerz_rusqlite::RusqliteMigration;
 use secrecy::{ExposeSecret, SecretVec};
 use uuid::Uuid;
-use zcash_client_backend::{
-    data_api::{AccountPurpose, AccountSource},
-    keys::UnifiedSpendingKey,
-};
-use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_primitives::consensus;
+
+use zcash_client_backend::data_api::{AccountPurpose, AccountSource, Zip32Derivation};
+use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
+use zcash_protocol::consensus;
 use zip32::fingerprint::SeedFingerprint;
 
 use super::{
     add_account_birthdays, receiving_key_scopes, v_transactions_note_uniqueness, wallet_summaries,
 };
+use crate::wallet::{account_kind_code, init::WalletMigrationError};
 
 /// The migration that switched from presumed seed-derived account IDs to supporting
 /// HD accounts and all sorts of imported keys.
@@ -33,7 +31,7 @@ const DEPENDENCIES: &[Uuid] = &[
     wallet_summaries::MIGRATION_ID,
 ];
 
-impl<P: consensus::Parameters> schemer::Migration for Migration<P> {
+impl<P: consensus::Parameters> schemerz::Migration<Uuid> for Migration<P> {
     fn id(&self) -> Uuid {
         MIGRATION_ID
     }
@@ -52,14 +50,20 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
     type Error = WalletMigrationError;
 
     fn up(&self, transaction: &Transaction) -> Result<(), WalletMigrationError> {
-        let account_kind_derived = account_kind_code(AccountSource::Derived {
-            seed_fingerprint: SeedFingerprint::from_bytes([0; 32]),
-            account_index: zip32::AccountId::ZERO,
+        let account_kind_derived = account_kind_code(&AccountSource::Derived {
+            derivation: Zip32Derivation::new(
+                SeedFingerprint::from_bytes([0; 32]),
+                zip32::AccountId::ZERO,
+                #[cfg(feature = "zcashd-compat")]
+                None,
+            ),
+            key_source: None,
         });
-        let account_kind_imported = account_kind_code(AccountSource::Imported {
+        let account_kind_imported = account_kind_code(&AccountSource::Imported {
             // the purpose here is irrelevant; we just use it to get the correct code
             // for the account kind
             purpose: AccountPurpose::ViewOnly,
+            key_source: None,
         });
         transaction.execute_batch(&format!(
             r#"

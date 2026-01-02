@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use rusqlite::Transaction;
-use schemer_rusqlite::RusqliteMigration;
+use schemerz_rusqlite::RusqliteMigration;
 use uuid::Uuid;
 
 use crate::wallet::init::WalletMigrationError;
@@ -12,7 +12,7 @@ pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xb6ce8980_00c9_4985_9e0c_
 
 pub(crate) struct Migration;
 
-impl schemer::Migration for Migration {
+impl schemerz::Migration<Uuid> for Migration {
     fn id(&self) -> Uuid {
         MIGRATION_ID
     }

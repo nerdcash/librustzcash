@@ -1,8 +1,7 @@
-use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use super::{Exchange, ExchangeData};
+use super::{Exchange, ExchangeData, RETRY_LIMIT, retry_filter};
 use crate::tor::{Client, Error};
 
 /// Querier for the Gemini exchange.
@@ -30,13 +29,16 @@ struct GeminiData {
     ask: Decimal,
 }
 
-#[async_trait]
 impl Exchange for Gemini {
     async fn query_zec_to_usd(&self, client: &Client) -> Result<ExchangeData, Error> {
         // API documentation:
         // https://docs.gemini.com/rest-api/#ticker-v2
         let res = client
-            .get_json::<GeminiData>("https://api.gemini.com/v2/ticker/zecusd".parse().unwrap())
+            .http_get_json::<GeminiData>(
+                "https://api.gemini.com/v2/ticker/zecusd".parse().unwrap(),
+                RETRY_LIMIT,
+                retry_filter,
+            )
             .await?;
         let data = res.into_body();
         Ok(ExchangeData {

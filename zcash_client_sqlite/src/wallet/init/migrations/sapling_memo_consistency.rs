@@ -4,15 +4,22 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use rusqlite::named_params;
-use schemer_rusqlite::RusqliteMigration;
+use rusqlite::{OptionalExtension, named_params};
+use schemerz_rusqlite::RusqliteMigration;
 use uuid::Uuid;
-use zcash_client_backend::{decrypt_transaction, keys::UnifiedFullViewingKey};
-use zcash_primitives::{consensus, transaction::TxId, zip32::AccountId};
+
+use zcash_client_backend::decrypt_transaction;
+use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_primitives::transaction::Transaction;
+use zcash_protocol::{
+    TxId,
+    consensus::{self, BlockHeight},
+};
+use zip32::AccountId;
 
 use crate::{
     error::SqliteClientError,
-    wallet::{get_transaction, init::WalletMigrationError, memo_repr},
+    wallet::{init::WalletMigrationError, memo_repr, parse_tx},
 };
 
 use super::received_notes_nullable_nf;
@@ -25,7 +32,7 @@ pub(super) struct Migration<P> {
     pub(super) params: P,
 }
 
-impl<P> schemer::Migration for Migration<P> {
+impl<P> schemerz::Migration<Uuid> for Migration<P> {
     fn id(&self) -> Uuid {
         MIGRATION_ID
     }
@@ -66,8 +73,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
             let ufvk_str: String = row.get(3)?;
             let ufvk = UnifiedFullViewingKey::decode(&self.params, &ufvk_str).map_err(|e| {
                 WalletMigrationError::CorruptedData(format!(
-                    "Could not decode unified full viewing key for account {}: {:?}",
-                    account, e
+                    "Could not decode unified full viewing key for account {account}: {e:?}"
                 ))
             })?;
 
@@ -94,18 +100,17 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                     }
                     SqliteClientError::DbError(err) => WalletMigrationError::DbError(err),
                     other => WalletMigrationError::CorruptedData(format!(
-                        "An error was encountered decoding transaction data: {:?}",
-                        other
+                        "An error was encountered decoding transaction data: {other:?}"
                     )),
                 })?
                 .ok_or_else(|| {
                     WalletMigrationError::CorruptedData(format!(
-                        "Transaction not found for id {:?}",
-                        txid
+                        "Transaction not found for id {txid:?}"
                     ))
                 })?;
 
-            let decrypted_outputs = decrypt_transaction(&self.params, block_height, &tx, &ufvks);
+            let decrypted_outputs =
+                decrypt_transaction(&self.params, Some(block_height), None, &tx, &ufvks);
 
             // Orchard outputs were not supported as of the wallet states that could require this
             // migration.
@@ -220,6 +225,36 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
     fn down(&self, _: &rusqlite::Transaction) -> Result<(), Self::Error> {
         Err(WalletMigrationError::CannotRevert(MIGRATION_ID))
     }
+}
+
+/// Looks up a transaction by its [`TxId`].
+///
+/// Returns the decoded transaction, along with the block height that was used in its decoding.
+/// This is either the block height at which the transaction was mined, or the expiry height if the
+/// wallet created the transaction but the transaction has not yet been mined from the perspective
+/// of the wallet.
+fn get_transaction<P: consensus::Parameters>(
+    conn: &rusqlite::Connection,
+    params: &P,
+    txid: TxId,
+) -> Result<Option<(BlockHeight, Transaction)>, SqliteClientError> {
+    conn.query_row(
+        "SELECT raw, block, expiry_height FROM transactions
+        WHERE txid = ?",
+        [txid.as_ref()],
+        |row| {
+            let h: Option<u32> = row.get(1)?;
+            let expiry: Option<u32> = row.get(2)?;
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                h.map(BlockHeight::from),
+                expiry.map(BlockHeight::from),
+            ))
+        },
+    )
+    .optional()?
+    .map(|(t, b, e)| parse_tx(params, &t, b, e))
+    .transpose()
 }
 
 #[cfg(test)]

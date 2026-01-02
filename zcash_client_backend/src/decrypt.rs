@@ -1,16 +1,19 @@
 use std::collections::HashMap;
 
 use sapling::note_encryption::{PreparedIncomingViewingKey, SaplingDomain};
+use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_note_encryption::{try_note_decryption, try_output_recovery_with_ovk};
 use zcash_primitives::{
-    consensus::{self, BlockHeight},
-    memo::MemoBytes,
-    transaction::components::{amount::NonNegativeAmount, sapling::zip212_enforcement},
-    transaction::Transaction,
-    zip32::Scope,
+    transaction::Transaction, transaction::components::sapling::zip212_enforcement,
 };
+use zcash_protocol::{
+    consensus::{self, BlockHeight, NetworkUpgrade},
+    memo::MemoBytes,
+    value::Zatoshis,
+};
+use zip32::Scope;
 
-use crate::{data_api::DecryptedTransaction, keys::UnifiedFullViewingKey};
+use crate::data_api::DecryptedTransaction;
 
 #[cfg(feature = "orchard")]
 use orchard::note_encryption::OrchardDomain;
@@ -84,29 +87,52 @@ impl<Note, AccountId> DecryptedOutput<Note, AccountId> {
 }
 
 impl<A> DecryptedOutput<sapling::Note, A> {
-    pub fn note_value(&self) -> NonNegativeAmount {
-        NonNegativeAmount::from_u64(self.note.value().inner())
+    pub fn note_value(&self) -> Zatoshis {
+        Zatoshis::from_u64(self.note.value().inner())
             .expect("Sapling note value is expected to have been validated by consensus.")
     }
 }
 
 #[cfg(feature = "orchard")]
 impl<A> DecryptedOutput<orchard::note::Note, A> {
-    pub fn note_value(&self) -> NonNegativeAmount {
-        NonNegativeAmount::from_u64(self.note.value().inner())
+    pub fn note_value(&self) -> Zatoshis {
+        Zatoshis::from_u64(self.note.value().inner())
             .expect("Orchard note value is expected to have been validated by consensus.")
     }
 }
 
 /// Scans a [`Transaction`] for any information that can be decrypted by the set of
 /// [`UnifiedFullViewingKey`]s.
+///
+/// # Parameters
+/// - `params`: The network parameters corresponding to the network the transaction
+///   was created for.
+/// - `mined_height`: The height at which the transaction was mined, or `None` for
+///   unmined transactions.
+/// - `chain_tip_height`: The current chain tip height, if known. This parameter
+///   will be unused if `mined_height.is_some()`.
+/// - `tx`: The transaction to decrypt.
+/// - `ufvks`: The [`UnifiedFullViewingKey`]s to use in trial decryption, keyed
+///   by the identifiers for the wallet accounts they correspond to.
 pub fn decrypt_transaction<'a, P: consensus::Parameters, AccountId: Copy>(
     params: &P,
-    height: BlockHeight,
+    mined_height: Option<BlockHeight>,
+    chain_tip_height: Option<BlockHeight>,
     tx: &'a Transaction,
     ufvks: &HashMap<AccountId, UnifiedFullViewingKey>,
 ) -> DecryptedTransaction<'a, AccountId> {
-    let zip212_enforcement = zip212_enforcement(params, height);
+    let zip212_enforcement = zip212_enforcement(
+        params,
+        // Height is block height for mined transactions, and the "mempool height" (chain height + 1)
+        // for mempool transactions. We fall back to Sapling activation if we have no other
+        // information.
+        mined_height.unwrap_or_else(|| {
+            chain_tip_height
+                .map(|max_height| max_height + 1) // "mempool height"
+                .or_else(|| params.activation_height(NetworkUpgrade::Sapling))
+                .expect("Sapling activation height must be known.")
+        }),
+    );
     let sapling_bundle = tx.sapling_bundle();
     let sapling_outputs = sapling_bundle
         .iter()
@@ -182,7 +208,6 @@ pub fn decrypt_transaction<'a, P: consensus::Parameters, AccountId: Copy>(
                         .enumerate()
                         .flat_map(move |(index, action)| {
                             let domain = OrchardDomain::for_action(action);
-                            let account = account;
                             try_note_decryption(&domain, &ivk_external, action)
                                 .map(|ret| (ret, TransferType::Incoming))
                                 .or_else(|| {
@@ -215,7 +240,7 @@ pub fn decrypt_transaction<'a, P: consensus::Parameters, AccountId: Copy>(
         .collect();
 
     DecryptedTransaction::new(
-        Some(height),
+        mined_height,
         tx,
         sapling_outputs,
         #[cfg(feature = "orchard")]

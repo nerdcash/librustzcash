@@ -2,23 +2,21 @@
 //!
 //! [`FeeRule`]: crate::transaction::fees::FeeRule
 //! [ZIP 317]: https//zips.z.cash/zip-0317
+use alloc::vec::Vec;
 use core::cmp::max;
 
-use crate::{
+use ::transparent::bundle::OutPoint;
+use zcash_protocol::{
     consensus::{self, BlockHeight},
-    transaction::{
-        components::{
-            amount::{BalanceError, NonNegativeAmount},
-            transparent::OutPoint,
-        },
-        fees::transparent,
-    },
+    value::{BalanceError, Zatoshis},
 };
+
+use crate::transaction::fees::transparent;
 
 /// The standard [ZIP 317] marginal fee.
 ///
 /// [ZIP 317]: https//zips.z.cash/zip-0317
-pub const MARGINAL_FEE: NonNegativeAmount = NonNegativeAmount::const_from_u64(5_000);
+pub const MARGINAL_FEE: Zatoshis = Zatoshis::const_from_u64(5_000);
 
 /// The minimum number of logical actions that must be paid according to [ZIP 317].
 ///
@@ -39,7 +37,7 @@ pub const P2PKH_STANDARD_OUTPUT_SIZE: usize = 34;
 /// `MARGINAL_FEE * GRACE_ACTIONS`.
 ///
 /// [ZIP 317]: https//zips.z.cash/zip-0317
-pub const MINIMUM_FEE: NonNegativeAmount = NonNegativeAmount::const_from_u64(10_000);
+pub const MINIMUM_FEE: Zatoshis = Zatoshis::const_from_u64(10_000);
 
 /// A [`FeeRule`] implementation that implements the [ZIP 317] fee rule.
 ///
@@ -55,7 +53,7 @@ pub const MINIMUM_FEE: NonNegativeAmount = NonNegativeAmount::const_from_u64(10_
 /// [ZIP 317]: https//zips.z.cash/zip-0317
 #[derive(Clone, Debug)]
 pub struct FeeRule {
-    marginal_fee: NonNegativeAmount,
+    marginal_fee: Zatoshis,
     grace_actions: usize,
     p2pkh_standard_input_size: usize,
     p2pkh_standard_output_size: usize,
@@ -76,17 +74,19 @@ impl FeeRule {
 
     /// Construct a new FeeRule instance with the specified parameter values.
     ///
+    /// Using this fee rule with
+    /// ```compile_fail
+    /// marginal_fee < 5000 || grace_actions < 2
+    ///     || p2pkh_standard_input_size > P2PKH_STANDARD_INPUT_SIZE
+    ///     || p2pkh_standard_output_size > P2PKH_STANDARD_OUTPUT_SIZE
+    /// ```
+    /// violates ZIP 317, and might cause transactions built with it to fail.
+    ///
     /// Returns `None` if either `p2pkh_standard_input_size` or `p2pkh_standard_output_size` are
     /// zero.
-    #[deprecated(
-        note = "Using this fee rule with `marginal_fee < 5000 || grace_actions < 2 \
-                 || p2pkh_standard_input_size > P2PKH_STANDARD_INPUT_SIZE \
-                 || p2pkh_standard_output_size > P2PKH_STANDARD_OUTPUT_SIZE` \
-                violates ZIP 317, and might cause transactions built with it to fail. \
-                This API is likely to be removed. Use `[FeeRule::standard]` instead."
-    )]
+    #[cfg(feature = "non-standard-fees")]
     pub fn non_standard(
-        marginal_fee: NonNegativeAmount,
+        marginal_fee: Zatoshis,
         grace_actions: usize,
         p2pkh_standard_input_size: usize,
         p2pkh_standard_output_size: usize,
@@ -104,7 +104,7 @@ impl FeeRule {
     }
 
     /// Returns the ZIP 317 marginal fee.
-    pub fn marginal_fee(&self) -> NonNegativeAmount {
+    pub fn marginal_fee(&self) -> Zatoshis {
         self.marginal_fee
     }
     /// Returns the ZIP 317 number of grace actions
@@ -126,9 +126,9 @@ impl FeeRule {
 pub enum FeeError {
     /// An overflow or underflow of amount computation occurred.
     Balance(BalanceError),
-    /// Transparent inputs provided to the fee calculation included coins that do not pay to
-    /// standard P2pkh scripts.
-    NonP2pkhInputs(Vec<OutPoint>),
+    /// Transparent inputs provided to the fee calculation included coins that pay to
+    /// unknown P2SH redeem scripts.
+    UnknownP2shInputs(Vec<OutPoint>),
 }
 
 impl From<BalanceError> for FeeError {
@@ -137,15 +137,16 @@ impl From<BalanceError> for FeeError {
     }
 }
 
-impl std::fmt::Display for FeeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl core::fmt::Display for FeeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match &self {
             FeeError::Balance(e) => write!(
                 f,
-                "A balance calculation violated amount validity bounds: {}.",
-                e
+                "A balance calculation violated amount validity bounds: {e}."
             ),
-            FeeError::NonP2pkhInputs(_) => write!(f, "Only P2PKH inputs are supported."),
+            FeeError::UnknownP2shInputs(_) => {
+                write!(f, "Only P2PKH or known-P2SH inputs are supported.")
+            }
         }
     }
 }
@@ -162,27 +163,27 @@ impl super::FeeRule for FeeRule {
         sapling_input_count: usize,
         sapling_output_count: usize,
         orchard_action_count: usize,
-    ) -> Result<NonNegativeAmount, Self::Error> {
+    ) -> Result<Zatoshis, Self::Error> {
         let mut t_in_total_size: usize = 0;
-        let mut non_p2pkh_outpoints = vec![];
+        let mut unknown_p2sh_outpoints = vec![];
         for sz in transparent_input_sizes.into_iter() {
             match sz {
                 transparent::InputSize::Known(s) => {
                     t_in_total_size += s;
                 }
                 transparent::InputSize::Unknown(outpoint) => {
-                    non_p2pkh_outpoints.push(outpoint.clone());
+                    unknown_p2sh_outpoints.push(outpoint.clone());
                 }
             }
         }
 
-        if !non_p2pkh_outpoints.is_empty() {
-            return Err(FeeError::NonP2pkhInputs(non_p2pkh_outpoints));
+        if !unknown_p2sh_outpoints.is_empty() {
+            return Err(FeeError::UnknownP2shInputs(unknown_p2sh_outpoints));
         }
 
         let t_out_total_size = transparent_output_sizes.into_iter().sum();
 
-        let ceildiv = |num: usize, den: usize| (num + den - 1) / den;
+        let ceildiv = |num: usize, den: usize| num.div_ceil(den);
 
         let logical_actions = max(
             ceildiv(t_in_total_size, self.p2pkh_standard_input_size),

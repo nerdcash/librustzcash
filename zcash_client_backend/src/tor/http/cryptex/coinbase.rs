@@ -1,8 +1,7 @@
-use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use super::{Exchange, ExchangeData};
+use super::{Exchange, ExchangeData, RETRY_LIMIT, retry_filter};
 use crate::tor::{Client, Error};
 
 /// Querier for the Coinbase exchange.
@@ -31,17 +30,18 @@ struct CoinbaseData {
     conversions_volume: Option<Decimal>,
 }
 
-#[async_trait]
 impl Exchange for Coinbase {
     #[allow(dead_code)]
     async fn query_zec_to_usd(&self, client: &Client) -> Result<ExchangeData, Error> {
         // API documentation:
         // https://docs.cdp.coinbase.com/exchange/reference/exchangerestapi_getproductticker
         let res = client
-            .get_json::<CoinbaseData>(
+            .http_get_json::<CoinbaseData>(
                 "https://api.exchange.coinbase.com/products/ZEC-USD/ticker"
                     .parse()
                     .unwrap(),
+                RETRY_LIMIT,
+                retry_filter,
             )
             .await?;
         let data = res.into_body();

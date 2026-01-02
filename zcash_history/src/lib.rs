@@ -12,9 +12,9 @@ mod tree;
 mod version;
 
 pub use entry::{Entry, MAX_ENTRY_SIZE};
-pub use node_data::{NodeData, MAX_NODE_DATA_SIZE};
+pub use node_data::{MAX_NODE_DATA_SIZE, NodeData};
 pub use tree::Tree;
-pub use version::{Version, V1, V2};
+pub use version::{V1, V2, Version};
 
 /// Crate-level error type
 #[derive(Debug)]
@@ -28,9 +28,9 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::ExpectedInMemory(l) => write!(f, "Node/leaf expected to be in memory: {}", l),
+            Self::ExpectedInMemory(l) => write!(f, "Node/leaf expected to be in memory: {l}"),
             Self::ExpectedNode(None) => write!(f, "Node expected"),
-            Self::ExpectedNode(Some(l)) => write!(f, "Node expected, not leaf: {}", l),
+            Self::ExpectedNode(Some(l)) => write!(f, "Node expected, not leaf: {l}"),
         }
     }
 }
@@ -48,8 +48,8 @@ pub enum EntryLink {
 impl std::fmt::Display for EntryLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::Stored(v) => write!(f, "stored({})", v),
-            Self::Generated(v) => write!(f, "generated({})", v),
+            Self::Stored(v) => write!(f, "stored({v})"),
+            Self::Generated(v) => write!(f, "generated({v})"),
         }
     }
 }

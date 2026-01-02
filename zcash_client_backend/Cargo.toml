@@ -1,7 +1,7 @@
 [package]
 name = "zcash_client_backend"
 description = "APIs for creating shielded Zcash light clients"
-version = "0.14.0"
+version = "0.21.0"
 authors = [
     "Jack Grigg <jack@z.cash>",
     "Kris Nuttycombe <kris@electriccoin.co>"
@@ -29,15 +29,18 @@ zcash_address.workspace = true
 zcash_encoding.workspace = true
 zcash_keys = { workspace = true, features = ["sapling"] }
 zcash_note_encryption.workspace = true
-zcash_primitives.workspace = true
+zcash_primitives = { workspace = true, features = ["std", "circuits"] }
 zcash_protocol.workspace = true
+zcash_script.workspace = true
 zip32.workspace = true
 zip321.workspace = true
+transparent.workspace = true
+pczt = { workspace = true, optional = true }
 
 # Dependencies exposed in a public API:
 # (Breaking upgrades to these require a breaking upgrade to this crate.)
 # - Data Access API
-time = "0.3.22"
+time.workspace = true
 nonempty.workspace = true
 
 # - CSPRNG
@@ -47,6 +50,7 @@ rand_core.workspace = true
 base64.workspace = true
 bech32.workspace = true
 bs58.workspace = true
+postcard = { workspace = true, optional = true }
 
 # - Errors
 bip32 = { workspace = true, optional = true }
@@ -58,7 +62,8 @@ tracing.workspace = true
 # - Protobuf interfaces and gRPC bindings
 hex.workspace = true
 prost.workspace = true
-tonic = { workspace = true, optional = true, features = ["prost", "codegen"] }
+tonic = { workspace = true, optional = true, features = ["codegen"] }
+tonic-prost = { workspace = true, optional = true }
 
 # - Secret management
 secrecy.workspace = true
@@ -69,6 +74,9 @@ bls12_381.workspace = true
 group.workspace = true
 orchard = { workspace = true, optional = true }
 sapling.workspace = true
+
+# - Transparent protocol
+secp256k1 = { workspace = true, optional = true }
 
 # - Sync engine
 async-trait = { version = "0.1", optional = true }
@@ -87,16 +95,17 @@ jubjub = { workspace = true, optional = true }
 rand_chacha = { workspace = true, optional = true }
 zcash_proofs = { workspace = true, optional = true }
 
-# - ZIP 321
-nom = "7"
-
 # - Tor
+# -- Exposed types: `arti_client::DormantMode`, `fs_mistrust::MistrustBuilder`.
 # -- Exposed error types: `arti_client::Error`, `arti_client::config::ConfigBuildError`,
 #    `hyper::Error`, `hyper::http::Error`, `serde_json::Error`. We could avoid this with
 #    changes to error handling.
 arti-client = { workspace = true, optional = true }
+dynosaur = { workspace = true, optional = true }
+fs-mistrust = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true, features = ["client", "http1"] }
 serde_json = { workspace = true, optional = true }
+trait-variant = { workspace = true, optional = true }
 
 # - Currency conversion
 rust_decimal = { workspace = true, optional = true }
@@ -127,9 +136,17 @@ serde = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 
+# Workaround for https://anonticket.torproject.org/user/projects/arti/issues/pending/4028/
+time-core.workspace = true
+
+# Dependencies used internally:
+# (Breaking upgrades to these are usually backwards-compatible, but check MSRVs.)
+# - Boilerplate
+getset.workspace = true
+
 [build-dependencies]
-tonic-build = { workspace = true, features = ["prost"] }
-which = "4"
+tonic-prost-build.workspace = true
+which.workspace = true
 
 [dev-dependencies]
 ambassador.workspace = true
@@ -141,6 +158,7 @@ proptest.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 shardtree = { workspace = true, features = ["test-dependencies"] }
+tempfile = "3.5.0"
 tokio = { version = "1.21.0", features = ["rt-multi-thread"] }
 zcash_address = { workspace = true, features = ["test-dependencies"] }
 zcash_keys = { workspace = true, features = ["test-dependencies"] }
@@ -149,8 +167,10 @@ zcash_proofs = { workspace = true, features = ["bundled-prover"] }
 zcash_protocol = { workspace = true, features = ["local-consensus"] }
 
 [features]
+default = ["time/default"]
+
 ## Enables the `tonic` gRPC client bindings for connecting to a `lightwalletd` server.
-lightwalletd-tonic = ["dep:tonic", "hyper-util?/tokio"]
+lightwalletd-tonic = ["dep:tonic", "dep:tonic-prost", "hyper-util?/tokio"]
 
 ## Enables the `tls-webpki-roots` feature of `tonic`.
 lightwalletd-tonic-tls-webpki-roots = ["lightwalletd-tonic", "tonic?/tls-webpki-roots"]
@@ -161,12 +181,37 @@ lightwalletd-tonic-transport = ["lightwalletd-tonic", "tonic?/transport"]
 ## Enables receiving transparent funds and shielding them.
 transparent-inputs = [
     "dep:bip32",
+    "dep:secp256k1",
+    "transparent/transparent-inputs",
     "zcash_keys/transparent-inputs",
     "zcash_primitives/transparent-inputs",
 ]
 
+# Enables operations that permit arbitrary transparent pubkeys to be associated
+# with an account in the wallet. Applications that rely on this feature must
+# maintain spending keys corresponding to all imported pubkeys for any account
+# from which it permits spending.
+transparent-key-import = ["transparent-inputs"]
+
 ## Enables receiving and spending Orchard funds.
 orchard = ["dep:orchard", "dep:pasta_curves", "zcash_keys/orchard"]
+
+## Enables compatibility with legacy zcashd wallet data
+zcashd-compat = ["zcash_keys/zcashd-compat"]
+
+## Enables creating partially-constructed transactions for use in hardware wallet and multisig scenarios.
+pczt = [
+  "orchard",
+  "transparent-inputs",
+  "pczt/zcp-builder",
+  "pczt/io-finalizer",
+  "pczt/prover",
+  "pczt/signer",
+  "pczt/spend-finalizer",
+  "pczt/tx-extractor",
+  "dep:postcard",
+  "dep:serde",
+]
 
 ## Exposes a wallet synchronization function that implements the necessary state machine.
 sync = [
@@ -179,7 +224,8 @@ sync = [
 ## operations.
 tor = [
     "dep:arti-client",
-    "dep:async-trait",
+    "dep:dynosaur",
+    "dep:fs-mistrust",
     "dep:futures-util",
     "dep:http-body-util",
     "dep:hyper",
@@ -191,11 +237,15 @@ tor = [
     "dep:tokio",
     "dep:tokio-rustls",
     "dep:tor-rtcompat",
+    "dep:trait-variant",
     "dep:tower",
     "dep:webpki-roots",
 ]
 
 ## Exposes APIs that are useful for testing, such as `proptest` strategies.
+##
+## NOTE: Semver-breaking changes to the APIs exposed by this feature may be
+## present in any release version, including patch releases.
 test-dependencies = [
     "dep:ambassador",
     "dep:assert_matches",
@@ -210,6 +260,9 @@ test-dependencies = [
     "zcash_protocol/local-consensus",
     "incrementalmerkletree/test-dependencies",
 ]
+
+## Exposes APIs that allow calculation of non-standard fees.
+non-standard-fees = ["zcash_primitives/non-standard-fees"]
 
 #! ### Experimental features
 
@@ -227,3 +280,6 @@ bench = false
 
 [badges]
 maintenance = { status = "actively-developed" }
+
+[lints]
+workspace = true

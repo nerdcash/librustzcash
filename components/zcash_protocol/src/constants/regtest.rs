@@ -41,6 +41,13 @@ pub const HRP_SAPLING_PAYMENT_ADDRESS: &str = "zregtestsapling";
 /// [sproutpaymentaddrencoding]: https://zips.z.cash/protocol/protocol.pdf#sproutpaymentaddrencoding
 pub const B58_SPROUT_ADDRESS_PREFIX: [u8; 2] = [0x16, 0xb6];
 
+/// The prefix for a Base58Check-encoded DER-encoded regtest [`SecretKey`], as specified via the
+/// bitcoin-derived [`EncodeSecret`] format function.
+///
+/// [`SecretKey`]: https://docs.rs/secp256k1/latest/secp256k1/struct.SecretKey.html
+/// [`EncodeSecret`]: https://github.com/zcash/zcash/blob/1f1f7a385adc048154e7f25a3a0de76f3658ca09/src/key_io.cpp#L298
+pub const B58_SECRET_KEY_PREFIX: [u8; 1] = [0xef];
+
 /// The prefix for a Base58Check-encoded regtest transparent [`PublicKeyHash`].
 /// Same as the testnet prefix.
 ///
@@ -57,3 +64,16 @@ pub const B58_SCRIPT_ADDRESS_PREFIX: [u8; 2] = [0x1c, 0xba];
 ///
 /// [ZIP 320]: https://zips.z.cash/zip-0320
 pub const HRP_TEX_ADDRESS: &str = "texregtest";
+
+/// The HRP for a Bech32m-encoded regtest Unified Address.
+///
+/// Defined in [ZIP 316][zip-0316].
+///
+/// [zip-0316]: https://zips.z.cash/zip-0316
+pub const HRP_UNIFIED_ADDRESS: &str = "uregtest";
+
+/// The HRP for a Bech32m-encoded regtest Unified FVK.
+pub const HRP_UNIFIED_FVK: &str = "uviewregtest";
+
+/// The HRP for a Bech32m-encoded regtest Unified IVK.
+pub const HRP_UNIFIED_IVK: &str = "uivkregtest";

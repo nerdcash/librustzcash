@@ -1,8 +1,7 @@
-use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use super::{Exchange, ExchangeData};
+use super::{Exchange, ExchangeData, RETRY_LIMIT, retry_filter};
 use crate::tor::{Client, Error};
 
 /// Querier for the Binance exchange.
@@ -44,16 +43,17 @@ struct BinanceData {
     count: u32,
 }
 
-#[async_trait]
 impl Exchange for Binance {
     async fn query_zec_to_usd(&self, client: &Client) -> Result<ExchangeData, Error> {
         // API documentation:
         // https://binance-docs.github.io/apidocs/spot/en/#24hr-ticker-price-change-statistics
         let res = client
-            .get_json::<BinanceData>(
+            .http_get_json::<BinanceData>(
                 "https://api.binance.com/api/v3/ticker/24hr?symbol=ZECUSDT"
                     .parse()
                     .unwrap(),
+                RETRY_LIMIT,
+                retry_filter,
             )
             .await?;
         let data = res.into_body();

@@ -3,11 +3,11 @@
 use prost::Message;
 use rusqlite::params;
 
-use zcash_primitives::consensus::BlockHeight;
+use zcash_protocol::consensus::BlockHeight;
 
 use zcash_client_backend::{data_api::chain::error::Error, proto::compact_formats::CompactBlock};
 
-use crate::{error::SqliteClientError, BlockDb};
+use crate::{BlockDb, error::SqliteClientError};
 
 #[cfg(feature = "unstable")]
 use {
@@ -166,13 +166,13 @@ pub(crate) fn blockmetadb_insert(
             match conn.execute("ROLLBACK", []) {
                 Ok(_) => Err(error),
                 Err(e) =>
-                    // Panicking here is probably the right thing to do, because it
-                    // means the database is corrupt.
+                // Panicking here is probably the right thing to do, because it
+                // means the database is corrupt.
+                {
                     panic!(
-                        "Rollback failed with error {} while attempting to recover from error {}; database is likely corrupt.",
-                        e,
-                        error
+                        "Rollback failed with error {e} while attempting to recover from error {error}; database is likely corrupt."
                     )
+                }
             }
         }
     }
@@ -320,7 +320,6 @@ where
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use zcash_client_backend::data_api::testing::sapling::SaplingPoolTester;
 
@@ -340,7 +339,6 @@ mod tests {
         testing::pool::valid_chain_states::<OrchardPoolTester>()
     }
 
-    // FIXME: This requires test framework fixes to pass.
     #[test]
     #[cfg(feature = "orchard")]
     fn invalid_chain_cache_disconnected_sapling() {

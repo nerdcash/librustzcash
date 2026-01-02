@@ -65,8 +65,7 @@ fn read_shard_v1<H: HashSer, R: Read>(mut reader: &mut R) -> io::Result<Prunable
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "Byte value {} does not correspond to a valid set of retention flags",
-                            bits
+                            "Byte value {bits} does not correspond to a valid set of retention flags"
                         ),
                     )
                 })
@@ -76,7 +75,7 @@ fn read_shard_v1<H: HashSer, R: Read>(mut reader: &mut R) -> io::Result<Prunable
         NIL_TAG => Ok(Tree::empty()),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Node tag not recognized: {}", other),
+            format!("Node tag not recognized: {other}"),
         )),
     }
 }
@@ -91,14 +90,14 @@ pub fn read_shard<H: HashSer, R: Read>(mut reader: R) -> io::Result<PrunableTree
         SER_V1 => read_shard_v1(&mut reader),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Shard serialization version not recognized: {}", other),
+            format!("Shard serialization version not recognized: {other}"),
         )),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use incrementalmerkletree::frontier::testing::{arb_test_node, TestNode};
+    use incrementalmerkletree::frontier::testing::{TestNode, arb_test_node};
     use proptest::prelude::*;
     use shardtree::testing::arb_prunable_tree;
     use std::io::Cursor;

@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::mem;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use memuse::DynamicUsage;
 use zcash_note_encryption::{
-    batch, BatchDomain, Domain, ShieldedOutput, COMPACT_NOTE_SIZE, ENC_CIPHERTEXT_SIZE,
+    BatchDomain, COMPACT_NOTE_SIZE, Domain, ENC_CIPHERTEXT_SIZE, ShieldedOutput, batch,
 };
 use zcash_primitives::{block::BlockHash, transaction::TxId};
 
@@ -47,12 +47,11 @@ where
 pub(crate) trait Decryptor<D: BatchDomain, Output> {
     type Memo;
 
-    // Once we reach MSRV 1.75.0, this can return `impl Iterator`.
     fn batch_decrypt<IvkTag: Clone>(
         tags: &[IvkTag],
         ivks: &[D::IncomingViewingKey],
         outputs: &[(D, Output)],
-    ) -> Vec<Option<DecryptedOutput<IvkTag, D, Self::Memo>>>;
+    ) -> impl Iterator<Item = Option<DecryptedOutput<IvkTag, D, Self::Memo>>>;
 }
 
 /// A decryptor of outputs as encoded in transactions.
@@ -68,7 +67,7 @@ impl<D: BatchDomain, Output: ShieldedOutput<D, ENC_CIPHERTEXT_SIZE>> Decryptor<D
         tags: &[IvkTag],
         ivks: &[D::IncomingViewingKey],
         outputs: &[(D, Output)],
-    ) -> Vec<Option<DecryptedOutput<IvkTag, D, Self::Memo>>> {
+    ) -> impl Iterator<Item = Option<DecryptedOutput<IvkTag, D, Self::Memo>>> {
         batch::try_note_decryption(ivks, outputs)
             .into_iter()
             .map(|res| {
@@ -79,7 +78,6 @@ impl<D: BatchDomain, Output: ShieldedOutput<D, ENC_CIPHERTEXT_SIZE>> Decryptor<D
                     memo,
                 })
             })
-            .collect()
     }
 }
 
@@ -95,7 +93,7 @@ impl<D: BatchDomain, Output: ShieldedOutput<D, COMPACT_NOTE_SIZE>> Decryptor<D, 
         tags: &[IvkTag],
         ivks: &[D::IncomingViewingKey],
         outputs: &[(D, Output)],
-    ) -> Vec<Option<DecryptedOutput<IvkTag, D, Self::Memo>>> {
+    ) -> impl Iterator<Item = Option<DecryptedOutput<IvkTag, D, Self::Memo>>> {
         batch::try_compact_note_decryption(ivks, outputs)
             .into_iter()
             .map(|res| {
@@ -106,7 +104,6 @@ impl<D: BatchDomain, Output: ShieldedOutput<D, COMPACT_NOTE_SIZE>> Decryptor<D, 
                     memo: (),
                 })
             })
-            .collect()
     }
 }
 
@@ -148,7 +145,7 @@ impl<IvkTag, D: Domain, M> DynamicUsage for BatchReceiver<IvkTag, D, M> {
         // linked list. `crossbeam_channel` allocates memory for the linked list in blocks
         // of 31 items.
         const ITEMS_PER_BLOCK: usize = 31;
-        let num_blocks = (num_items + ITEMS_PER_BLOCK - 1) / ITEMS_PER_BLOCK;
+        let num_blocks = num_items.div_ceil(ITEMS_PER_BLOCK);
 
         // The structure of a block is:
         // - A pointer to the next block.
@@ -258,6 +255,7 @@ impl<Item: Task + DynamicUsage> Tasks<Item> for WithUsage {
 
 /// A task that will clean up its own heap usage from the overall running usage once it is
 /// complete.
+#[allow(dead_code)]
 pub(crate) struct WithUsageTask<Item> {
     /// The item being run.
     item: Item,
@@ -375,9 +373,7 @@ where
         assert_eq!(outputs.len(), repliers.len());
 
         let decryption_results = Dec::batch_decrypt(&tags, &ivks, &outputs);
-        for (decryption_result, OutputReplier(replier)) in
-            decryption_results.into_iter().zip(repliers.into_iter())
-        {
+        for (decryption_result, OutputReplier(replier)) in decryption_results.zip(repliers) {
             // If `decryption_result` is `None` then we will just drop `replier`,
             // indicating to the parent `BatchRunner` that this output was not for us.
             if let Some(value) = decryption_result {
@@ -480,11 +476,11 @@ where
             self.pending_results.dynamic_usage_bounds(),
         );
         (
-            bounds.0 .0 + running_usage + bounds.1 .0,
+            bounds.0.0 + running_usage + bounds.1.0,
             bounds
                 .0
-                 .1
-                .zip(bounds.1 .1)
+                .1
+                .zip(bounds.1.1)
                 .map(|(a, b)| a + running_usage + b),
         )
     }

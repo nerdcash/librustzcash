@@ -15,26 +15,25 @@ use futures_util::TryStreamExt;
 use shardtree::error::ShardTreeError;
 use subtle::ConditionallySelectable;
 use tonic::{
-    body::BoxBody,
+    body::Body as TonicBody,
     client::GrpcService,
     codegen::{Body, Bytes, StdError},
 };
 use tracing::{debug, info};
-use zcash_primitives::{
-    consensus::{BlockHeight, Parameters},
-    merkle_tree::HashSer,
-};
+
+use zcash_primitives::merkle_tree::HashSer;
+use zcash_protocol::consensus::{BlockHeight, Parameters};
 
 use crate::{
     data_api::{
+        WalletCommitmentTrees, WalletRead, WalletWrite,
         chain::{
-            error::Error as ChainError, scan_cached_blocks, BlockCache, ChainState,
-            CommitmentTreeRoot,
+            BlockCache, ChainState, CommitmentTreeRoot, error::Error as ChainError,
+            scan_cached_blocks,
         },
         scanning::{ScanPriority, ScanRange},
-        WalletCommitmentTrees, WalletRead, WalletWrite,
     },
-    proto::service::{self, compact_tx_streamer_client::CompactTxStreamerClient, BlockId},
+    proto::service::{self, BlockId, compact_tx_streamer_client::CompactTxStreamerClient},
     scanning::ScanError,
 };
 
@@ -43,12 +42,14 @@ use orchard::tree::MerkleHashOrchard;
 
 #[cfg(feature = "transparent-inputs")]
 use {
-    crate::{encoding::AddressCodec, wallet::WalletTransparentOutput},
-    zcash_primitives::{
-        legacy::Script,
-        transaction::components::transparent::{OutPoint, TxOut},
+    crate::wallet::WalletTransparentOutput,
+    ::transparent::{
+        address::Script,
+        bundle::{OutPoint, TxOut},
     },
-    zcash_protocol::{consensus::NetworkUpgrade, value::Zatoshis},
+    zcash_keys::encoding::AddressCodec as _,
+    zcash_protocol::value::Zatoshis,
+    zcash_script::script,
 };
 
 /// Scans the chain until the wallet is up-to-date.
@@ -61,7 +62,7 @@ pub async fn run<P, ChT, CaT, DbT>(
 ) -> Result<(), Error<CaT::Error, <DbT as WalletRead>::Error, <DbT as WalletCommitmentTrees>::Error>>
 where
     P: Parameters + Send + 'static,
-    ChT: GrpcService<BoxBody>,
+    ChT: GrpcService<TonicBody>,
     ChT::Error: Into<StdError>,
     ChT::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <ChT::ResponseBody as Body>::Error: Into<StdError> + Send,
@@ -72,27 +73,11 @@ where
     <DbT as WalletRead>::Error: std::error::Error + Send + Sync + 'static,
     <DbT as WalletCommitmentTrees>::Error: std::error::Error + Send + Sync + 'static,
 {
-    #[cfg(feature = "transparent-inputs")]
-    let wallet_birthday = db_data
-        .get_wallet_birthday()
-        .map_err(Error::Wallet)?
-        .unwrap_or_else(|| params.activation_height(NetworkUpgrade::Sapling).unwrap());
-
     // 1) Download note commitment tree data from lightwalletd
     // 2) Pass the commitment tree data to the database.
     update_subtree_roots(client, db_data).await?;
 
-    while running(
-        client,
-        params,
-        db_cache,
-        db_data,
-        batch_size,
-        #[cfg(feature = "transparent-inputs")]
-        wallet_birthday,
-    )
-    .await?
-    {}
+    while running(client, params, db_cache, db_data, batch_size).await? {}
 
     Ok(())
 }
@@ -103,11 +88,10 @@ async fn running<P, ChT, CaT, DbT, TrErr>(
     db_cache: &CaT,
     db_data: &mut DbT,
     batch_size: u32,
-    #[cfg(feature = "transparent-inputs")] wallet_birthday: BlockHeight,
 ) -> Result<bool, Error<CaT::Error, <DbT as WalletRead>::Error, TrErr>>
 where
     P: Parameters + Send + 'static,
-    ChT: GrpcService<BoxBody>,
+    ChT: GrpcService<TonicBody>,
     ChT::Error: Into<StdError>,
     ChT::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <ChT::ResponseBody as Body>::Error: Into<StdError> + Send,
@@ -127,10 +111,8 @@ where
     #[cfg(feature = "transparent-inputs")]
     for account_id in db_data.get_account_ids().map_err(Error::Wallet)? {
         let start_height = db_data
-            .block_fully_scanned()
-            .map_err(Error::Wallet)?
-            .map(|meta| meta.block_height())
-            .unwrap_or(wallet_birthday);
+            .utxo_query_height(account_id)
+            .map_err(Error::Wallet)?;
         info!(
             "Refreshing UTXOs for {:?} from height {}",
             account_id, start_height,
@@ -243,7 +225,7 @@ async fn update_subtree_roots<ChT, DbT, CaErr, DbErr>(
     db_data: &mut DbT,
 ) -> Result<(), Error<CaErr, DbErr, <DbT as WalletCommitmentTrees>::Error>>
 where
-    ChT: GrpcService<BoxBody>,
+    ChT: GrpcService<TonicBody>,
     ChT::Error: Into<StdError>,
     ChT::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <ChT::ResponseBody as Body>::Error: Into<StdError> + Send,
@@ -252,8 +234,6 @@ where
 {
     let mut request = service::GetSubtreeRootsArg::default();
     request.set_shielded_protocol(service::ShieldedProtocol::Sapling);
-    // Hack to work around a bug in the initial lightwalletd implementation.
-    request.max_entries = 65536;
 
     let sapling_roots: Vec<CommitmentTreeRoot<sapling::Node>> = client
         .get_subtree_roots(request)
@@ -278,8 +258,7 @@ where
     {
         let mut request = service::GetSubtreeRootsArg::default();
         request.set_shielded_protocol(service::ShieldedProtocol::Orchard);
-        // Hack to work around a bug in the initial lightwalletd implementation.
-        request.max_entries = 65536;
+
         let orchard_roots: Vec<CommitmentTreeRoot<MerkleHashOrchard>> = client
             .get_subtree_roots(request)
             .await?
@@ -308,7 +287,7 @@ async fn update_chain_tip<ChT, DbT, CaErr, TrErr>(
     db_data: &mut DbT,
 ) -> Result<(), Error<CaErr, <DbT as WalletRead>::Error, TrErr>>
 where
-    ChT: GrpcService<BoxBody>,
+    ChT: GrpcService<TonicBody>,
     ChT::Error: Into<StdError>,
     ChT::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <ChT::ResponseBody as Body>::Error: Into<StdError> + Send,
@@ -337,7 +316,7 @@ async fn download_blocks<ChT, CaT, DbErr, TrErr>(
     scan_range: &ScanRange,
 ) -> Result<(), Error<CaT::Error, DbErr, TrErr>>
 where
-    ChT: GrpcService<BoxBody>,
+    ChT: GrpcService<TonicBody>,
     ChT::Error: Into<StdError>,
     ChT::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <ChT::ResponseBody as Body>::Error: Into<StdError> + Send,
@@ -373,7 +352,7 @@ async fn download_chain_state<ChT, CaErr, DbErr, TrErr>(
     block_height: BlockHeight,
 ) -> Result<ChainState, Error<CaErr, DbErr, TrErr>>
 where
-    ChT: GrpcService<BoxBody>,
+    ChT: GrpcService<TonicBody>,
     ChT::Error: Into<StdError>,
     ChT::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <ChT::ResponseBody as Body>::Error: Into<StdError> + Send,
@@ -501,7 +480,7 @@ async fn refresh_utxos<P, ChT, DbT, CaErr, TrErr>(
 ) -> Result<(), Error<CaErr, <DbT as WalletRead>::Error, TrErr>>
 where
     P: Parameters + Send + 'static,
-    ChT: GrpcService<BoxBody>,
+    ChT: GrpcService<TonicBody>,
     ChT::Error: Into<StdError>,
     ChT::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <ChT::ResponseBody as Body>::Error: Into<StdError> + Send,
@@ -510,7 +489,7 @@ where
 {
     let request = service::GetAddressUtxosArg {
         addresses: db_data
-            .get_transparent_receivers(account_id)
+            .get_transparent_receivers(account_id, true, true)
             .map_err(Error::Wallet)?
             .into_keys()
             .map(|addr| addr.encode(params))
@@ -538,11 +517,11 @@ where
                             .try_into()
                             .map_err(|_| Error::MisbehavingServer)?,
                     ),
-                    TxOut {
-                        value: Zatoshis::from_nonnegative_i64(reply.value_zat)
+                    TxOut::new(
+                        Zatoshis::from_nonnegative_i64(reply.value_zat)
                             .map_err(|_| Error::MisbehavingServer)?,
-                        script_pubkey: Script(reply.script),
-                    },
+                        Script(script::Code(reply.script)),
+                    ),
                     Some(
                         BlockHeight::try_from(reply.height)
                             .map_err(|_| Error::MisbehavingServer)?,
@@ -586,19 +565,16 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Cache(e) => write!(f, "Error while interacting with block cache: {}", e),
+            Error::Cache(e) => write!(f, "Error while interacting with block cache: {e}"),
             Error::MisbehavingServer => write!(f, "lightwalletd server is misbehaving"),
-            Error::Scan(e) => write!(f, "Error while scanning blocks: {}", e),
-            Error::Server(e) => write!(
-                f,
-                "Error while communicating with lightwalletd server: {}",
-                e
-            ),
-            Error::Wallet(e) => write!(f, "Error while interacting with wallet database: {}", e),
+            Error::Scan(e) => write!(f, "Error while scanning blocks: {e}"),
+            Error::Server(e) => {
+                write!(f, "Error while communicating with lightwalletd server: {e}")
+            }
+            Error::Wallet(e) => write!(f, "Error while interacting with wallet database: {e}"),
             Error::WalletTrees(e) => write!(
                 f,
-                "Error while interacting with wallet commitment trees: {}",
-                e
+                "Error while interacting with wallet commitment trees: {e}"
             ),
         }
     }

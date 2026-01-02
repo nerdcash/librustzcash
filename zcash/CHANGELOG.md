@@ -7,6 +7,10 @@ and this library adheres to Rust's notion of
 
 ## [Unreleased]
 
+### Changed
+- MSRV is now 1.85.1.
+- Migrated to `zcash_primitives 0.22`.
+
 ## [0.1.0] - 2024-07-15
 Initial release that re-exports other crates. Expect that the API surface of
 this crate will change significantly in future releases.
