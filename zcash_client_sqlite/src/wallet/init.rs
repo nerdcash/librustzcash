@@ -28,6 +28,7 @@ const MIN_SQLITE_MINOR_VERSION: u32 = 35;
 
 const MIGRATIONS_TABLE: &str = "schemer_migrations";
 
+/// Errors that can occur when applying migrations to the wallet database.
 #[derive(Debug)]
 pub enum WalletMigrationError {
     /// A feature required by the wallet database is not supported by the version of
@@ -198,6 +199,8 @@ fn sqlite_client_error_to_wallet_migration_error(e: SqliteClientError) -> Wallet
         SqliteClientError::TableNotEmpty => unreachable!("wallet already initialized"),
         SqliteClientError::BlockConflict(_)
         | SqliteClientError::NonSequentialBlocks
+        | SqliteClientError::PutBlocksCommitmentTree { .. }
+        | SqliteClientError::TruncateCommitmentTree { .. }
         | SqliteClientError::RequestedRewindInvalid { .. }
         | SqliteClientError::KeyDerivationError(_)
         | SqliteClientError::Zip32AccountIndexOutOfRange
@@ -249,8 +252,17 @@ fn sqlite_client_error_to_wallet_migration_error(e: SqliteClientError) -> Wallet
             unreachable!("we don't service transaction data requests in migrations")
         }
         #[cfg(feature = "transparent-key-import")]
-        SqliteClientError::PubkeyImportConflict(_) => {
-            unreachable!("we do not import pubkeys in migrations")
+        SqliteClientError::StandaloneImportConflict(_) => {
+            unreachable!("we do not import standalone transparent addresses in migrations")
+        }
+        #[cfg(feature = "orchard")]
+        SqliteClientError::HistoricalFrontierInvalid(_)
+        | SqliteClientError::HistoricalWitnessUnavailable { .. } => {
+            unreachable!("we do not generate historical witnesses in migrations")
+        }
+        #[cfg(feature = "transparent-inputs")]
+        SqliteClientError::FeeRuleError(_) => {
+            unreachable!("we don't use fee rules in migrations")
         }
     }
 }
@@ -632,20 +644,18 @@ fn init_wallet_db_internal<
     // but unfortunately `schemer` does not currently expose its DAG of migrations. As a
     // consequence, the caller has to choose whether or not this check should be performed
     // based upon which migrations they're asking to apply.
-    if verify_seed_relevance {
-        if let Some(seed) = seed {
-            match wdb
-                .seed_relevance_to_derived_accounts(&seed)
-                .map_err(sqlite_client_error_to_wallet_migration_error)?
-            {
-                SeedRelevance::Relevant { .. } => (),
-                // Every seed is relevant to a wallet with no accounts; this is most likely a
-                // new wallet database being initialized for the first time.
-                SeedRelevance::NoAccounts => (),
-                // No seed is relevant to a wallet that only has imported accounts.
-                SeedRelevance::NotRelevant | SeedRelevance::NoDerivedAccounts => {
-                    return Err(WalletMigrationError::SeedNotRelevant.into());
-                }
+    if verify_seed_relevance && let Some(seed) = seed {
+        match wdb
+            .seed_relevance_to_derived_accounts(&seed)
+            .map_err(sqlite_client_error_to_wallet_migration_error)?
+        {
+            SeedRelevance::Relevant { .. } => (),
+            // Every seed is relevant to a wallet with no accounts; this is most likely a
+            // new wallet database being initialized for the first time.
+            SeedRelevance::NoAccounts => (),
+            // No seed is relevant to a wallet that only has imported accounts.
+            SeedRelevance::NotRelevant | SeedRelevance::NoDerivedAccounts => {
+                return Err(WalletMigrationError::SeedNotRelevant.into());
             }
         }
     }
@@ -750,10 +760,7 @@ mod tests {
         zip32::DiversifierIndex,
     };
 
-    #[cfg(all(
-        any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-        feature = "zip-233"
-    ))]
+    #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
     use zcash_protocol::value::Zatoshis;
 
     pub(crate) fn describe_tables(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
@@ -788,18 +795,34 @@ mod tests {
             db::TABLE_ACCOUNTS,
             db::TABLE_ADDRESSES,
             db::TABLE_BLOCKS,
+            db::TABLE_IRONWOOD_RECEIVED_NOTE_SPENDS,
+            db::TABLE_IRONWOOD_RECEIVED_NOTES,
+            db::TABLE_IRONWOOD_TREE_CAP,
+            db::TABLE_IRONWOOD_TREE_CHECKPOINT_MARKS_REMOVED,
+            db::TABLE_IRONWOOD_TREE_CHECKPOINTS,
+            db::TABLE_IRONWOOD_TREE_RETAINED_CHECKPOINTS,
+            db::TABLE_IRONWOOD_TREE_SHARDS,
             db::TABLE_NULLIFIER_MAP,
+            db::TABLE_ORCHARD_IRONWOOD_MIGRATION_CROSSING_VALUES,
+            db::TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_DIRECT_FUNDING,
+            db::TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_INPUTS,
+            db::TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_OUTPUTS,
+            db::TABLE_ORCHARD_IRONWOOD_MIGRATION_TRANSACTION_DEPS,
+            db::TABLE_ORCHARD_IRONWOOD_MIGRATION_TRANSACTIONS,
+            db::TABLE_ORCHARD_IRONWOOD_MIGRATIONS,
             db::TABLE_ORCHARD_RECEIVED_NOTE_SPENDS,
             db::TABLE_ORCHARD_RECEIVED_NOTES,
             db::TABLE_ORCHARD_TREE_CAP,
             db::TABLE_ORCHARD_TREE_CHECKPOINT_MARKS_REMOVED,
             db::TABLE_ORCHARD_TREE_CHECKPOINTS,
+            db::TABLE_ORCHARD_TREE_RETAINED_CHECKPOINTS,
             db::TABLE_ORCHARD_TREE_SHARDS,
             db::TABLE_SAPLING_RECEIVED_NOTE_SPENDS,
             db::TABLE_SAPLING_RECEIVED_NOTES,
             db::TABLE_SAPLING_TREE_CAP,
             db::TABLE_SAPLING_TREE_CHECKPOINT_MARKS_REMOVED,
             db::TABLE_SAPLING_TREE_CHECKPOINTS,
+            db::TABLE_SAPLING_TREE_RETAINED_CHECKPOINTS,
             db::TABLE_SAPLING_TREE_SHARDS,
             db::TABLE_SCAN_QUEUE,
             db::TABLE_SCHEMERZ_MIGRATIONS,
@@ -821,25 +844,40 @@ mod tests {
         }
 
         let expected_indices = vec![
+            db::INDEX_ACCOUNTS_ORCHARD_IVK,
+            db::INDEX_ACCOUNTS_P2PKH_IVK,
+            db::INDEX_ACCOUNTS_P2SH_IVK,
+            db::INDEX_ACCOUNTS_SAPLING_IVK,
             db::INDEX_ACCOUNTS_UFVK,
             db::INDEX_ACCOUNTS_UIVK,
             db::INDEX_ACCOUNTS_UUID,
             db::INDEX_HD_ACCOUNT,
             db::INDEX_ADDRESSES_ACCOUNTS,
+            db::INDEX_ADDRESSES_CACHED_TRANSPARENT_RECEIVER_ADDRESS,
             db::INDEX_ADDRESSES_INDICES,
             db::INDEX_ADDRESSES_PUBKEYS,
             db::INDEX_ADDRESSES_T_INDICES,
+            db::INDEX_IRONWOOD_RNS_NOTE,
+            db::INDEX_IRONWOOD_RNS_TX,
+            db::INDEX_IRONWOOD_RECEIVED_NOTES_ACCOUNT,
+            db::INDEX_IRONWOOD_RECEIVED_NOTES_ADDRESS,
+            db::INDEX_IRONWOOD_RECEIVED_NOTES_TX,
+            db::INDEX_IRONWOOD_RECEIVED_NOTES_WITNESS_STABILIZED,
             db::INDEX_NF_MAP_LOCATOR_IDX,
+            db::INDEX_ORCHARD_IRONWOOD_MIGRATION_TX_DUE,
+            db::INDEX_ORCHARD_IRONWOOD_MIGRATIONS_ACCOUNT,
             db::INDEX_ORCHARD_RNS_NOTE,
             db::INDEX_ORCHARD_RNS_TX,
             db::INDEX_ORCHARD_RECEIVED_NOTES_ACCOUNT,
             db::INDEX_ORCHARD_RECEIVED_NOTES_ADDRESS,
             db::INDEX_ORCHARD_RECEIVED_NOTES_TX,
+            db::INDEX_ORCHARD_RECEIVED_NOTES_WITNESS_STABILIZED,
             db::INDEX_SAPLING_RNS_NOTE,
             db::INDEX_SAPLING_RNS_TX,
             db::INDEX_SAPLING_RECEIVED_NOTES_ACCOUNT,
             db::INDEX_SAPLING_RECEIVED_NOTES_ADDRESS,
             db::INDEX_SAPLING_RECEIVED_NOTES_TX,
+            db::INDEX_SAPLING_RECEIVED_NOTES_WITNESS_STABILIZED,
             db::INDEX_SENT_NOTES_FROM_ACCOUNT,
             db::INDEX_SENT_NOTES_TO_ACCOUNT,
             db::INDEX_SENT_NOTES_TX,
@@ -848,6 +886,7 @@ mod tests {
             db::INDEX_TRANSPARENT_RECEIVED_OUTPUTS_ACCOUNT,
             db::INDEX_TRANSPARENT_RECEIVED_OUTPUTS_ADDRESS,
             db::INDEX_TRANSPARENT_RECEIVED_OUTPUTS_TX,
+            db::INDEX_TRANSPARENT_RECEIVED_OUTPUTS_VALUE_ZAT,
             db::INDEX_TRANSPARENT_SPEND_MAP_TX,
             db::INDEX_TRANSPARENT_SPEND_SEARCH_TX,
             db::INDEX_TX_RETIREVAL_QUEUE_DEPENDENT_TX,
@@ -872,6 +911,9 @@ mod tests {
         let expected_views = vec![
             db::VIEW_ADDRESS_FIRST_USE.to_owned(),
             db::VIEW_ADDRESS_USES.to_owned(),
+            db::view_ironwood_shard_scan_ranges(st.network()),
+            db::view_ironwood_shard_unscanned_ranges(),
+            db::VIEW_IRONWOOD_SHARDS_SCAN_STATE.to_owned(),
             db::view_orchard_shard_scan_ranges(st.network()),
             db::view_orchard_shard_unscanned_ranges(),
             db::VIEW_ORCHARD_SHARDS_SCAN_STATE.to_owned(),
@@ -1167,7 +1209,8 @@ mod tests {
 
             // add a sapling sent note
             wdb.conn.execute(
-                "INSERT INTO blocks (height, hash, time, sapling_tree) VALUES (0, 0, 0, x'000000')",
+                "INSERT INTO blocks (height, hash, time, sapling_tree) \
+                 VALUES (0, x'0000000000000000000000000000000000000000000000000000000000000000', 0, x'000000')",
                 [],
             )?;
 
@@ -1176,10 +1219,7 @@ mod tests {
                 BranchId::Canopy,
                 0,
                 BlockHeight::from(0),
-                #[cfg(all(
-                    any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-                    feature = "zip-233"
-                ))]
+                #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
                 Zatoshis::ZERO,
                 None,
                 None,
@@ -1365,7 +1405,8 @@ mod tests {
                 )
                 .encode(&wdb.params);
                 wdb.conn.execute(
-                    "INSERT INTO blocks (height, hash, time, sapling_tree) VALUES (0, 0, 0, x'000000')",
+                    "INSERT INTO blocks (height, hash, time, sapling_tree) \
+                 VALUES (0, x'0000000000000000000000000000000000000000000000000000000000000000', 0, x'000000')",
                     [],
                 )?;
                 wdb.conn.execute(

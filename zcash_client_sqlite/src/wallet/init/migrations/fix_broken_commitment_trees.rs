@@ -8,11 +8,14 @@ use uuid::Uuid;
 use zcash_client_backend::data_api::WalletCommitmentTrees;
 use zcash_protocol::consensus::{self, BlockHeight, NetworkUpgrade};
 
+use zcash_client_backend::data_api::anchor_retention::AnchorRetentionInterval;
+
 use crate::{
     error::SqliteClientError,
     wallet::{
         SqlTransaction, WalletDb,
         init::{WalletMigrationError, migrations::support_legacy_sqlite},
+        trim_scan_queue_to,
     },
 };
 
@@ -65,170 +68,14 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
             .optional()?
             .flatten();
 
-        if let Some(max_height) = max_block_height {
-            // This migration inlines the logic from `wallet::truncate_to_height` that was present
-            // at the time of the migration, before the `confirmed_unmined_at_height` column was
-            // added to the transactions table. This ensures the migration works on databases
-            // that have not yet applied the `tx_observation_height` migration.
-
-            // Determine a checkpoint to which we can rewind, if any.
-            #[cfg(not(feature = "orchard"))]
-            let truncation_height_query = r#"
-                SELECT MAX(height) FROM blocks
-                JOIN sapling_tree_checkpoints ON checkpoint_id = blocks.height
-                WHERE blocks.height <= :block_height
-            "#;
-
-            #[cfg(feature = "orchard")]
-            let truncation_height_query = r#"
-                SELECT MAX(height) FROM blocks
-                JOIN sapling_tree_checkpoints sc ON sc.checkpoint_id = blocks.height
-                JOIN orchard_tree_checkpoints oc ON oc.checkpoint_id = blocks.height
-                WHERE blocks.height <= :block_height
-            "#;
-
-            let truncation_height = transaction
-                .query_row(
-                    truncation_height_query,
-                    named_params! {":block_height": u32::from(max_height)},
-                    |row| row.get::<_, Option<u32>>(0),
-                )
-                .optional()?
-                .flatten()
-                .map_or_else(
-                    || {
-                        // If we don't have a checkpoint at a height less than or equal to the requested
-                        // truncation height, query for the minimum height to which it's possible for us to
-                        // truncate so that we can report it to the caller.
-                        #[cfg(not(feature = "orchard"))]
-                        let min_checkpoint_height_query =
-                            "SELECT MIN(checkpoint_id) FROM sapling_tree_checkpoints";
-                        #[cfg(feature = "orchard")]
-                        let min_checkpoint_height_query = "SELECT MIN(sc.checkpoint_id)
-                             FROM sapling_tree_checkpoints sc
-                             JOIN orchard_tree_checkpoints oc
-                             ON oc.checkpoint_id = sc.checkpoint_id";
-
-                        let min_truncation_height = transaction
-                            .query_row(min_checkpoint_height_query, [], |row| {
-                                row.get::<_, Option<u32>>(0)
-                            })
-                            .optional()?
-                            .flatten()
-                            .map(BlockHeight::from);
-
-                        Err(WalletMigrationError::from(
-                            SqliteClientError::RequestedRewindInvalid {
-                                safe_rewind_height: min_truncation_height,
-                                requested_height: max_height,
-                            },
-                        ))
-                    },
-                    |h| Ok(BlockHeight::from(h)),
-                )?;
-
-            let last_scanned_height =
-                transaction.query_row("SELECT MAX(height) FROM blocks", [], |row| {
-                    let h = row.get::<_, Option<u32>>(0)?;
-
-                    Ok(h.map_or_else(
-                        || {
-                            self.params
-                                .activation_height(NetworkUpgrade::Sapling)
-                                .expect("Sapling activation height must be available.")
-                                - 1
-                        },
-                        BlockHeight::from,
-                    ))
-                })?;
-
-            // Delete from the scanning queue any range with a start height greater than the
-            // truncation height, and then truncate any remaining range by setting the end
-            // equal to the truncation height + 1. This sets our view of the chain tip back
-            // to the retained height.
-            transaction.execute(
-                "DELETE FROM scan_queue
-                WHERE block_range_start >= :new_end_height",
-                named_params![":new_end_height": u32::from(truncation_height + 1)],
+        if let Some(h) = max_block_height {
+            truncate_to_height(
+                transaction,
+                &self.params,
+                #[cfg(feature = "transparent-inputs")]
+                &GapLimits::default(),
+                h,
             )?;
-            transaction.execute(
-                "UPDATE scan_queue
-                SET block_range_end = :new_end_height
-                WHERE block_range_end > :new_end_height",
-                named_params![":new_end_height": u32::from(truncation_height + 1)],
-            )?;
-
-            // Mark transparent utxos as un-mined. Since the TXO is now not mined, it would ideally be
-            // considered to have been returned to the mempool; it _might_ be spendable in this state, but
-            // we must also set its max_observed_unspent_height field to NULL because the transaction may
-            // be rendered entirely invalid by a reorg that alters anchor(s) used in constructing shielded
-            // spends in the transaction.
-            transaction.execute(
-                "UPDATE transparent_received_outputs
-                 SET max_observed_unspent_height = CASE
-                    WHEN tx.mined_height <= :height THEN :height
-                    ELSE NULL
-                 END
-                 FROM transactions tx
-                 WHERE tx.id_tx = transaction_id
-                 AND max_observed_unspent_height > :height",
-                named_params![":height": u32::from(truncation_height)],
-            )?;
-
-            // Un-mine transactions. This must be done outside of the last_scanned_height check because
-            // transaction entries may be created as a consequence of receiving transparent TXOs.
-            // NOTE: This version does not reference `confirmed_unmined_at_height` which is added by a
-            // later migration (`tx_observation_height`).
-            transaction.execute(
-                "UPDATE transactions
-                 SET block = NULL, mined_height = NULL, tx_index = NULL
-                 WHERE mined_height > :height",
-                named_params![":height": u32::from(truncation_height)],
-            )?;
-
-            // If we're removing scanned blocks, we need to truncate the note commitment tree and remove
-            // affected block records from the database.
-            if truncation_height < last_scanned_height {
-                // Truncate the note commitment trees
-                let mut wdb = WalletDb {
-                    conn: SqlTransaction(transaction),
-                    params: self.params.clone(),
-                    clock: (),
-                    rng: (),
-                    #[cfg(feature = "transparent-inputs")]
-                    gap_limits: GapLimits::default(),
-                };
-                wdb.with_sapling_tree_mut(|tree| {
-                    tree.truncate_to_checkpoint(&truncation_height)?;
-                    Ok::<_, SqliteClientError>(())
-                })?;
-                #[cfg(feature = "orchard")]
-                wdb.with_orchard_tree_mut(|tree| {
-                    tree.truncate_to_checkpoint(&truncation_height)?;
-                    Ok::<_, SqliteClientError>(())
-                })?;
-
-                // Do not delete sent notes; this can contain data that is not recoverable
-                // from the chain. Wallets must continue to operate correctly in the
-                // presence of stale sent notes that link to unmined transactions.
-                // Also, do not delete received notes; they may contain memo data that is
-                // not recoverable; balance APIs must ensure that un-mined received notes
-                // do not count towards spendability or transaction balalnce.
-
-                // Now that they aren't depended on, delete un-mined blocks.
-                transaction.execute(
-                    "DELETE FROM blocks WHERE height > ?",
-                    [u32::from(truncation_height)],
-                )?;
-
-                // Delete from the nullifier map any entries with a locator referencing a block
-                // height greater than the truncation height.
-                transaction.execute(
-                    "DELETE FROM tx_locator_map
-                    WHERE block_height > :block_height",
-                    named_params![":block_height": u32::from(truncation_height)],
-                )?;
-            }
         }
 
         Ok(())
@@ -237,6 +84,170 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
     fn down(&self, _: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
         Err(WalletMigrationError::CannotRevert(MIGRATION_ID))
     }
+}
+
+/// Truncates the database to at most the given height.
+///
+/// If the requested height is greater than or equal to the height of the last scanned
+/// block, this function does nothing.
+///
+/// This should only be executed inside a transactional context.
+///
+/// Returns the block height to which the database was truncated.
+///
+/// Frozen from `58913805e1b991bc4ee7a040f5d7ce2994f9f16a` prior to the addition of the
+/// `confirmed_unmined_at_height` column in the `tx_observation_height` migration.
+fn truncate_to_height<P: consensus::Parameters>(
+    conn: &rusqlite::Transaction,
+    params: &P,
+    #[cfg(feature = "transparent-inputs")] gap_limits: &GapLimits,
+    max_height: BlockHeight,
+) -> Result<BlockHeight, SqliteClientError> {
+    // Determine a checkpoint to which we can rewind, if any.
+    #[cfg(not(feature = "orchard"))]
+    let truncation_height_query = r#"
+        SELECT MAX(height) FROM blocks
+        JOIN sapling_tree_checkpoints ON checkpoint_id = blocks.height
+        WHERE blocks.height <= :block_height
+    "#;
+
+    #[cfg(feature = "orchard")]
+    let truncation_height_query = r#"
+        SELECT MAX(height) FROM blocks
+        JOIN sapling_tree_checkpoints sc ON sc.checkpoint_id = blocks.height
+        JOIN orchard_tree_checkpoints oc ON oc.checkpoint_id = blocks.height
+        WHERE blocks.height <= :block_height
+    "#;
+
+    let truncation_height = conn
+        .query_row(
+            truncation_height_query,
+            named_params! {":block_height": u32::from(max_height)},
+            |row| row.get::<_, Option<u32>>(0),
+        )
+        .optional()?
+        .flatten()
+        .map_or_else(
+            || {
+                // If we don't have a checkpoint at a height less than or equal to the requested
+                // truncation height, query for the minimum height to which it's possible for us to
+                // truncate so that we can report it to the caller.
+                #[cfg(not(feature = "orchard"))]
+                let min_checkpoint_height_query =
+                    "SELECT MIN(checkpoint_id) FROM sapling_tree_checkpoints";
+                #[cfg(feature = "orchard")]
+                let min_checkpoint_height_query = "SELECT MIN(sc.checkpoint_id)
+                     FROM sapling_tree_checkpoints sc
+                     JOIN orchard_tree_checkpoints oc
+                     ON oc.checkpoint_id = sc.checkpoint_id";
+
+                let min_truncation_height = conn
+                    .query_row(min_checkpoint_height_query, [], |row| {
+                        row.get::<_, Option<u32>>(0)
+                    })
+                    .optional()?
+                    .flatten()
+                    .map(BlockHeight::from);
+
+                Err(SqliteClientError::RequestedRewindInvalid {
+                    safe_rewind_height: min_truncation_height,
+                    requested_height: max_height,
+                })
+            },
+            |h| Ok(BlockHeight::from(h)),
+        )?;
+
+    let last_scanned_height = conn.query_row("SELECT MAX(height) FROM blocks", [], |row| {
+        let h = row.get::<_, Option<u32>>(0)?;
+
+        Ok(h.map_or_else(
+            || {
+                params
+                    .activation_height(NetworkUpgrade::Sapling)
+                    // Fall back to the genesis block in regtest mode.
+                    .map_or(BlockHeight::from_u32(0), |h| h - 1)
+            },
+            BlockHeight::from,
+        ))
+    })?;
+
+    // Delete from the scanning queue any range with a start height greater than the
+    // truncation height, and then truncate any remaining range by setting the end
+    // equal to the truncation height + 1. This sets our view of the chain tip back
+    // to the retained height.
+    trim_scan_queue_to(conn, truncation_height)?;
+
+    // Mark transparent utxos as un-mined. Since the TXO is now not mined, it would ideally be
+    // considered to have been returned to the mempool; it _might_ be spendable in this state, but
+    // we must also set its max_observed_unspent_height field to NULL because the transaction may
+    // be rendered entirely invalid by a reorg that alters anchor(s) used in constructing shielded
+    // spends in the transaction.
+    conn.execute(
+        "UPDATE transparent_received_outputs
+         SET max_observed_unspent_height = CASE WHEN tx.mined_height <= :height THEN :height ELSE NULL END
+         FROM transactions tx
+         WHERE tx.id_tx = transaction_id
+         AND max_observed_unspent_height > :height",
+        named_params![":height": u32::from(truncation_height)],
+    )?;
+
+    // Un-mine transactions. This must be done outside of the last_scanned_height check because
+    // transaction entries may be created as a consequence of receiving transparent TXOs.
+    conn.execute(
+        "UPDATE transactions
+         SET block = NULL, mined_height = NULL, tx_index = NULL
+         WHERE mined_height > :height",
+        named_params![":height": u32::from(truncation_height)],
+    )?;
+
+    // If we're removing scanned blocks, we need to truncate the note commitment tree and remove
+    // affected block records from the database.
+    if truncation_height < last_scanned_height {
+        // Truncate the note commitment trees
+        let mut wdb = WalletDb {
+            conn: SqlTransaction(conn),
+            params: params.clone(),
+            clock: (),
+            rng: (),
+            // Truncation removes checkpoints; it never establishes them, so no anchor retention
+            // decision is made through this handle and the interval is immaterial.
+            anchor_retention_interval: AnchorRetentionInterval::default(),
+            #[cfg(feature = "transparent-inputs")]
+            gap_limits: *gap_limits,
+        };
+        wdb.with_sapling_tree_mut(|tree| {
+            tree.truncate_to_checkpoint(&truncation_height)?;
+            Ok::<_, SqliteClientError>(())
+        })?;
+        #[cfg(feature = "orchard")]
+        wdb.with_orchard_tree_mut(|tree| {
+            tree.truncate_to_checkpoint(&truncation_height)?;
+            Ok::<_, SqliteClientError>(())
+        })?;
+
+        // Do not delete sent notes; this can contain data that is not recoverable
+        // from the chain. Wallets must continue to operate correctly in the
+        // presence of stale sent notes that link to unmined transactions.
+        // Also, do not delete received notes; they may contain memo data that is
+        // not recoverable; balance APIs must ensure that un-mined received notes
+        // do not count towards spendability or transaction balalnce.
+
+        // Now that they aren't depended on, delete un-mined blocks.
+        conn.execute(
+            "DELETE FROM blocks WHERE height > ?",
+            [u32::from(truncation_height)],
+        )?;
+
+        // Delete from the nullifier map any entries with a locator referencing a block
+        // height greater than the truncation height.
+        conn.execute(
+            "DELETE FROM tx_locator_map
+            WHERE block_height > :block_height",
+            named_params![":block_height": u32::from(truncation_height)],
+        )?;
+    }
+
+    Ok(truncation_height)
 }
 
 #[cfg(test)]
@@ -250,7 +261,7 @@ mod tests {
         testing::db::{test_clock, test_rng},
         wallet::init::{
             WalletMigrator,
-            migrations::{support_legacy_sqlite, tx_observation_height},
+            migrations::{support_legacy_sqlite, tests::test_migrate, tx_observation_height},
         },
     };
 
@@ -258,7 +269,7 @@ mod tests {
 
     #[test]
     fn migrate() {
-        crate::wallet::init::migrations::tests::test_migrate(&[MIGRATION_ID]);
+        test_migrate(&[MIGRATION_ID]);
     }
 
     /// Test that the migration works correctly when the `confirmed_unmined_at_height` column

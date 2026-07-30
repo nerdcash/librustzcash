@@ -276,10 +276,6 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
 mod tests {
     use std::convert::Infallible;
 
-    use crate::ParallelSliceMut;
-    #[cfg(feature = "multicore")]
-    use maybe_rayon::iter::{IndexedParallelIterator, ParallelIterator};
-
     use incrementalmerkletree::Position;
     use rand_core::OsRng;
     use rusqlite::{Connection, OptionalExtension, named_params, params};
@@ -292,7 +288,9 @@ mod tests {
     };
     use zcash_client_backend::{
         TransferType,
-        data_api::{BlockMetadata, SAPLING_SHARD_HEIGHT, WalletCommitmentTrees},
+        data_api::{
+            BlockMetadata, SAPLING_SHARD_HEIGHT, WalletCommitmentTrees, ll::ReceivedSaplingOutput,
+        },
         decrypt_transaction,
         proto::compact_formats::{CompactBlock, CompactTx},
         scanning::{Nullifiers, ScanningKeys, scan_block},
@@ -303,7 +301,7 @@ mod tests {
         block::BlockHash,
         transaction::{
             Transaction,
-            builder::{BuildConfig, BuildResult, Builder},
+            builder::{BuildConfig, BuildResult, Builder, BundlePadding},
             fees::fixed,
         },
     };
@@ -326,7 +324,6 @@ mod tests {
                 migrations::{add_account_birthdays, shardtree_support, wallet_summaries},
             },
             memo_repr,
-            sapling::ReceivedSaplingOutput,
         },
     };
 
@@ -365,11 +362,14 @@ mod tests {
             BuildConfig::Standard {
                 sapling_anchor: Some(sapling::Anchor::empty_tree()),
                 orchard_anchor: None,
+                ironwood_anchor: None,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             },
         );
         let mut transparent_signing_set = TransparentSigningSet::new();
         builder
-            .add_transparent_input(
+            .add_transparent_p2pkh_input(
                 transparent_signing_set.add_key(
                     usk0.transparent()
                         .derive_external_secret_key(NonHardenedChildIndex::ZERO)
@@ -561,7 +561,7 @@ mod tests {
                 // migration.
                 for output in d_tx.sapling_outputs() {
                     match output.transfer_type() {
-                        TransferType::Outgoing | TransferType::WalletInternal => {
+                        TransferType::Outgoing | TransferType::AccountInternal => {
                             // Don't need to bother with sent outputs for this test.
                             if output.transfer_type() != TransferType::Outgoing {
                                 put_received_note_before_migration(
@@ -581,6 +581,9 @@ mod tests {
                             put_received_note_before_migration(wdb.conn.0, output, tx_ref.0, None)
                                 .unwrap();
                         }
+                        TransferType::WalletInternal => unreachable!(
+                            "TransferType::WalletInternal is only produced for transparent outputs"
+                        ),
                     }
                 }
 
@@ -645,7 +648,7 @@ mod tests {
         let tx = res.transaction();
 
         let mut compact_tx = CompactTx {
-            hash: tx.txid().as_ref()[..].into(),
+            txid: tx.txid().as_ref()[..].into(),
             ..Default::default()
         };
         for output in tx.sapling_bundle().unwrap().shielded_outputs() {
@@ -669,6 +672,8 @@ mod tests {
             Some(&BlockMetadata::from_parts(
                 height - 1,
                 prev_hash,
+                Some(0),
+                #[cfg(feature = "orchard")]
                 Some(0),
                 #[cfg(feature = "orchard")]
                 Some(0),
@@ -740,7 +745,7 @@ mod tests {
                     // Create subtrees from the note commitments in parallel.
                     const CHUNK_SIZE: usize = 1024;
                     let subtrees = sapling_commitments
-                        .par_chunks_mut(CHUNK_SIZE)
+                        .chunks_mut(CHUNK_SIZE)
                         .enumerate()
                         .filter_map(|(i, chunk)| {
                             let start = start_position + (i * CHUNK_SIZE) as u64;
@@ -910,7 +915,7 @@ mod tests {
         let tx_params = named_params![
             ":txid": &txid_bytes.as_ref()[..],
             ":block": u32::from(height),
-            ":tx_index": i64::try_from(tx.block_index()).expect("transaction indices are representable as i64"),
+            ":tx_index": u16::from(tx.block_index()),
         ];
 
         stmt_upsert_tx_meta

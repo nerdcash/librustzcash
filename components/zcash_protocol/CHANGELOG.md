@@ -10,6 +10,90 @@ workspace.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-23
+
+### Added
+- `zcash_protocol::consensus::SECONDS_PER_BLOCK`
+- `zcash_protocol::consensus::BLOCKS_PER_HOUR`
+- `zcash_protocol::constants::MAX_BLOCK_BYTES`, the Zcash consensus maximum
+  block size and therefore the maximum size of any single transaction.
+- `zcash_protocol::value::Zatoshis::{write, read, to_u64_le_bytes}`, a canonical
+  little-endian `u64` binary codec for amounts.
+- `zcash_protocol::testing::arb_txid` (behind the `test-dependencies` feature)
+- `zcash_protocol::consensus::testing::`
+  - `arb_block_height` 
+  - `arb_height_for_branch` 
+
+### Deprecated
+- `zcash_protocol::consensus::testing::arb_height` has been deprecated; use
+  `arb_height_for_branch` instead.
+
+## [0.10.0] - 2026-07-09
+
+This release sets the NU6.3 mainnet activation height to 3428143.
+
+### Added
+- `zcash_protocol::consensus::OrchardProtocolRevision`
+- `zcash_protocol::consensus::BranchId::orchard_protocol_revision`
+- `zcash_protocol::consensus::BranchId::network_upgrade`
+- `zcash_protocol::consensus::NetworkUpgrade::branch_id` (previously private)
+
+### Changed
+- MSRV is now 1.88
+
+## [0.10.0-pre.0] - 2026-06-30
+
+This release sets the NU6.3 activation height to 4134000 on testnet.
+Mainnet activation will be set in the 0.10.0 final release.
+
+### Added
+- `zcash_protocol::constants::{V6_TX_VERSION, V6_VERSION_GROUP_ID}`
+- `zcash_protocol::consensus::{NetworkUpgrade::Nu6_3, BranchId::Nu6_3}`
+- `zcash_protocol::local_consensus::LocalNetwork::nu6_3`.
+
+### Removed
+- All support for Transparent Zcash Extensions (TZEs), which was only ever
+  available behind the `--cfg zcash_unstable="zfuture"` development flag and has
+  been determined never to land. This removes the `zfuture` configuration and
+  everything it gated, including:
+  - `zcash_protocol::consensus::NetworkUpgrade::ZFuture` and
+    `zcash_protocol::consensus::BranchId::ZFuture`.
+  - `zcash_protocol::constants::{ZFUTURE_TX_VERSION, ZFUTURE_VERSION_GROUP_ID}`.
+  - `zcash_protocol::local_consensus::LocalNetwork::z_future`.
+
+## [0.9.0] - 2026-06-02
+
+### Changed
+- This release sets the NU6.2 network activation height to 
+  3364600 on mainnet and 4052000 on testnet.
+- `zcash_protocol::consensus`:
+  - `BranchId` now has an additional `Nu6_2` variant.
+  - `NetworkUpgrade` now has an additional `Nu6_2` variant.
+- `zcash_protocol::local_consensus`:
+  - `LocalNetwork` has a new field `nu6_2`.
+
+### Fixed
+- Updated to crate versions that fix an Orchard soundness vulnerability
+  (GHSA-ww9q-8r59-xv46) and Orchard non-canonical proof size issue
+  (GHSA-2x4w-pxqw-58v9).
+
+## [0.8.0] - 2026-04-23
+
+### Added
+- `zcash_protocol::consensus::TxIndex`
+- `zcash_protocol::consensus::COINBASE_MATURITY_BLOCKS`
+- `zcash_protocol::consensus::BranchId::{has_sprout, has_sapling, has_orchard}`
+
+### Changed
+- MSRV is now 1.85.1
+- Migrated to `zcash_encoding 0.4`
+- Migrated from the yanked `core2` crate to `corez 0.1.1`.
+
+## [0.7.2] - 2025-12-10
+
+### Added
+- `zcash_protocol::txid::TxId::NULL`
+
 ## [0.7.1] - 2025-10-18
 
 ### Fixed

@@ -14,7 +14,7 @@ use zcash_address::ZcashAddress;
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedIncomingViewingKey};
 use zcash_protocol::consensus::{self, BlockHeight};
 
-use super::add_account_uuids;
+use super::{add_account_uuids, add_transparent_sync_tracking};
 use crate::{
     AccountRef,
     util::Clock,
@@ -38,7 +38,10 @@ use {
 
 pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xc41dfc0e_e870_4859_be47_d2f572f5ca73);
 
-const DEPENDENCIES: &[Uuid] = &[add_account_uuids::MIGRATION_ID];
+const DEPENDENCIES: &[Uuid] = &[
+    add_account_uuids::MIGRATION_ID,
+    add_transparent_sync_tracking::MIGRATION_ID,
+];
 
 pub(super) struct Migration<P, C, R> {
     pub(super) params: P,
