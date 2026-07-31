@@ -10,6 +10,21 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `WalletWrite::import_account_uivk`, for importing an account from a
+  [`UnifiedIncomingViewingKey`].
+- `ScanningKeys::from_account_uivks` and `ScanningKeys::extend`, so wallets can
+  trial-decrypt with incoming-viewing-key-only accounts.
+- `decrypt_transaction` now accepts a map of
+  [`UnifiedIncomingViewingKey`]s in addition to UFVKs, enabling external-scope
+  decryption for IVK-only accounts.
+- `scan_cached_blocks` now includes IVK-only accounts when constructing scanning
+  keys.
+
+### Changed
+- `decrypt_transaction` takes an additional `uivks` argument. Callers that only
+  have UFVKs should pass an empty map.
+
 ## [0.24.0-rc.4] - 2026-07-26
 
 ### Changed

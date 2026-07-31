@@ -3528,6 +3528,39 @@ pub trait WalletWrite: WalletRead {
         key_source: Option<&str>,
     ) -> Result<Self::Account, Self::Error>;
 
+    /// Tells the wallet to track an account using a unified incoming viewing key.
+    ///
+    /// Returns details about the imported account, including the unique account identifier for
+    /// the newly-created wallet database entry. No spending key is returned because an incoming
+    /// viewing key provides no spend authority.
+    ///
+    /// Incoming-viewing-key-only accounts can detect notes sent to the account's external
+    /// addresses, but cannot detect spends of those notes (or compute balances). Callers MUST
+    /// treat balance-related APIs and APIs that rely upon spentness checks as unsupported for
+    /// such accounts.
+    ///
+    /// If an account already exists whose UIVK components are a subset of `unified_key`, this
+    /// method may upgrade that account in place by adding the additional UIVK items. Importing
+    /// a UIVK over an account that already has a UFVK is not permitted.
+    ///
+    /// The [`WalletWrite`] trait documentation has more details about account creation and import.
+    ///
+    /// # Arguments
+    /// - `account_name`: A human-readable name for the account.
+    /// - `unified_key`: The UIVK used to detect transactions involving the account.
+    /// - `birthday`: Metadata about where to start scanning blocks to find transactions intended
+    ///   for the account.
+    /// - `key_source`: A string identifier or other metadata describing the source of the key.
+    ///   This is treated as opaque metadata by the wallet backend; it is provided for use by
+    ///   applications which need to track additional identifying information for an account.
+    fn import_account_uivk(
+        &mut self,
+        account_name: &str,
+        unified_key: &UnifiedIncomingViewingKey,
+        birthday: &AccountBirthday,
+        key_source: Option<&str>,
+    ) -> Result<Self::Account, Self::Error>;
+
     /// Deletes the specified account, and all transactions that exclusively involve it, from the
     /// wallet database.
     ///

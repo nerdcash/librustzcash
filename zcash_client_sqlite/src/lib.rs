@@ -1662,6 +1662,16 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         })
     }
 
+    fn import_account_uivk(
+        &mut self,
+        account_name: &str,
+        uivk: &zcash_keys::keys::UnifiedIncomingViewingKey,
+        birthday: &AccountBirthday,
+        key_source: Option<&str>,
+    ) -> Result<Self::Account, Self::Error> {
+        self.transactionally(|wdb| wdb.import_account_uivk(account_name, uivk, birthday, key_source))
+    }
+
     fn delete_account(&mut self, account_uuid: Self::AccountId) -> Result<(), Self::Error> {
         self.transactionally(|wdb| wdb.delete_account(account_uuid))
     }
@@ -2054,6 +2064,28 @@ impl<P: consensus::Parameters, CL: Clock, R: RngCore> WalletWrite
                 key_source: key_source.map(|s| s.to_owned()),
             },
             wallet::ViewingKey::Full(Box::new(ufvk.to_owned())),
+            birthday,
+            #[cfg(feature = "transparent-inputs")]
+            &self.gap_limits,
+        )
+    }
+
+    fn import_account_uivk(
+        &mut self,
+        account_name: &str,
+        uivk: &zcash_keys::keys::UnifiedIncomingViewingKey,
+        birthday: &AccountBirthday,
+        key_source: Option<&str>,
+    ) -> Result<Self::Account, Self::Error> {
+        wallet::add_account(
+            self.conn.0,
+            &self.params,
+            account_name,
+            &AccountSource::Imported {
+                purpose: AccountPurpose::ViewOnly,
+                key_source: key_source.map(|s| s.to_owned()),
+            },
+            wallet::ViewingKey::Incoming(Box::new(uivk.to_owned())),
             birthday,
             #[cfg(feature = "transparent-inputs")]
             &self.gap_limits,

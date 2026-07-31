@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use sapling::note_encryption::{PreparedIncomingViewingKey, SaplingDomain};
-use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedIncomingViewingKey};
 use zcash_note_encryption::{try_note_decryption, try_output_recovery_with_ovk};
 use zcash_primitives::{
     transaction::Transaction, transaction::components::sapling::zip212_enforcement,
@@ -117,7 +117,7 @@ impl<A> DecryptedOutput<orchard::note::Note, A> {
 }
 
 /// Scans a [`Transaction`] for any information that can be decrypted by the set of
-/// [`UnifiedFullViewingKey`]s.
+/// [`UnifiedFullViewingKey`]s and/or [`UnifiedIncomingViewingKey`]s.
 ///
 /// # Parameters
 /// - `params`: The network parameters corresponding to the network the transaction
@@ -129,12 +129,15 @@ impl<A> DecryptedOutput<orchard::note::Note, A> {
 /// - `tx`: The transaction to decrypt.
 /// - `ufvks`: The [`UnifiedFullViewingKey`]s to use in trial decryption, keyed
 ///   by the identifiers for the wallet accounts they correspond to.
+/// - `uivks`: The [`UnifiedIncomingViewingKey`]s for incoming-viewing-key-only accounts.
+///   Only external-scope decryption is performed for these keys.
 pub fn decrypt_transaction<'a, P: consensus::Parameters, AccountId: Copy>(
     params: &P,
     mined_height: Option<BlockHeight>,
     chain_tip_height: Option<BlockHeight>,
     tx: &'a Transaction,
     ufvks: &HashMap<AccountId, UnifiedFullViewingKey>,
+    uivks: &HashMap<AccountId, UnifiedIncomingViewingKey>,
 ) -> DecryptedTransaction<'a, Transaction, AccountId> {
     let zip212_enforcement = zip212_enforcement(
         params,
@@ -150,55 +153,84 @@ pub fn decrypt_transaction<'a, P: consensus::Parameters, AccountId: Copy>(
         }),
     );
     let sapling_bundle = tx.sapling_bundle();
-    let sapling_outputs = sapling_bundle
-        .iter()
-        .flat_map(|bundle| {
-            ufvks
-                .iter()
-                .flat_map(|(account, ufvk)| ufvk.sapling().into_iter().map(|dfvk| (*account, dfvk)))
-                .flat_map(|(account, dfvk)| {
-                    let sapling_domain = SaplingDomain::new(zip212_enforcement);
-                    let ivk_external =
-                        PreparedIncomingViewingKey::new(&dfvk.to_ivk(Scope::External));
-                    let ivk_internal =
-                        PreparedIncomingViewingKey::new(&dfvk.to_ivk(Scope::Internal));
-                    let ovk = dfvk.fvk().ovk;
+    let sapling_outputs_from_ufvks = sapling_bundle.iter().flat_map(|bundle| {
+        ufvks
+            .iter()
+            .flat_map(|(account, ufvk)| ufvk.sapling().into_iter().map(|dfvk| (*account, dfvk)))
+            .flat_map(|(account, dfvk)| {
+                let sapling_domain = SaplingDomain::new(zip212_enforcement);
+                let ivk_external = PreparedIncomingViewingKey::new(&dfvk.to_ivk(Scope::External));
+                let ivk_internal = PreparedIncomingViewingKey::new(&dfvk.to_ivk(Scope::Internal));
+                let ovk = dfvk.fvk().ovk;
 
-                    bundle
-                        .shielded_outputs()
-                        .iter()
-                        .enumerate()
-                        .flat_map(move |(index, output)| {
-                            try_note_decryption(&sapling_domain, &ivk_external, output)
-                                .map(|ret| (ret, TransferType::Incoming))
-                                .or_else(|| {
-                                    try_note_decryption(&sapling_domain, &ivk_internal, output)
-                                        .map(|ret| (ret, TransferType::AccountInternal))
-                                })
-                                .or_else(|| {
-                                    try_output_recovery_with_ovk(
-                                        &sapling_domain,
-                                        &ovk,
-                                        output,
-                                        output.cv(),
-                                        output.out_ciphertext(),
-                                    )
-                                    .map(|ret| (ret, TransferType::Outgoing))
-                                })
-                                .into_iter()
-                                .map(move |((note, _, memo), transfer_type)| {
-                                    DecryptedOutput::new(
-                                        index,
-                                        note,
-                                        ShieldedPool::Sapling,
-                                        account,
-                                        MemoBytes::from_bytes(&memo).expect("correct length"),
-                                        transfer_type,
-                                    )
-                                })
-                        })
-                })
-        })
+                bundle
+                    .shielded_outputs()
+                    .iter()
+                    .enumerate()
+                    .flat_map(move |(index, output)| {
+                        try_note_decryption(&sapling_domain, &ivk_external, output)
+                            .map(|ret| (ret, TransferType::Incoming))
+                            .or_else(|| {
+                                try_note_decryption(&sapling_domain, &ivk_internal, output)
+                                    .map(|ret| (ret, TransferType::AccountInternal))
+                            })
+                            .or_else(|| {
+                                try_output_recovery_with_ovk(
+                                    &sapling_domain,
+                                    &ovk,
+                                    output,
+                                    output.cv(),
+                                    output.out_ciphertext(),
+                                )
+                                .map(|ret| (ret, TransferType::Outgoing))
+                            })
+                            .into_iter()
+                            .map(move |((note, _, memo), transfer_type)| {
+                                DecryptedOutput::new(
+                                    index,
+                                    note,
+                                    ShieldedPool::Sapling,
+                                    account,
+                                    MemoBytes::from_bytes(&memo).expect("correct length"),
+                                    transfer_type,
+                                )
+                            })
+                    })
+            })
+    });
+    let sapling_outputs_from_uivks = sapling_bundle.iter().flat_map(|bundle| {
+        uivks
+            .iter()
+            .flat_map(|(account, uivk)| {
+                uivk.sapling()
+                    .as_ref()
+                    .map(|ivk| (*account, ivk.prepare()))
+                    .into_iter()
+            })
+            .flat_map(|(account, ivk_external)| {
+                let sapling_domain = SaplingDomain::new(zip212_enforcement);
+                bundle
+                    .shielded_outputs()
+                    .iter()
+                    .enumerate()
+                    .flat_map(move |(index, output)| {
+                        try_note_decryption(&sapling_domain, &ivk_external, output)
+                            .into_iter()
+                            .map(move |(note, _, memo)| {
+                                DecryptedOutput::new(
+                                    index,
+                                    note,
+                                    ShieldedPool::Sapling,
+                                    account,
+                                    MemoBytes::from_bytes(&memo).expect("correct length"),
+                                    TransferType::Incoming,
+                                )
+                            })
+                    })
+            })
+    });
+    let sapling_outputs = sapling_outputs_from_ufvks
+        .chain(sapling_outputs_from_uivks)
         .collect();
 
     // Trial-decrypt an Orchard-family (Orchard or Ironwood) bundle. The two bundle kinds are
@@ -208,16 +240,18 @@ pub fn decrypt_transaction<'a, P: consensus::Parameters, AccountId: Copy>(
     // in the value pool their notes belong to. Decrypting a bundle under the other kind's domain
     // would silently detect nothing.
     #[cfg(feature = "orchard")]
-    fn decrypt_orchard_protocol_bundle<V: DomainVersion, AccountId: Copy>(
-        ufvks: &HashMap<AccountId, UnifiedFullViewingKey>,
-        bundle: &orchard::bundle::Bundle<
+    fn decrypt_orchard_protocol_bundle<'k, V: DomainVersion, AccountId: Copy + 'k>(
+        ufvks: &'k HashMap<AccountId, UnifiedFullViewingKey>,
+        uivks: &'k HashMap<AccountId, UnifiedIncomingViewingKey>,
+        bundle: &'k orchard::bundle::Bundle<
             orchard::bundle::Authorized,
             zcash_protocol::value::ZatBalance,
         >,
         pool: orchard::ValuePool,
-    ) -> impl Iterator<Item = DecryptedOutput<(orchard::Note, orchard::ValuePool), AccountId>> {
+    ) -> impl Iterator<Item = DecryptedOutput<(orchard::Note, orchard::ValuePool), AccountId>> + 'k
+    {
         let shielded_pool = crate::wallet::shielded_pool_for_value_pool(pool);
-        ufvks
+        let from_ufvks = ufvks
             .iter()
             .flat_map(|(account, ufvk)| ufvk.orchard().into_iter().map(|fvk| (*account, fvk)))
             .flat_map(move |(account, fvk)| {
@@ -261,7 +295,42 @@ pub fn decrypt_transaction<'a, P: consensus::Parameters, AccountId: Copy>(
                                 )
                             })
                     })
+            });
+        let from_uivks = uivks
+            .iter()
+            .flat_map(|(account, uivk)| {
+                uivk.orchard()
+                    .as_ref()
+                    .map(|ivk| {
+                        (
+                            *account,
+                            orchard::keys::PreparedIncomingViewingKey::new(ivk),
+                        )
+                    })
+                    .into_iter()
             })
+            .flat_map(move |(account, ivk_external)| {
+                bundle
+                    .actions()
+                    .iter()
+                    .enumerate()
+                    .flat_map(move |(index, action)| {
+                        let domain = NoteEncryptionDomain::<V>::for_action(action);
+                        try_note_decryption(&domain, &ivk_external, action)
+                            .into_iter()
+                            .map(move |(note, _, memo)| {
+                                DecryptedOutput::new(
+                                    index,
+                                    (note, pool),
+                                    shielded_pool,
+                                    account,
+                                    MemoBytes::from_bytes(&memo).expect("correct length"),
+                                    TransferType::Incoming,
+                                )
+                            })
+                    })
+            });
+        from_ufvks.chain(from_uivks)
     }
 
     #[cfg(feature = "orchard")]
@@ -271,6 +340,7 @@ pub fn decrypt_transaction<'a, P: consensus::Parameters, AccountId: Copy>(
         .flat_map(|bundle| {
             decrypt_orchard_protocol_bundle::<OrchardVersion, _>(
                 ufvks,
+                uivks,
                 bundle,
                 orchard::ValuePool::Orchard,
             )
@@ -284,6 +354,7 @@ pub fn decrypt_transaction<'a, P: consensus::Parameters, AccountId: Copy>(
         .flat_map(|bundle| {
             decrypt_orchard_protocol_bundle::<IronwoodVersion, _>(
                 ufvks,
+                uivks,
                 bundle,
                 orchard::ValuePool::Ironwood,
             )

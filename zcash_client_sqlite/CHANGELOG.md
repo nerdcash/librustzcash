@@ -10,6 +10,10 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `WalletWrite::import_account_uivk` is implemented for `WalletDb`, enabling
+  import of incoming-viewing-key-only accounts.
+
 ## [0.22.0-rc.4] - 2026-07-26
 
 ### Changed

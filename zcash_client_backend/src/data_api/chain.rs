@@ -175,7 +175,7 @@ use {
 pub mod error;
 use error::Error;
 
-use super::WalletRead;
+use super::{Account, WalletRead};
 
 /// A struct containing metadata about a subtree root of the note commitment tree.
 ///
@@ -634,11 +634,23 @@ where
 {
     assert_eq!(from_height, from_state.block_height + 1);
 
-    // Fetch the UnifiedFullViewingKeys we are tracking
-    let account_ufvks = data_db
-        .get_unified_full_viewing_keys()
-        .map_err(Error::Wallet)?;
-    let scanning_keys = ScanningKeys::from_account_ufvks(account_ufvks);
+    // Fetch the viewing keys we are tracking. Prefer UFVKs when available so that
+    // both external and internal scopes (and nullifiers) can be observed; fall back
+    // to UIVKs for incoming-viewing-key-only accounts.
+    let mut account_ufvks = std::collections::HashMap::new();
+    let mut account_uivks = std::collections::HashMap::new();
+    for account_id in data_db.get_account_ids().map_err(Error::Wallet)? {
+        let Some(account) = data_db.get_account(account_id).map_err(Error::Wallet)? else {
+            continue;
+        };
+        if let Some(ufvk) = account.ufvk() {
+            account_ufvks.insert(account_id, ufvk.clone());
+        } else {
+            account_uivks.insert(account_id, account.uivk());
+        }
+    }
+    let mut scanning_keys = ScanningKeys::from_account_ufvks(account_ufvks);
+    scanning_keys.extend(ScanningKeys::from_account_uivks(account_uivks));
     let mut runners = BatchRunners::<_, (), (), ()>::for_keys(100, &scanning_keys);
 
     block_source.with_blocks::<_, DbT::Error>(Some(from_height), Some(limit), |block| {

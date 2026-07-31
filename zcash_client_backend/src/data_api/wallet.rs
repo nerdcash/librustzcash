@@ -252,8 +252,18 @@ where
     ParamsT: consensus::Parameters,
     DbT: WalletWrite,
 {
-    // Fetch the UnifiedFullViewingKeys we are tracking
+    // Fetch the viewing keys we are tracking. Prefer UFVKs; also collect UIVKs for
+    // incoming-viewing-key-only accounts so their external receives can be decrypted.
     let ufvks = data.get_unified_full_viewing_keys()?;
+    let mut uivks = std::collections::HashMap::new();
+    for account_id in data.get_account_ids()? {
+        if ufvks.contains_key(&account_id) {
+            continue;
+        }
+        if let Some(account) = data.get_account(account_id)? {
+            uivks.insert(account_id, account.uivk());
+        }
+    }
 
     data.store_decrypted_tx(decrypt_transaction(
         params,
@@ -261,6 +271,7 @@ where
         data.chain_height()?,
         tx,
         &ufvks,
+        &uivks,
     ))?;
 
     Ok(())

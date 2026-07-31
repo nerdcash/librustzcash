@@ -1536,7 +1536,7 @@ pub(crate) mod tests {
         // Decrypt the full transaction with the account's viewing keys.
         let mut ufvks = HashMap::new();
         ufvks.insert(account_id, account.ufvk().unwrap().clone());
-        let d_tx = decrypt_transaction(st.network(), None, None, &tx, &ufvks);
+        let d_tx = decrypt_transaction(st.network(), None, None, &tx, &ufvks, &std::collections::HashMap::new());
 
         // The wallet-owned Ironwood outputs are detected under the Ironwood domain (not
         // Orchard). Spending Ironwood funds to the account's own Orchard receiver produces both
@@ -2006,7 +2006,7 @@ pub(crate) mod tests {
             // shuffled and either may come first.
             let mut ufvks = HashMap::new();
             ufvks.insert(account_id, account.ufvk().unwrap().clone());
-            let d_tx = decrypt_transaction(st.network(), None, None, &tx, &ufvks);
+            let d_tx = decrypt_transaction(st.network(), None, None, &tx, &ufvks, &std::collections::HashMap::new());
             let change = d_tx
                 .ironwood_outputs()
                 .iter()
