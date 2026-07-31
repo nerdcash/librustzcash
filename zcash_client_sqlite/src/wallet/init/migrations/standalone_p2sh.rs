@@ -9,11 +9,14 @@ use uuid::Uuid;
 
 use crate::wallet::init::WalletMigrationError;
 
-use super::account_delete_cascade;
+use super::{account_delete_cascade, add_transparent_sync_tracking};
 
 pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0x944f8a1e_bdfa_4d52_90ca_663dee8efc62);
 
-const DEPENDENCIES: &[Uuid] = &[account_delete_cascade::MIGRATION_ID];
+const DEPENDENCIES: &[Uuid] = &[
+    account_delete_cascade::MIGRATION_ID,
+    add_transparent_sync_tracking::MIGRATION_ID,
+];
 
 pub(super) struct Migration;
 
@@ -56,6 +59,7 @@ impl RusqliteMigration for Migration {
                 transparent_receiver_next_check_time INTEGER,
                 imported_transparent_receiver_pubkey BLOB,
                 imported_transparent_receiver_script BLOB,
+                last_downloaded_transparent_block INTEGER,
                 UNIQUE (account_id, key_scope, diversifier_index_be),
                 UNIQUE (imported_transparent_receiver_pubkey),
                 UNIQUE (imported_transparent_receiver_script),
@@ -90,13 +94,13 @@ impl RusqliteMigration for Migration {
                 id, account_id, key_scope, diversifier_index_be, address,
                 transparent_child_index, cached_transparent_receiver_address,
                 exposed_at_height, receiver_flags, transparent_receiver_next_check_time,
-                imported_transparent_receiver_pubkey
+                imported_transparent_receiver_pubkey, last_downloaded_transparent_block
             )
             SELECT
                 id, account_id, key_scope, diversifier_index_be, address,
                 transparent_child_index, cached_transparent_receiver_address,
                 exposed_at_height, receiver_flags, transparent_receiver_next_check_time,
-                imported_transparent_receiver_pubkey
+                imported_transparent_receiver_pubkey, last_downloaded_transparent_block
             FROM addresses;
 
             PRAGMA legacy_alter_table = ON;
