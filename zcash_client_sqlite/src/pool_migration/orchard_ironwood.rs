@@ -524,6 +524,7 @@ where
             Some(row.scheduled_height()),
             &tx,
             &ufvks,
+            &HashMap::new(),
         );
         let outputs = decrypted
             .orchard_outputs()

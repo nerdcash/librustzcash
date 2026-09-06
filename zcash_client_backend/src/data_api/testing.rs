@@ -3566,6 +3566,14 @@ impl WalletWrite for MockWalletDb {
         Ok(None)
     }
 
+    fn put_address_with_diversifier_index(
+        &mut self,
+        _account_id: <Self as WalletRead>::AccountId,
+        _diversifier_index: DiversifierIndex,
+    ) -> Result<UnifiedAddress, <Self as WalletRead>::Error> {
+        todo!()
+    }
+
     #[allow(clippy::type_complexity)]
     fn put_blocks(
         &mut self,
@@ -3647,7 +3655,7 @@ impl WalletWrite for MockWalletDb {
         &mut self,
         _address: &TransparentAddress,
         _block_height: BlockHeight,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Ok(())
     }
 

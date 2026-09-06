@@ -1859,9 +1859,9 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
 
     fn put_address_with_diversifier_index(
         &mut self,
-        account_id: Self::AccountId,
+        account_id: <Self as WalletRead>::AccountId,
         diversifier_index: DiversifierIndex,
-    ) -> Result<UnifiedAddress, SqliteClientError> {
+    ) -> Result<UnifiedAddress, <Self as WalletRead>::Error> {
         if let Some(account) = self.get_account(account_id)? {
             self.transactionally(|wdb| {
                 let keys = wdb.get_unified_full_viewing_keys()?;
@@ -2024,7 +2024,7 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         &mut self,
         _address: &TransparentAddress,
         _block_height: BlockHeight,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         return wallet::put_latest_scanned_block_for_transparent(
             &self.conn.borrow(),
             &self.params,
@@ -2259,7 +2259,7 @@ impl<P: consensus::Parameters, CL: Clock, R: RngCore> WalletWrite
         &mut self,
         address: &TransparentAddress,
         block_height: BlockHeight,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         wallet::put_latest_scanned_block_for_transparent(
             self.conn.0,
             &self.params,
@@ -2571,7 +2571,14 @@ impl<P: consensus::Parameters, CL: Clock, R: RngCore> WalletWrite
             #[cfg(feature = "orchard")]
             {
                 let decrypted =
-                    decrypt_transaction(&self.params, None, chain_tip, sent_tx.tx(), &ufvks);
+                    decrypt_transaction(
+                        &self.params,
+                        None,
+                        chain_tip,
+                        sent_tx.tx(),
+                        &ufvks,
+                        &HashMap::new(),
+                    );
                 let classification = classify_decrypted_tx(
                     sent_tx.tx(),
                     decrypted.orchard_outputs(),

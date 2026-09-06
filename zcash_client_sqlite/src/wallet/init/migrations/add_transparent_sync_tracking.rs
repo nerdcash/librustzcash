@@ -1,3 +1,5 @@
+//! Adds `last_downloaded_transparent_block` to the addresses table.
+
 use std::collections::HashSet;
 
 use rusqlite::Transaction;
@@ -8,7 +10,8 @@ use crate::wallet::init::WalletMigrationError;
 
 use super::{addresses_table, full_account_ids};
 
-pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xb6ce8980_00c9_4985_9e0c_90a4b11841be);
+/// Identifier for the transparent sync tracking migration.
+pub const MIGRATION_ID: Uuid = Uuid::from_u128(0xb6ce8980_00c9_4985_9e0c_90a4b11841be);
 
 pub(super) const DEPENDENCIES: &[Uuid] = &[
     addresses_table::MIGRATION_ID,

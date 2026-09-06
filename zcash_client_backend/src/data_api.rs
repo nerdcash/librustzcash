@@ -3720,7 +3720,7 @@ pub trait WalletWrite:
         unified_key: &UnifiedIncomingViewingKey,
         birthday: &AccountBirthday,
         key_source: Option<&str>,
-    ) -> Result<Self::Account, Self::Error>;
+    ) -> Result<Self::Account, <Self as WalletRead>::Error>;
 
     /// Deletes the specified account, and all transactions that exclusively involve it, from the
     /// wallet database.
@@ -3888,9 +3888,9 @@ pub trait WalletWrite:
     /// valid for any receiver required by the resulting unified address.
     fn put_address_with_diversifier_index(
         &mut self,
-        account_id: Self::AccountId,
+        account_id: <Self as WalletRead>::AccountId,
         diversifier_index: DiversifierIndex,
-    ) -> Result<UnifiedAddress, Self::Error>;
+    ) -> Result<UnifiedAddress, <Self as WalletRead>::Error>;
 
     /// Updates the wallet's view of the blockchain.
     ///
@@ -4027,7 +4027,7 @@ pub trait WalletWrite:
         &mut self,
         address: &TransparentAddress,
         block_height: BlockHeight,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), <Self as WalletRead>::Error>;
 
     /// Truncates the wallet database to the specified chain state.
     ///
