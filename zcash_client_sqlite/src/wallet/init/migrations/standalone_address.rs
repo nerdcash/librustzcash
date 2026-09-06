@@ -9,13 +9,16 @@ use uuid::Uuid;
 
 use crate::wallet::init::WalletMigrationError;
 
-use super::add_transparent_receiver_address_index;
+use super::{add_transparent_receiver_address_index, add_transparent_sync_tracking};
 
 /// This migration relaxes the addresses table constraint to allow standalone transparent
 /// addresses imported without any associated key material.
 pub const MIGRATION_ID: Uuid = Uuid::from_u128(0xc9a2c15c_5142_44f9_9485_13a6a87829f1);
 
-pub(super) const DEPENDENCIES: &[Uuid] = &[add_transparent_receiver_address_index::MIGRATION_ID];
+pub(super) const DEPENDENCIES: &[Uuid] = &[
+    add_transparent_receiver_address_index::MIGRATION_ID,
+    add_transparent_sync_tracking::MIGRATION_ID,
+];
 
 pub(super) struct Migration;
 
@@ -60,6 +63,7 @@ impl RusqliteMigration for Migration {
                 transparent_receiver_next_check_time INTEGER,
                 imported_transparent_receiver_pubkey BLOB,
                 imported_transparent_receiver_script BLOB,
+                last_downloaded_transparent_block INTEGER,
                 UNIQUE (account_id, key_scope, diversifier_index_be),
                 UNIQUE (imported_transparent_receiver_pubkey),
                 UNIQUE (imported_transparent_receiver_script),
@@ -101,13 +105,15 @@ impl RusqliteMigration for Migration {
                 id, account_id, key_scope, diversifier_index_be, address,
                 transparent_child_index, cached_transparent_receiver_address,
                 exposed_at_height, receiver_flags, transparent_receiver_next_check_time,
-                imported_transparent_receiver_pubkey, imported_transparent_receiver_script
+                imported_transparent_receiver_pubkey, imported_transparent_receiver_script,
+                last_downloaded_transparent_block
             )
             SELECT
                 id, account_id, key_scope, diversifier_index_be, address,
                 transparent_child_index, cached_transparent_receiver_address,
                 exposed_at_height, receiver_flags, transparent_receiver_next_check_time,
-                imported_transparent_receiver_pubkey, imported_transparent_receiver_script
+                imported_transparent_receiver_pubkey, imported_transparent_receiver_script,
+                last_downloaded_transparent_block
             FROM addresses;
 
             PRAGMA legacy_alter_table = ON;
