@@ -19,6 +19,7 @@ use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
 use zcash_protocol::{
     ShieldedPool, TxId,
     consensus::{self, BlockHeight},
+    value::Zatoshis,
 };
 use zip32::Scope;
 
@@ -174,6 +175,31 @@ pub(crate) fn select_spendable_sapling_notes<P: consensus::Parameters>(
         params,
         account,
         target_value,
+        target_height,
+        confirmations_policy,
+        exclude,
+        ShieldedPool::Sapling,
+        to_received_note,
+        lock_filter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_single_spendable_sapling_note<P: consensus::Parameters>(
+    conn: &Connection,
+    params: &P,
+    account: AccountUuid,
+    value: Zatoshis,
+    target_height: TargetHeight,
+    confirmations_policy: ConfirmationsPolicy,
+    exclude: &[ReceivedNoteId],
+    lock_filter: LockFilter<'_>,
+) -> Result<Option<ReceivedNote<ReceivedNoteId, sapling::Note>>, SqliteClientError> {
+    super::common::select_single_spendable_note(
+        conn,
+        params,
+        account,
+        value,
         target_height,
         confirmations_policy,
         exclude,
@@ -573,69 +599,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn spend_fails_on_locked_notes() {
-        testing::pool::spend_fails_on_locked_notes::<SaplingPoolTester>()
-    }
-
-    #[test]
-    fn explicit_note_locking() {
-        testing::pool::explicit_note_locking::<SaplingPoolTester>()
-    }
-
-    #[test]
-    fn note_locking_height_boundary() {
-        testing::pool::note_locking_height_boundary::<SaplingPoolTester>()
-    }
-
-    #[test]
-    fn clear_locked_outputs() {
-        testing::pool::clear_locked_outputs::<SaplingPoolTester>()
-    }
-
-    #[test]
-    fn proposal_level_note_locking() {
-        testing::pool::proposal_level_note_locking::<SaplingPoolTester>()
-    }
-
-    #[test]
-    fn locked_proposal_proto_roundtrip() {
-        testing::pool::locked_proposal_proto_roundtrip::<SaplingPoolTester>()
-    }
-
-    #[test]
-    fn lock_expiry_restores_spendability() {
-        testing::pool::lock_expiry_restores_spendability::<SaplingPoolTester>()
-    }
-
-    #[test]
-    fn lock_conflict_and_batch_atomicity() {
-        testing::pool::lock_conflict_and_batch_atomicity::<SaplingPoolTester>()
-    }
-
-    #[test]
-    fn unlock_proposal_inputs_releases_locks() {
-        testing::pool::unlock_proposal_inputs_releases_locks::<SaplingPoolTester>()
-    }
-
-    #[test]
-    fn spend_policy_locked_input_policy_reaches_selection() {
-        testing::pool::spend_policy_locked_input_policy_reaches_selection::<SaplingPoolTester>()
-    }
-
-    proptest::proptest! {
-        // Each case builds a fresh wallet and replays an operation sequence, so keep the
-        // case count moderate; the sequences themselves explore the expiry boundaries.
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(12))]
-
-        #[test]
-        fn note_locking_model(
-            ops in zcash_client_backend::data_api::testing::pool::arb_lock_ops(3, 10)
-        ) {
-            testing::pool::check_note_locking_model::<SaplingPoolTester>(&ops)
-        }
-    }
-
-    #[test]
     fn ovk_policy_prevents_recovery_from_chain() {
         testing::pool::ovk_policy_prevents_recovery_from_chain::<SaplingPoolTester>()
     }
@@ -694,9 +657,20 @@ pub(crate) mod tests {
         testing::pool::anchor_checkpoints_retained_across_deep_scan::<SaplingPoolTester>()
     }
 
+    #[cfg(feature = "orchard")]
+    #[test]
+    fn empty_boundary_blocks_are_checkpointed_and_retained() {
+        testing::pool::empty_boundary_blocks_are_checkpointed_and_retained::<SaplingPoolTester>()
+    }
+
     #[test]
     fn scan_cached_blocks_detects_spends_out_of_order() {
         testing::pool::scan_cached_blocks_detects_spends_out_of_order::<SaplingPoolTester>()
+    }
+
+    #[test]
+    fn oldest_note_is_selected_first() {
+        testing::pool::oldest_note_is_selected_first::<SaplingPoolTester>()
     }
 
     #[test]

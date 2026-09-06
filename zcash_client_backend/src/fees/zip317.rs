@@ -8,7 +8,8 @@ use core::marker::PhantomData;
 
 use zcash_primitives::transaction::fees::{FeeRule, transparent, zip317 as prim_zip317};
 use zcash_protocol::{
-    ShieldedPool, consensus,
+    ShieldedPool,
+    consensus::{self, BlockHeight},
     memo::MemoBytes,
     value::{BalanceError, Zatoshis},
 };
@@ -16,6 +17,7 @@ use zcash_protocol::{
 use crate::{
     data_api::{
         AccountMeta, InputSource, NoteFilter,
+        anchor_retention::PoolMigrationParams,
         wallet::{
             TargetHeight,
             input_selection::{LockFilter, LockedInputPolicy},
@@ -34,7 +36,7 @@ use super::{
 #[cfg(feature = "transparent-inputs")]
 use super::TransparentChangePolicy;
 #[cfg(feature = "orchard")]
-use super::orchard as orchard_fees;
+use {super::orchard as orchard_fees, zcash_primitives::transaction::builder::BundlePadding};
 
 /// An extension to the [`FeeRule`] trait that exposes methods required for
 /// ZIP 317 fee calculation.
@@ -75,8 +77,6 @@ pub struct SingleOutputChangeStrategy<R, I> {
     change_memo: Option<MemoBytes>,
     fallback_change_pool: ShieldedPool,
     dust_output_policy: DustOutputPolicy,
-    #[cfg(feature = "orchard")]
-    unpadded_orchard_pool_bundles: bool,
     #[cfg(feature = "transparent-inputs")]
     transparent_change_policy: TransparentChangePolicy,
     meta_source: PhantomData<I>,
@@ -99,27 +99,10 @@ impl<R, I> SingleOutputChangeStrategy<R, I> {
             change_memo,
             fallback_change_pool,
             dust_output_policy,
-            #[cfg(feature = "orchard")]
-            unpadded_orchard_pool_bundles: false,
             #[cfg(feature = "transparent-inputs")]
             transparent_change_policy: TransparentChangePolicy::ShieldChange,
             meta_source: PhantomData,
         }
-    }
-
-    /// Requests unpadded Orchard-pool (Orchard and Ironwood) bundles: fee and
-    /// change calculation will count exactly the requested actions instead of
-    /// padding each bundle to the 2-action minimum.
-    ///
-    /// The transaction executing the proposal must be built with the matching
-    /// bundle type ([`BundleType::UNPADDED`](orchard::builder::BundleType)),
-    /// or the builder's balance check will fail. Intended for transactions whose
-    /// shape is already public (e.g. pool migrations); see the orchard
-    /// `pad_to_minimum` documentation for the privacy trade-off.
-    #[cfg(feature = "orchard")]
-    pub fn with_unpadded_orchard_pool_bundles(mut self) -> Self {
-        self.unpadded_orchard_pool_bundles = true;
-        self
     }
 
     /// Sets the [`TransparentChangePolicy`] to be used by this change strategy, determining
@@ -167,6 +150,8 @@ where
         &self,
         params: &P,
         target_height: TargetHeight,
+        anchor_height: BlockHeight,
+        zip318: &PoolMigrationParams,
         transparent_inputs: &[impl transparent::InputView],
         transparent_outputs: &[impl transparent::OutputView],
         sapling: &impl sapling_fees::BundleView<NoteRefT>,
@@ -189,13 +174,6 @@ where
             self.fee_rule.grace_actions(),
         );
 
-        #[cfg(feature = "orchard")]
-        let orchard_pool_bundle_type = if self.unpadded_orchard_pool_bundles {
-            ::orchard::builder::BundleType::UNPADDED
-        } else {
-            ::orchard::builder::BundleType::DEFAULT
-        };
-
         single_pool_output_balance(
             cfg,
             None,
@@ -207,8 +185,13 @@ where
             orchard,
             #[cfg(feature = "orchard")]
             ironwood,
+            // The Orchard bundle is always padded to the default floor. Only the Ironwood
+            // bundle's padding varies, and it is derived from the transaction's shape rather
+            // than chosen here.
             #[cfg(feature = "orchard")]
-            orchard_pool_bundle_type,
+            BundlePadding::DEFAULT,
+            anchor_height,
+            zip318,
             self.change_memo.as_ref(),
             ephemeral_balance,
         )
@@ -223,8 +206,6 @@ pub struct MultiOutputChangeStrategy<R, I> {
     fallback_change_pool: ShieldedPool,
     dust_output_policy: DustOutputPolicy,
     split_policy: SplitPolicy,
-    #[cfg(feature = "orchard")]
-    unpadded_orchard_pool_bundles: bool,
     #[cfg(feature = "transparent-inputs")]
     transparent_change_policy: TransparentChangePolicy,
     meta_source: PhantomData<I>,
@@ -255,27 +236,10 @@ impl<R, I> MultiOutputChangeStrategy<R, I> {
             fallback_change_pool,
             dust_output_policy,
             split_policy,
-            #[cfg(feature = "orchard")]
-            unpadded_orchard_pool_bundles: false,
             #[cfg(feature = "transparent-inputs")]
             transparent_change_policy: TransparentChangePolicy::ShieldChange,
             meta_source: PhantomData,
         }
-    }
-
-    /// Requests unpadded Orchard-pool (Orchard and Ironwood) bundles: fee and
-    /// change calculation will count exactly the requested actions instead of
-    /// padding each bundle to the 2-action minimum.
-    ///
-    /// The transaction executing the proposal must be built with the matching
-    /// bundle type ([`BundleType::UNPADDED`](orchard::builder::BundleType)),
-    /// or the builder's balance check will fail. Intended for transactions whose
-    /// shape is already public (e.g. pool migrations); see the orchard
-    /// `pad_to_minimum` documentation for the privacy trade-off.
-    #[cfg(feature = "orchard")]
-    pub fn with_unpadded_orchard_pool_bundles(mut self) -> Self {
-        self.unpadded_orchard_pool_bundles = true;
-        self
     }
 
     /// Sets the [`TransparentChangePolicy`] to be used by this change strategy, determining
@@ -340,6 +304,8 @@ where
         &self,
         params: &P,
         target_height: TargetHeight,
+        anchor_height: BlockHeight,
+        zip318: &PoolMigrationParams,
         transparent_inputs: &[impl transparent::InputView],
         transparent_outputs: &[impl transparent::OutputView],
         sapling: &impl sapling_fees::BundleView<NoteRefT>,
@@ -361,13 +327,6 @@ where
             self.fee_rule.grace_actions(),
         );
 
-        #[cfg(feature = "orchard")]
-        let orchard_pool_bundle_type = if self.unpadded_orchard_pool_bundles {
-            ::orchard::builder::BundleType::UNPADDED
-        } else {
-            ::orchard::builder::BundleType::DEFAULT
-        };
-
         single_pool_output_balance(
             cfg,
             Some(wallet_meta),
@@ -379,8 +338,13 @@ where
             orchard,
             #[cfg(feature = "orchard")]
             ironwood,
+            // The Orchard bundle is always padded to the default floor. Only the Ironwood
+            // bundle's padding varies, and it is derived from the transaction's shape rather
+            // than chosen here.
             #[cfg(feature = "orchard")]
-            orchard_pool_bundle_type,
+            BundlePadding::DEFAULT,
+            anchor_height,
+            zip318,
             self.change_memo.as_ref(),
             ephemeral_balance,
         )
@@ -389,20 +353,31 @@ where
 
 #[cfg(test)]
 mod tests {
-    use core::{convert::Infallible, num::NonZeroUsize};
+    // `sapling_fees` is named by both the orchard and the transparent-inputs tests.
+    #[cfg(any(feature = "orchard", feature = "transparent-inputs"))]
+    use crate::fees::sapling as sapling_fees;
 
-    use ::transparent::{address::Script, bundle::TxOut};
-    use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
-    use zcash_protocol::{
-        ShieldedPool,
-        consensus::{Network, NetworkUpgrade, Parameters},
-        value::Zatoshis,
+    #[cfg(feature = "transparent-inputs")]
+    use {
+        crate::fees::TransparentChangePolicy,
+        ::transparent::{address::TransparentAddress, bundle::OutPoint},
     };
 
-    use super::SingleOutputChangeStrategy;
+    #[cfg(feature = "orchard")]
+    use {
+        crate::{
+            data_api::wallet::{TargetHeight, input_selection::OrchardPayment},
+            fees::{orchard as orchard_fees, tests::TestOrchardInput},
+        },
+        zcash_protocol::zip318::{AnchorBucketInterval, MAX_RESIDUAL_VALUE},
+    };
+
     use crate::{
         data_api::{
-            AccountMeta, PoolMeta, testing::MockWalletDb, wallet::input_selection::SaplingPayment,
+            AccountMeta, PoolMeta,
+            anchor_retention::{AnchorRetentionInterval, PoolMigrationParams},
+            testing::MockWalletDb,
+            wallet::input_selection::SaplingPayment,
         },
         fees::{
             ChangeError, ChangeStrategy, ChangeValue, DustAction, DustOutputPolicy, SplitPolicy,
@@ -410,15 +385,17 @@ mod tests {
             zip317::MultiOutputChangeStrategy,
         },
     };
-
-    #[cfg(feature = "orchard")]
-    use {
-        crate::data_api::wallet::input_selection::OrchardPayment,
-        crate::fees::orchard as orchard_fees,
+    use core::{convert::Infallible, num::NonZeroUsize};
+    use zcash_protocol::{
+        ShieldedPool,
+        consensus::{BlockHeight, Network, NetworkUpgrade, Parameters},
+        value::Zatoshis,
     };
 
-    #[cfg(all(feature = "orchard", feature = "transparent-inputs"))]
-    use crate::data_api::wallet::TargetHeight;
+    use ::transparent::{address::Script, bundle::TxOut};
+    use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
+
+    use super::SingleOutputChangeStrategy;
 
     #[test]
     fn change_without_dust() {
@@ -436,6 +413,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[] as &[TestTransparentInput],
             &[] as &[TxOut],
             &(
@@ -484,6 +463,8 @@ mod tests {
                         .activation_height(NetworkUpgrade::Nu5)
                         .unwrap()
                         .into(),
+                    BlockHeight::from_u32(1),
+                    &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
                     &[] as &[TestTransparentInput],
                     &[] as &[TxOut],
                     &(
@@ -537,6 +518,8 @@ mod tests {
                     .activation_height(NetworkUpgrade::Nu5)
                     .unwrap()
                     .into(),
+                BlockHeight::from_u32(1),
+                &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
                 &[] as &[TestTransparentInput],
                 &[] as &[TxOut],
                 &(
@@ -581,6 +564,8 @@ mod tests {
                     .activation_height(NetworkUpgrade::Nu5)
                     .unwrap()
                     .into(),
+                BlockHeight::from_u32(1),
+                &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
                 &[] as &[TestTransparentInput],
                 &[] as &[TxOut],
                 &(
@@ -620,6 +605,8 @@ mod tests {
                     .activation_height(NetworkUpgrade::Nu5)
                     .unwrap()
                     .into(),
+                BlockHeight::from_u32(1),
+                &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
                 &[] as &[TestTransparentInput],
                 &[] as &[TxOut],
                 &(
@@ -664,6 +651,8 @@ mod tests {
                     .activation_height(NetworkUpgrade::Nu5)
                     .unwrap()
                     .into(),
+                BlockHeight::from_u32(1),
+                &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
                 &[] as &[TestTransparentInput],
                 &[] as &[TxOut],
                 &(
@@ -716,6 +705,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[] as &[TestTransparentInput],
             &[] as &[TxOut],
             &(
@@ -747,8 +738,6 @@ mod tests {
     #[test]
     #[cfg(feature = "orchard")]
     fn orchard_v3_change_counts_spends_and_outputs_separately() {
-        use crate::fees::{sapling as sapling_fees, tests::TestOrchardInput};
-
         let change_strategy = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
             None,
@@ -766,6 +755,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu6_3)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[] as &[TestTransparentInput],
             &[] as &[TxOut],
             &sapling_fees::EmptyBundleView,
@@ -793,9 +784,6 @@ mod tests {
     #[test]
     #[cfg(all(feature = "orchard", feature = "transparent-inputs"))]
     fn orchard_fallback_change_pool_is_promoted_to_ironwood_after_nu6_3() {
-        use crate::fees::sapling as sapling_fees;
-        use ::transparent::{address::TransparentAddress, bundle::OutPoint};
-
         // A caller that names Orchard as its fallback change pool.
         let change_strategy = MultiOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
@@ -869,6 +857,8 @@ mod tests {
         let pre_nu6_3_balance = change_strategy.compute_balance::<_, Infallible>(
             &Network::TestNetwork,
             pre_nu6_3_height,
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &transparent_inputs,
             &transparent_outputs,
             &sapling_view,
@@ -894,6 +884,8 @@ mod tests {
         let post_nu6_3_balance = change_strategy.compute_balance::<_, Infallible>(
             &Network::TestNetwork,
             post_nu6_3_height,
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &transparent_inputs,
             &transparent_outputs,
             &sapling_view,
@@ -908,6 +900,76 @@ mod tests {
             Ok(balance) if
                 balance.proposed_change() == [ChangeValue::ironwood(Zatoshis::const_from_u64(8000), None)] &&
                 balance.fee_required() == Zatoshis::const_from_u64(15000)
+        );
+    }
+
+    /// The change strategy records the exact dummy outputs it charged the fee against, so the
+    /// builder can reproduce that action count. A canonical crossing has no Ironwood dummy output;
+    /// a payment one zatoshi off the denomination grid has one.
+    #[test]
+    #[cfg(feature = "orchard")]
+    fn the_change_strategy_records_the_dummy_outputs_it_costed() {
+        let change_strategy = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
+            Zip317FeeRule::standard(),
+            None,
+            ShieldedPool::Orchard,
+            DustOutputPolicy::default(),
+        );
+        let zip318 = PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318);
+        let interval = AnchorBucketInterval::ZIP_318;
+
+        // An anchor ON the grid, as a canonical crossing requires.
+        let anchor = interval.boundary_at_or_below(BlockHeight::from_u32(2_000_000));
+        let height = TargetHeight::from(BlockHeight::from_u32(u32::from(anchor) + 10));
+
+        // One Orchard input, large enough that its change stays in Orchard rather than being
+        // promoted to Ironwood by the turnstile rule.
+        let orchard_inputs = [TestOrchardInput {
+            note_id: 0,
+            value: Zatoshis::const_from_u64(10_000_000),
+        }];
+        let orchard_view = (
+            ::orchard::bundle::BundleVersion::orchard_v3(),
+            &orchard_inputs[..],
+            &[] as &[Infallible],
+        );
+        let sapling_view = (
+            sapling::builder::BundleType::DEFAULT,
+            &[] as &[Infallible],
+            &[] as &[Infallible],
+        );
+
+        let recorded_for = |value: Zatoshis| {
+            let ironwood_outputs = [OrchardPayment::new(value)];
+            let ironwood_view = (
+                ::orchard::bundle::BundleVersion::ironwood_v3(),
+                &[] as &[Infallible],
+                &ironwood_outputs[..],
+            );
+            change_strategy
+                .compute_balance::<_, u32>(
+                    &Network::TestNetwork,
+                    height,
+                    anchor,
+                    &zip318,
+                    &[] as &[TestTransparentInput],
+                    &[] as &[TxOut],
+                    &sapling_view,
+                    &orchard_view,
+                    &ironwood_view,
+                    None,
+                    &(),
+                )
+                .expect("the input covers the payment and its fee")
+                .dummy_outputs()
+                .expect("the change strategy records dummy outputs")
+                .ironwood()
+        };
+
+        assert_eq!(recorded_for(MAX_RESIDUAL_VALUE), 0);
+        assert_eq!(
+            recorded_for((MAX_RESIDUAL_VALUE + Zatoshis::const_from_u64(1)).unwrap()),
+            1
         );
     }
 
@@ -949,6 +1011,8 @@ mod tests {
             .compute_balance(
                 &Network::TestNetwork,
                 height,
+                BlockHeight::from_u32(1),
+                &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
                 &[] as &[TestTransparentInput],
                 &[] as &[TxOut],
                 &sapling_view,
@@ -963,6 +1027,8 @@ mod tests {
             .compute_balance(
                 &Network::TestNetwork,
                 height,
+                BlockHeight::from_u32(1),
+                &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
                 &[] as &[TestTransparentInput],
                 &[] as &[TxOut],
                 &sapling_view,
@@ -988,92 +1054,6 @@ mod tests {
         assert_eq!(
             with_ironwood.fee_required(),
             Zatoshis::const_from_u64(30000)
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "orchard")]
-    fn unpadded_orchard_pool_bundles_lower_the_fee() {
-        // `with_unpadded_orchard_pool_bundles` drops the ZIP 317 2-action padding floor
-        // for the Orchard and Ironwood bundles. This reuses the
-        // `ironwood_outputs_are_charged_actions` scenario, where only the single-output
-        // Ironwood bundle is below the floor, so the unpadded strategy charges it 1
-        // action instead of 2 and the fee falls by exactly one 5000-zat action.
-        let height = Network::TestNetwork
-            .activation_height(NetworkUpgrade::Nu5)
-            .unwrap()
-            .into();
-        let sapling_inputs = [TestSaplingInput {
-            note_id: 0,
-            value: Zatoshis::const_from_u64(100000),
-        }];
-        let orchard_outputs = [OrchardPayment::new(Zatoshis::const_from_u64(30000))];
-        let sapling_view = (
-            sapling::builder::BundleType::DEFAULT,
-            &sapling_inputs[..],
-            &[] as &[Infallible],
-        );
-        let orchard_view = (
-            ::orchard::bundle::BundleVersion::orchard_v2(),
-            &[] as &[Infallible],
-            &orchard_outputs[..],
-        );
-        let ironwood_view = (
-            ::orchard::bundle::BundleVersion::ironwood_v3(),
-            &[] as &[Infallible],
-            &orchard_outputs[..],
-        );
-
-        let padded_fee = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
-            Zip317FeeRule::standard(),
-            None,
-            ShieldedPool::Orchard,
-            DustOutputPolicy::default(),
-        )
-        .compute_balance(
-            &Network::TestNetwork,
-            height,
-            &[] as &[TestTransparentInput],
-            &[] as &[TxOut],
-            &sapling_view,
-            &orchard_view,
-            &ironwood_view,
-            None,
-            &(),
-        )
-        .unwrap()
-        .fee_required();
-
-        let unpadded_fee = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
-            Zip317FeeRule::standard(),
-            None,
-            ShieldedPool::Orchard,
-            DustOutputPolicy::default(),
-        )
-        .with_unpadded_orchard_pool_bundles()
-        .compute_balance(
-            &Network::TestNetwork,
-            height,
-            &[] as &[TestTransparentInput],
-            &[] as &[TxOut],
-            &sapling_view,
-            &orchard_view,
-            &ironwood_view,
-            None,
-            &(),
-        )
-        .unwrap()
-        .fee_required();
-
-        // Padded default matches `ironwood_outputs_are_charged_actions`: sapling (2) +
-        // orchard (1 payment + 1 change = 2) + ironwood (1 output, padded to 2) = 6
-        // actions = 30000 zat. Unpadded charges the single-output Ironwood bundle 1
-        // action, so the fee drops by one 5000-zat action to 25000.
-        assert_eq!(padded_fee, Zatoshis::const_from_u64(30000));
-        assert_eq!(unpadded_fee, Zatoshis::const_from_u64(25000));
-        assert_eq!(
-            padded_fee,
-            (unpadded_fee + Zatoshis::const_from_u64(5000)).unwrap()
         );
     }
 
@@ -1105,6 +1085,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[] as &[TestTransparentInput],
             &[TxOut::new(
                 Zatoshis::const_from_u64(40000),
@@ -1137,9 +1119,6 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn change_fully_transparent_no_change() {
-        use crate::fees::sapling as sapling_fees;
-        use ::transparent::{address::TransparentAddress, bundle::OutPoint};
-
         let change_strategy = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
             None,
@@ -1154,6 +1133,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[TestTransparentInput {
                 outpoint: OutPoint::fake(),
                 coin: TxOut::new(
@@ -1185,9 +1166,6 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn change_transparent_flows_with_shielded_change() {
-        use crate::fees::sapling as sapling_fees;
-        use ::transparent::{address::TransparentAddress, bundle::OutPoint};
-
         let change_strategy = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
             None,
@@ -1202,6 +1180,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[TestTransparentInput {
                 outpoint: OutPoint::fake(),
                 coin: TxOut::new(
@@ -1233,9 +1213,6 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn change_transparent_flows_with_shielded_dust_change() {
-        use crate::fees::sapling as sapling_fees;
-        use ::transparent::{address::TransparentAddress, bundle::OutPoint};
-
         let change_strategy = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
             None,
@@ -1256,6 +1233,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[TestTransparentInput {
                 outpoint: OutPoint::fake(),
                 coin: TxOut::new(
@@ -1287,9 +1266,6 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn change_fully_transparent_with_transparent_change() {
-        use crate::fees::{TransparentChangePolicy, sapling as sapling_fees};
-        use ::transparent::{address::TransparentAddress, bundle::OutPoint};
-
         let change_strategy = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
             None,
@@ -1308,6 +1284,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[TestTransparentInput {
                 outpoint: OutPoint::fake(),
                 coin: TxOut::new(
@@ -1339,9 +1317,6 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn change_fully_transparent_exact_match_with_transparent_change() {
-        use crate::fees::{TransparentChangePolicy, sapling as sapling_fees};
-        use ::transparent::{address::TransparentAddress, bundle::OutPoint};
-
         let change_strategy = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
             None,
@@ -1358,6 +1333,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[TestTransparentInput {
                 outpoint: OutPoint::fake(),
                 coin: TxOut::new(
@@ -1389,8 +1366,6 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn transparent_change_policy_has_no_effect_on_shielded_flows() {
-        use crate::fees::TransparentChangePolicy;
-
         let change_strategy = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
             None,
@@ -1407,6 +1382,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[] as &[TestTransparentInput],
             &[] as &[TxOut],
             &(
@@ -1436,9 +1413,6 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn transparent_change_is_not_split() {
-        use crate::fees::{TransparentChangePolicy, sapling as sapling_fees};
-        use ::transparent::{address::TransparentAddress, bundle::OutPoint};
-
         let change_strategy = MultiOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
             None,
@@ -1460,6 +1434,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[TestTransparentInput {
                 outpoint: OutPoint::fake(),
                 coin: TxOut::new(
@@ -1491,9 +1467,6 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn transparent_change_rejects_dust() {
-        use crate::fees::{TransparentChangePolicy, sapling as sapling_fees};
-        use ::transparent::{address::TransparentAddress, bundle::OutPoint};
-
         let change_strategy = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
             None,
@@ -1512,6 +1485,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[TestTransparentInput {
                 outpoint: OutPoint::fake(),
                 coin: TxOut::new(
@@ -1543,9 +1518,6 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn transparent_change_allows_dust() {
-        use crate::fees::{TransparentChangePolicy, sapling as sapling_fees};
-        use ::transparent::{address::TransparentAddress, bundle::OutPoint};
-
         let change_strategy = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
             None,
@@ -1566,6 +1538,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[TestTransparentInput {
                 outpoint: OutPoint::fake(),
                 coin: TxOut::new(
@@ -1597,9 +1571,6 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn transparent_change_dust_added_to_fee() {
-        use crate::fees::{TransparentChangePolicy, sapling as sapling_fees};
-        use ::transparent::{address::TransparentAddress, bundle::OutPoint};
-
         let change_strategy = SingleOutputChangeStrategy::<_, MockWalletDb>::new(
             Zip317FeeRule::standard(),
             None,
@@ -1617,6 +1588,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[TestTransparentInput {
                 outpoint: OutPoint::fake(),
                 coin: TxOut::new(
@@ -1676,6 +1649,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[] as &[TestTransparentInput],
             &[] as &[TxOut],
             &(
@@ -1725,6 +1700,8 @@ mod tests {
                 .activation_height(NetworkUpgrade::Nu5)
                 .unwrap()
                 .into(),
+            BlockHeight::from_u32(1),
+            &PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318),
             &[] as &[TestTransparentInput],
             &[] as &[TxOut],
             &(

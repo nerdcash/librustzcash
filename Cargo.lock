@@ -3171,6 +3171,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "pbkdf2"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3182,7 +3188,7 @@ dependencies = [
 
 [[package]]
 name = "pczt"
-version = "0.9.1"
+version = "0.9.3"
 dependencies = [
  "blake2b_simd",
  "bls12_381",
@@ -3196,6 +3202,7 @@ dependencies = [
  "orchard",
  "pasta_curves",
  "postcard",
+ "proptest",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "redjubjub",
@@ -7111,7 +7118,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_client_backend"
-version = "0.24.0-rc.4"
+version = "0.24.0"
 dependencies = [
  "ambassador",
  "arti-client",
@@ -7186,7 +7193,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_client_sqlite"
-version = "0.22.0-rc.4"
+version = "0.22.0"
 dependencies = [
  "ambassador",
  "assert_matches",
@@ -7207,6 +7214,7 @@ dependencies = [
  "nonempty",
  "orchard",
  "pasta_curves",
+ "pastey",
  "pczt",
  "proptest",
  "prost",
@@ -7280,7 +7288,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_keys"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "assert_matches",
  "bech32",
@@ -7332,8 +7340,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_pool_migration"
-version = "0.1.0-rc.3"
+version = "0.1.0"
 dependencies = [
+ "blake2b_simd",
  "corez",
  "getset",
  "incrementalmerkletree",
@@ -7349,6 +7358,7 @@ dependencies = [
  "zcash_pool_migration_memory",
  "zcash_primitives",
  "zcash_protocol",
+ "zip32",
 ]
 
 [[package]]
@@ -7362,11 +7372,12 @@ dependencies = [
  "rand_core 0.6.4",
  "zcash_pool_migration",
  "zcash_protocol",
+ "zip32",
 ]
 
 [[package]]
 name = "zcash_primitives"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "assert_matches",
  "blake2b_simd",
@@ -7426,7 +7437,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_protocol"
-version = "0.10.1"
+version = "0.10.5"
 dependencies = [
  "corez",
  "document-features",
@@ -7568,7 +7579,7 @@ dependencies = [
 
 [[package]]
 name = "zip321"
-version = "0.9.0-rc.1"
+version = "0.9.0"
 dependencies = [
  "base64",
  "nom",

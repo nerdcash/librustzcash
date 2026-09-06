@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use crate::wallet::init::{WalletMigrationError, migrations::ironwood_received_notes};
 
-pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xa1d4a28c_7582_4457_b0f4_d3f297b62a71);
+/// This migration adds the note-locking columns to the received note/output tables.
+pub const MIGRATION_ID: Uuid = Uuid::from_u128(0xa1d4a28c_7582_4457_b0f4_d3f297b62a71);
 
 // This migration only appends a nullable column to each of the `sapling_received_notes`,
 // `orchard_received_notes`, `ironwood_received_notes`, and `transparent_received_outputs`
@@ -18,7 +19,7 @@ pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xa1d4a28c_7582_4457_b0f4_
 // migration that creates or rebuilds any of the four tables (the sapling/orchard/transparent
 // rebuilds all precede it via `orchard_note_version` -> `witness_stabilized_notes` ->
 // `account_delete_cascade`), and it creates the `ironwood_received_notes` table itself.
-const DEPENDENCIES: &[Uuid] = &[ironwood_received_notes::MIGRATION_ID];
+pub(super) const DEPENDENCIES: &[Uuid] = &[ironwood_received_notes::MIGRATION_ID];
 
 pub(super) struct Migration;
 

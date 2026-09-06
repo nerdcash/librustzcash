@@ -62,6 +62,10 @@ graph TB
 
     zcash_client_sqlite --> zcash_pool_migration
 
+    %% The base `pczt` data model backs the pool-migration schema backfills, in
+    %% every build configuration.
+    zcash_client_sqlite --> pczt
+
     %% The `zcash_client_backend` dependency is gated on the `wallet` feature.
     zcash_pool_migration -.-> zcash_client_backend
 
@@ -137,6 +141,7 @@ graph TB
     %% zcash_client_backend --> zcash_note_encryption
 
     %% zcash_client_sqlite --> zip32
+    %% zcash_pool_migration --> zip32
     %% zcash_client_backend --> zip32
     %% zcash_keys --> zip32
     orchard --> zip32

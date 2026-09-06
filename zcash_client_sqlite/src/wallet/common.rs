@@ -23,7 +23,12 @@ use crate::{
     AccountUuid, ReceivedNoteId, SAPLING_TABLES_PREFIX,
     error::SqliteClientError,
     wallet::{
-        get_anchor_height, pool_code,
+        get_anchor_height,
+        locking::{
+            locked_tier_expr, output_eligible_condition, overridable_owners_rarray,
+            push_lock_params,
+        },
+        pool_code,
         scanning::{parse_priority_code, priority_code},
     },
 };
@@ -137,154 +142,6 @@ pub(crate) fn spent_notes_clause(table_prefix: &str) -> String {
         "#,
         tx_unexpired_condition("stx")
     )
-}
-
-/// Generates the SQL condition under which an output is eligible for selection, given the
-/// active [`LockFilter`].
-///
-/// An output is *locked for selection* when its `lock_expiry_height` is set and greater than or
-/// equal to the target height; equivalently, it becomes selectable again once the target height
-/// has advanced strictly beyond its `lock_expiry_height`. This matches the
-/// [`WalletWrite::lock_outputs`] contract, which prevents selection "at any height less than or
-/// equal to" the lock expiry height, and is the exact complement of the locked-balance condition
-/// (`lock_expiry_height >= target_height`) used in balance computation.
-///
-/// - [`LockFilter::Unfiltered`] admits every output: the fragment is the constant `1`, so neither
-///   `:target_height` nor `:overridable_owners` is referenced on account of the lock filter and
-///   neither must be bound for its sake.
-/// - [`LockFilter::Policy`] admits an output when it carries no lock, when its lock has expired as
-///   of `:target_height`, or when its `lock_owner` is one of the policy's overridable owners. For
-///   [`LockedInputPolicy::Exclude`] the overridable-owner set is empty, so the `IN rarray(...)`
-///   term is always false and only unlocked outputs are eligible; for the preference variants the
-///   set carries the owners whose locks may be drawn upon. An output locked by any other owner is
-///   never eligible.
-///
-/// # Usage requirements
-/// - `tbl` must be set to the SQL alias for the received notes/outputs table.
-/// - Under a [`LockFilter::Policy`] the parent must provide `:target_height` and must bind
-///   `:overridable_owners` to the rarray produced by [`overridable_owners_rarray`]. Under
-///   [`LockFilter::Unfiltered`] neither is referenced by this fragment, and (rusqlite rejecting an
-///   unused named parameter) `:overridable_owners` must not be bound for its sake.
-///
-/// [`WalletWrite::lock_outputs`]: zcash_client_backend::data_api::WalletWrite::lock_outputs
-/// [`LockedInputPolicy::Exclude`]: zcash_client_backend::data_api::wallet::input_selection::LockedInputPolicy::Exclude
-pub(crate) fn output_eligible_condition(lock_filter: LockFilter<'_>, tbl: &str) -> String {
-    match lock_filter {
-        LockFilter::Unfiltered => "1".to_string(),
-        LockFilter::Policy(_) => format!(
-            "{tbl}.lock_expiry_height IS NULL \
-             OR {tbl}.lock_expiry_height < :target_height \
-             OR {tbl}.lock_owner IN rarray(:overridable_owners)"
-        ),
-    }
-}
-
-/// Builds the `:overridable_owners` rarray for the given [`LockFilter`]: the byte strings of the
-/// lock owners whose locked outputs the filter's policy admits.
-///
-/// The set is empty under [`LockFilter::Unfiltered`] (which does not reference the parameter) and
-/// under [`LockedInputPolicy::Exclude`] (which admits no locked owner). The returned `Rc` must be
-/// kept alive and bound by reference for the duration of the query, following the same pattern as
-/// the `:exclude` rarray.
-///
-/// [`LockedInputPolicy::Exclude`]: zcash_client_backend::data_api::wallet::input_selection::LockedInputPolicy::Exclude
-pub(crate) fn overridable_owners_rarray(lock_filter: LockFilter<'_>) -> Rc<Vec<Value>> {
-    let owners = match lock_filter {
-        LockFilter::Unfiltered => Vec::new(),
-        LockFilter::Policy(policy) => policy
-            .overridable_owners()
-            .iter()
-            .map(|owner| Value::from(owner.as_bytes().to_vec()))
-            .collect(),
-    };
-    Rc::new(owners)
-}
-
-/// Appends the lock-filter-dependent named parameters that [`output_eligible_condition`]
-/// references to a selection query's parameter list.
-///
-/// This is the single source of truth pairing the eligibility SQL with its bindings: it binds
-/// `:overridable_owners` (to the `overridable_owners` rarray from [`overridable_owners_rarray`],
-/// which must outlive the query) exactly when the fragment references it, i.e. under a
-/// [`LockFilter::Policy`]. Because rusqlite rejects a provided-but-unreferenced named parameter,
-/// keeping this in lockstep with [`output_eligible_condition`] in one place — rather than repeating
-/// the `matches!` and the `:overridable_owners` literal at each call site — prevents the SQL and
-/// its bindings from silently drifting apart.
-///
-/// `:target_height` is deliberately NOT handled here: every query that uses the eligibility
-/// fragment also references `:target_height` independently of the lock filter (via
-/// `spent_notes_clause` / `tx_unexpired_condition` and the like), so it is always present in the
-/// SQL and is bound unconditionally by the caller.
-pub(crate) fn push_lock_params<'a>(
-    params: &mut Vec<(&'a str, &'a dyn ToSql)>,
-    lock_filter: LockFilter<'_>,
-    overridable_owners: &'a Rc<Vec<Value>>,
-) {
-    if matches!(lock_filter, LockFilter::Policy(_)) {
-        params.push((":overridable_owners", overridable_owners as &dyn ToSql));
-    }
-}
-
-/// Returns the tier-preference sort key `(<lock tier>) ASC|DESC` for a [`LockFilter`] that prefers
-/// one lock tier over the other, or `None` when no tier preference applies
-/// ([`LockedInputPolicy::Exclude`] and [`LockFilter::Unfiltered`], which draw on a single admitted
-/// tier or apply no lock filtering).
-///
-/// The tier expression evaluates to `1` for an output that is locked for selection as of
-/// `:target_height` and `0` otherwise. [`LockedInputPolicy::PreferUnlocked`] sorts it ascending
-/// (unlocked first) and [`LockedInputPolicy::PreferLocked`] descending (owned-locked first).
-/// Because a [`LockFilter::Policy`] `WHERE` clause (see [`output_eligible_condition`]) has already
-/// excluded foreign-owner locks, the `1` tier contains only owned-locked outputs.
-///
-/// This key is a *preference* over an eligible set: callers must combine it with the existing
-/// within-tier ordering (age or value) as a secondary key so that ordering is preserved within
-/// each tier.
-///
-/// # Usage requirements
-/// - `tbl` must be set to the SQL alias for the received notes/outputs table.
-/// - When this returns `Some(_)`, the parent must provide `:target_height`.
-///
-/// [`LockedInputPolicy::Exclude`]: zcash_client_backend::data_api::wallet::input_selection::LockedInputPolicy::Exclude
-/// [`LockedInputPolicy::PreferUnlocked`]: zcash_client_backend::data_api::wallet::input_selection::LockedInputPolicy::PreferUnlocked
-/// [`LockedInputPolicy::PreferLocked`]: zcash_client_backend::data_api::wallet::input_selection::LockedInputPolicy::PreferLocked
-pub(crate) fn locked_tier_order_key(lock_filter: LockFilter<'_>, tbl: &str) -> Option<String> {
-    match lock_filter {
-        LockFilter::Policy(policy) if policy.admits_locked() => {
-            let direction = if policy.prefers_locked() {
-                "DESC"
-            } else {
-                "ASC"
-            };
-            Some(format!(
-                "(CASE WHEN {tbl}.lock_expiry_height IS NOT NULL \
-                  AND {tbl}.lock_expiry_height >= :target_height THEN 1 ELSE 0 END) {direction}"
-            ))
-        }
-        _ => None,
-    }
-}
-
-/// Generates the SQL condition under which an output's lock may be (re)acquired.
-///
-/// A lock may be taken when no lock exists (`lock_expiry_height IS NULL`), when the existing
-/// lock has expired as of the chain tip (`lock_expiry_height <= :chain_tip`), or when the
-/// existing lock is held by the requesting owner (`lock_owner = :owner`), which makes
-/// re-locking by the same owner idempotent. Because balance and selection evaluate lock state
-/// against `target_height = chain_tip + 1`, "expired as of the chain tip" (`h <= chain_tip`)
-/// is exactly "not locked for selection" (`h < target_height`): a lock can never be stolen by
-/// a DIFFERENT owner while the output is still excluded from selection.
-///
-/// When the chain tip is unknown, `:chain_tip` binds to SQL NULL and the expiry comparison
-/// evaluates to NULL (falsy), so only outputs with no existing lock, or whose lock the
-/// requesting owner already holds, can be locked; a foreign lock cannot be judged expired
-/// without a height to compare against.
-///
-/// # Usage requirements
-/// - This condition uses the bare `lock_expiry_height` and `lock_owner` column names, so it
-///   must be used in a single-table statement (such as the `UPDATE`s in `lock_outputs`).
-/// - The parent must provide `:chain_tip` (possibly NULL) and `:owner` as named arguments.
-pub(crate) fn output_lockable_condition() -> &'static str {
-    "lock_expiry_height IS NULL OR lock_expiry_height <= :chain_tip OR lock_owner = :owner"
 }
 
 fn unscanned_tip_exists(
@@ -520,6 +377,7 @@ where
             params,
             account,
             zats,
+            ValueSelection::Accumulate,
             target_height,
             anchor_height,
             confirmations_policy,
@@ -530,6 +388,54 @@ where
         ),
     }
 }
+
+/// Selects the single OLDEST spendable note of the given protocol whose value alone is at least
+/// `value`, or `None` when no single eligible note covers it. Age is the note's commitment tree
+/// position, which is assigned in strict chain order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_single_spendable_note<P: consensus::Parameters, F, Note>(
+    conn: &Connection,
+    params: &P,
+    account: AccountUuid,
+    value: Zatoshis,
+    target_height: TargetHeight,
+    confirmations_policy: ConfirmationsPolicy,
+    exclude: &[ReceivedNoteId],
+    protocol: ShieldedPool,
+    to_spendable_note: F,
+    lock_filter: LockFilter<'_>,
+) -> Result<Option<ReceivedNote<ReceivedNoteId, Note>>, SqliteClientError>
+where
+    F: Fn(
+        &P,
+        ShieldedPool,
+        &Row,
+    ) -> Result<Option<ReceivedNote<ReceivedNoteId, Note>>, SqliteClientError>,
+{
+    let Some(anchor_height) =
+        get_anchor_height(conn, target_height, confirmations_policy.trusted())?
+    else {
+        return Ok(None);
+    };
+
+    Ok(select_spendable_notes_matching_value(
+        conn,
+        params,
+        account,
+        value,
+        ValueSelection::SingleCovering,
+        target_height,
+        anchor_height,
+        confirmations_policy,
+        exclude,
+        protocol,
+        &to_spendable_note,
+        lock_filter,
+    )?
+    .into_iter()
+    .next())
+}
+
 /// Selects all the unspent notes with value greater than [`zip317::MARGINAL_FEE`] and for the
 /// specified shielded protocols from a given account, excepting any explicitly excluded note
 /// identifiers.
@@ -705,9 +611,23 @@ where
         .collect()
 }
 
+/// The shape of a value-targeted note selection: accumulate the oldest notes toward the target,
+/// or draw only the single oldest note that covers it alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValueSelection {
+    /// Accumulate the oldest eligible notes until the target value is covered.
+    Accumulate,
+    /// Select only the oldest eligible notes whose individual values cover the target alone,
+    /// oldest first.
+    SingleCovering,
+}
+
 /// Selects the set of spendable notes whose sum will be equal or greater that the
 /// specified ``target_value`` in Zatoshis from the specified shielded protocols excluding
 /// the ones present in the ``exclude`` slice.
+///
+/// Under [`ValueSelection::SingleCovering`], instead returns the notes whose individual value
+/// covers ``target_value`` alone, oldest first; callers take the head.
 ///
 /// - Implementation details
 ///   - Notes with individual value *below* the ``MARGINAL_FEE`` will be ignored
@@ -718,6 +638,7 @@ fn select_spendable_notes_matching_value<P: consensus::Parameters, F, Note>(
     params: &P,
     account: AccountUuid,
     target_value: Zatoshis,
+    selection: ValueSelection,
     target_height: TargetHeight,
     anchor_height: BlockHeight,
     confirmations_policy: ConfirmationsPolicy,
@@ -759,23 +680,63 @@ where
     //    well as a single note for which the sum was greater than or equal to the
     //    required value, bringing the sum of all selected notes across the threshold.
     //
+    // AGE is the note's commitment tree position: positions are assigned in strict chain
+    // order, so ordering by position is ordering by the age of the note on chain. The row
+    // id is NOT a usable proxy for age — ids are assigned in SCAN order, and priority
+    // scanning visits recent blocks before back-filling history, so a restored wallet's
+    // newest notes carry its lowest ids.
+    //
     // A `LockFilter::Policy` that prefers one lock tier (`PreferUnlocked`/`PreferLocked`)
-    // accumulates the running sum in tier order (via the window `ORDER BY`) so that the
-    // preferred tier is drawn upon first; the age order (`rn.id`) is retained as a secondary
+    // accumulates the running sum in tier order (via the leading window `ORDER BY` key) so
+    // that the preferred tier is drawn upon first; age order is retained as the secondary
     // key so that within each tier the oldest notes are still selected first. Because the
-    // tiered window order need not match the CTE's physical output order, the threshold-
-    // crossing note is chosen as the note with the smallest running sum at or above the
-    // target (`ORDER BY so_far`). For `Exclude`/`Unfiltered` the window and crossing-note
-    // selection are unchanged.
-    let tier_key = locked_tier_order_key(lock_filter, "rn");
-    let window_frame = match &tier_key {
-        Some(tier_key) => format!("ORDER BY {tier_key}, rn.id ROWS UNBOUNDED PRECEDING"),
-        None => "ROWS UNBOUNDED PRECEDING".to_string(),
+    // window order need not match the CTE's physical output order, the threshold-crossing
+    // note is chosen as the note with the smallest running sum at or above the target
+    // (`ORDER BY so_far`).
+    let tier = locked_tier_expr(lock_filter, "rn");
+    let window_frame = match &tier {
+        Some((expr, direction)) => format!(
+            "ORDER BY {expr} {direction}, rn.commitment_tree_position ROWS UNBOUNDED PRECEDING"
+        ),
+        None => "ORDER BY rn.commitment_tree_position ROWS UNBOUNDED PRECEDING".to_string(),
     };
-    let crossing_note_subquery = if tier_key.is_some() {
-        "SELECT * from eligible WHERE so_far >= :target_value ORDER BY so_far LIMIT 1"
-    } else {
-        "SELECT * from eligible WHERE so_far >= :target_value LIMIT 1"
+    // The single-covering tail selects FROM the CTE, where `rn` is out of scope, so the tier
+    // expression is materialized as a CTE column with the direction applied at the ordering
+    // site; a constant stands in when the lock filter admits only one tier and no preference
+    // applies.
+    let (tier_column, tier_direction) = tier
+        .as_ref()
+        .map(|(expr, direction)| (expr.as_str(), *direction))
+        .unwrap_or(("0", "ASC"));
+    let crossing_note_subquery =
+        "SELECT * from eligible WHERE so_far >= :target_value ORDER BY so_far LIMIT 1";
+    let result_columns = format!(
+        "id, txid, {output_index_col},
+                diversifier, value, {note_reconstruction_cols}, commitment_tree_position,
+                ufvk, recipient_key_scope,
+                mined_height, witness_stabilized, trust_status,
+                max_shielding_input_height, min_shielding_input_trust"
+    );
+    // The `eligible` CTE is shared; only the selection over it differs by shape. Accumulation
+    // takes every note below the running-sum threshold plus the threshold-crossing note;
+    // single-covering takes the individually sufficient notes ordered by lock tier first and
+    // age second — the same key order the accumulation window uses, so a `PreferUnlocked` or
+    // `PreferLocked` caller draws its preferred tier before an older note of the other tier —
+    // and relies on the caller to take the head (the Rust-side confirmations filter below may
+    // drop leading rows, so the limit cannot be applied in SQL).
+    let selection_tail = match selection {
+        ValueSelection::Accumulate => format!(
+            "SELECT {result_columns}
+         FROM eligible WHERE so_far < :target_value
+         UNION
+         SELECT {result_columns}
+         FROM ({crossing_note_subquery})"
+        ),
+        ValueSelection::SingleCovering => format!(
+            "SELECT {result_columns}
+         FROM eligible WHERE value >= :target_value
+         ORDER BY lock_tier {tier_direction}, commitment_tree_position"
+        ),
     };
     let eligible_condition = output_eligible_condition(lock_filter, "rn");
     let mut stmt_select_notes = conn.prepare_cached(&format!(
@@ -784,6 +745,7 @@ where
                  rn.id AS id, t.txid, rn.{output_index_col},
                  rn.diversifier, rn.value,
                  {note_reconstruction_cols}, rn.commitment_tree_position,
+                 {tier_column} AS lock_tier,
                  SUM(value) OVER ({window_frame}) AS so_far,
                  accounts.ufvk as ufvk, rn.recipient_key_scope,
                  t.block AS mined_height,
@@ -826,19 +788,7 @@ where
              AND ({eligible_condition}) -- the note is eligible under the lock filter
              GROUP BY rn.id
          )
-         SELECT id, txid, {output_index_col},
-                diversifier, value, {note_reconstruction_cols}, commitment_tree_position,
-                ufvk, recipient_key_scope,
-                mined_height, witness_stabilized, trust_status,
-                max_shielding_input_height, min_shielding_input_trust
-         FROM eligible WHERE so_far < :target_value
-         UNION
-         SELECT id, txid, {output_index_col},
-                diversifier, value, {note_reconstruction_cols}, commitment_tree_position,
-                ufvk, recipient_key_scope,
-                mined_height, witness_stabilized, trust_status,
-                max_shielding_input_height, min_shielding_input_trust
-         FROM ({crossing_note_subquery})",
+         {selection_tail}",
         spent_notes_clause(table_prefix),
     ))?;
 
@@ -1249,504 +1199,5 @@ mod tests {
         .unwrap();
 
         assert_eq!(unspent_note_meta.len(), 1);
-    }
-}
-
-/// Tests for the lock-state SQL predicates.
-///
-/// These pin the semantics of the lock columns against executable models, evaluating the actual
-/// SQL fragments in SQLite (including their NULL behavior, `rarray` owner matching, and window
-/// ordering) rather than a Rust re-implementation of them:
-///
-/// - An output is LOCKED for balance purposes while `lock_expiry_height >= target_height`.
-/// - Selection eligibility (`output_eligible_condition`) is owner-scoped:
-///   - `Unfiltered` admits every output;
-///   - `Policy(Exclude)` admits only outputs with no active lock as of the target height (the
-///     exact complement of the locked-balance predicate), so once the target height passes the
-///     lock expiry height an output is eligible again with no unlock call, even though the stale
-///     column value remains until replaced or cleared;
-///   - `Policy(PreferUnlocked | PreferLocked)` additionally admits outputs whose `lock_owner` is
-///     one of the policy's overridable owners, and never an output locked by any other owner.
-/// - Greedy value-target selection is TIERED under a preference policy
-///   (`locked_tier_order_key`): `PreferUnlocked` draws unlocked outputs before owned-locked
-///   ones and `PreferLocked` the reverse, each retaining age order within a tier; `Exclude` and
-///   `Unfiltered` impose no tier preference.
-/// - A lock may be (re)acquired when no lock exists, when the existing lock has expired as of
-///   the chain tip (`lock_expiry_height <= chain_tip`), or when the existing lock is held by
-///   the requesting owner (idempotent same-owner re-lock); with an unknown chain tip a
-///   foreign lock can never be judged expired.
-/// - No lock stealing: whenever a lock held by a DIFFERENT owner is replaceable, the output
-///   is already selectable at the next target height, so replacing an expired lock never
-///   removes protection from a still-protected output.
-#[cfg(test)]
-mod lock_predicate_tests {
-    use proptest::prelude::*;
-    use rusqlite::{Connection, ToSql, named_params};
-    use zcash_client_backend::{
-        data_api::wallet::input_selection::{LockFilter, LockedInputPolicy, NonEmptyBTreeSet},
-        wallet::LockOwner,
-    };
-
-    use super::{
-        locked_tier_order_key, output_eligible_condition, output_lockable_condition,
-        overridable_owners_rarray, push_lock_params,
-    };
-
-    /// A distinguished lock owner whose locks the preference policies in these tests admit.
-    const OWNER_A: LockOwner = LockOwner::new([0xA1; 32]);
-    /// A distinguished lock owner NOT admitted by the policies, standing in for "some other
-    /// flow's" lock; an output it holds must never be eligible under a `Policy`.
-    const OWNER_B: LockOwner = LockOwner::new([0xB2; 32]);
-
-    fn lock_state_db(lock_expiry_height: Option<u32>, lock_owner: Option<[u8; 32]>) -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE t (lock_expiry_height INTEGER, lock_owner BLOB)")
-            .unwrap();
-        conn.execute(
-            "INSERT INTO t (lock_expiry_height, lock_owner) VALUES (:h, :owner)",
-            named_params![":h": lock_expiry_height, ":owner": lock_owner],
-        )
-        .unwrap();
-        conn
-    }
-
-    /// A candidate output for the selection-eligibility and tiering tests: its stable `id`
-    /// (also its age order, oldest first), value, and lock state (`lock_expiry_height` set with
-    /// a `lock_owner` when locked).
-    struct Candidate {
-        id: i64,
-        value: i64,
-        lock_expiry_height: Option<u32>,
-        lock_owner: Option<LockOwner>,
-    }
-
-    fn unlocked(id: i64, value: i64) -> Candidate {
-        Candidate {
-            id,
-            value,
-            lock_expiry_height: None,
-            lock_owner: None,
-        }
-    }
-
-    fn locked(id: i64, value: i64, expiry: u32, owner: LockOwner) -> Candidate {
-        Candidate {
-            id,
-            value,
-            lock_expiry_height: Some(expiry),
-            lock_owner: Some(owner),
-        }
-    }
-
-    /// Builds an in-memory table of candidate outputs, with the `rarray` module loaded so that
-    /// the `:overridable_owners` binding used by [`output_eligible_condition`] can be evaluated.
-    fn candidates_db(candidates: &[Candidate]) -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        rusqlite::vtab::array::load_module(&conn).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE t (
-                 id INTEGER PRIMARY KEY,
-                 value INTEGER NOT NULL,
-                 lock_expiry_height INTEGER,
-                 lock_owner BLOB
-             )",
-        )
-        .unwrap();
-        for c in candidates {
-            conn.execute(
-                "INSERT INTO t (id, value, lock_expiry_height, lock_owner)
-                 VALUES (:id, :value, :h, :owner)",
-                named_params![
-                    ":id": c.id,
-                    ":value": c.value,
-                    ":h": c.lock_expiry_height,
-                    ":owner": c.lock_owner.map(|o| o.as_bytes().to_vec()),
-                ],
-            )
-            .unwrap();
-        }
-        conn
-    }
-
-    /// A preference policy admitting only [`OWNER_A`]'s locks.
-    fn owner_a_policy(prefer_locked: bool) -> LockedInputPolicy {
-        let owners = NonEmptyBTreeSet::singleton(OWNER_A);
-        if prefer_locked {
-            LockedInputPolicy::PreferLocked(owners)
-        } else {
-            LockedInputPolicy::PreferUnlocked(owners)
-        }
-    }
-
-    /// The set of candidate ids the eligibility fragment admits under `lock_filter`, in id
-    /// order. `:target_height` and `:overridable_owners` are bound only under a `Policy`, since
-    /// the `Unfiltered` fragment (`1`) references neither and rusqlite rejects unused
-    /// parameters.
-    fn eligible_ids(
-        candidates: &[Candidate],
-        target_height: u32,
-        lock_filter: LockFilter<'_>,
-    ) -> Vec<i64> {
-        let conn = candidates_db(candidates);
-        let sql = format!(
-            "SELECT id FROM t WHERE ({}) ORDER BY id",
-            output_eligible_condition(lock_filter, "t"),
-        );
-        let overridable_owners = overridable_owners_rarray(lock_filter);
-        let mut params: Vec<(&str, &dyn ToSql)> = Vec::new();
-        // Unlike the production queries, this isolated table references `:target_height` only
-        // through the eligibility fragment, so it too is bound only under a policy.
-        if matches!(lock_filter, LockFilter::Policy(_)) {
-            params.push((":target_height", &target_height));
-        }
-        push_lock_params(&mut params, lock_filter, &overridable_owners);
-        let mut stmt = conn.prepare(&sql).unwrap();
-        stmt.query_map(&params[..], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    }
-
-    /// The ids selected by a greedy value-target selection composed exactly as
-    /// `select_spendable_notes_matching_value` composes it (eligibility fragment + tiered
-    /// window `so_far` + threshold-crossing note), returned in selection (running-sum) order.
-    fn selection_order(
-        candidates: &[Candidate],
-        target_height: u32,
-        target_value: i64,
-        lock_filter: LockFilter<'_>,
-    ) -> Vec<i64> {
-        let conn = candidates_db(candidates);
-        let eligible_condition = output_eligible_condition(lock_filter, "t");
-        let tier_key = locked_tier_order_key(lock_filter, "t");
-        let window_frame = match &tier_key {
-            Some(k) => format!("ORDER BY {k}, t.id ROWS UNBOUNDED PRECEDING"),
-            None => "ROWS UNBOUNDED PRECEDING".to_string(),
-        };
-        // The crossing note is wrapped in its own subquery (as in the production query) so that
-        // its `LIMIT 1` binds to the crossing selection alone, not to the whole `UNION`.
-        let crossing = if tier_key.is_some() {
-            "SELECT * FROM eligible WHERE so_far >= :target_value ORDER BY so_far LIMIT 1"
-        } else {
-            "SELECT * FROM eligible WHERE so_far >= :target_value LIMIT 1"
-        };
-        let sql = format!(
-            "WITH eligible AS (
-                 SELECT t.id AS id, SUM(t.value) OVER ({window_frame}) AS so_far
-                 FROM t WHERE ({eligible_condition})
-             )
-             SELECT id FROM (
-                 SELECT id, so_far FROM eligible WHERE so_far < :target_value
-                 UNION
-                 SELECT id, so_far FROM ({crossing})
-             ) ORDER BY so_far",
-        );
-        // `:target_value` is always referenced; the isolated table references `:target_height`
-        // only through the eligibility fragment and tier window, so it is bound only under a
-        // policy.
-        let overridable_owners = overridable_owners_rarray(lock_filter);
-        let mut params: Vec<(&str, &dyn ToSql)> = vec![(":target_value", &target_value)];
-        if matches!(lock_filter, LockFilter::Policy(_)) {
-            params.push((":target_height", &target_height));
-        }
-        push_lock_params(&mut params, lock_filter, &overridable_owners);
-        let mut stmt = conn.prepare(&sql).unwrap();
-        stmt.query_map(&params[..], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    }
-
-    /// Evaluates `output_lockable_condition` in SQLite. A NULL result is falsy, as it would
-    /// be in the `UPDATE ... WHERE` clause of `lock_outputs`.
-    fn sql_lockable(
-        lock_expiry_height: Option<u32>,
-        lock_owner: Option<[u8; 32]>,
-        chain_tip: Option<u32>,
-        requesting_owner: [u8; 32],
-    ) -> bool {
-        let conn = lock_state_db(lock_expiry_height, lock_owner);
-        conn.query_row(
-            &format!("SELECT ({}) FROM t", output_lockable_condition()),
-            named_params![":chain_tip": chain_tip, ":owner": requesting_owner],
-            |row| row.get::<_, Option<bool>>(0),
-        )
-        .unwrap()
-        .unwrap_or(false)
-    }
-
-    /// The balance-side model: an output is counted as locked value while its lock expiry
-    /// height has not been passed as of the target height.
-    fn model_locked(lock_expiry_height: Option<u32>, target_height: u32) -> bool {
-        lock_expiry_height.is_some_and(|h| h >= target_height)
-    }
-
-    /// Whether a note with the given lock expiry height is eligible for selection under
-    /// `Policy(Exclude)` (i.e. unlocked for selection) at `target_height`. The owner is
-    /// irrelevant under `Exclude`, which admits no owner's lock, so a locked candidate records
-    /// [`OWNER_A`].
-    fn exclude_eligible(lock_expiry_height: Option<u32>, target_height: u32) -> bool {
-        let candidate = match lock_expiry_height {
-            None => unlocked(1, 100),
-            Some(h) => locked(1, 100, h, OWNER_A),
-        };
-        !eligible_ids(
-            &[candidate],
-            target_height,
-            LockFilter::Policy(&LockedInputPolicy::Exclude),
-        )
-        .is_empty()
-    }
-
-    /// A height strategy biased toward the boundary around the given height, where the
-    /// interesting semantics (expiry exactly at the target, one below, one above) live.
-    fn arb_height_near(height: u32) -> impl Strategy<Value = u32> {
-        prop_oneof![
-            3 => height.saturating_sub(3)..=height.saturating_add(3),
-            1 => any::<u32>(),
-        ]
-    }
-
-    fn arb_lock_expiry(target_height: u32) -> impl Strategy<Value = Option<u32>> {
-        prop_oneof![
-            1 => Just(None),
-            4 => arb_height_near(target_height).prop_map(Some),
-        ]
-    }
-
-    /// Owners drawn from a two-element pool, so that the requesting owner frequently matches
-    /// (and frequently differs from) the owner recorded on the row.
-    fn arb_owner() -> impl Strategy<Value = [u8; 32]> {
-        prop_oneof![Just([0xAA; 32]), Just([0xBB; 32])]
-    }
-
-    /// Two unlocked notes, two locked by [`OWNER_A`] (the admitted owner), and one locked by
-    /// [`OWNER_B`] (a foreign owner). All ids are assigned in age order (oldest first), all
-    /// values are equal, and all locks expire at 105, safely above [`TARGET_HEIGHT`], so every
-    /// locked note is "locked for selection".
-    const TARGET_HEIGHT: u32 = 100;
-
-    fn mixed_candidates() -> Vec<Candidate> {
-        vec![
-            unlocked(1, 100),
-            locked(2, 100, 105, OWNER_A),
-            unlocked(3, 100),
-            locked(4, 100, 105, OWNER_B),
-            locked(5, 100, 105, OWNER_A),
-        ]
-    }
-
-    /// `Exclude` admits only unlocked notes, regardless of owner.
-    #[test]
-    fn exclude_selects_only_unlocked() {
-        assert_eq!(
-            eligible_ids(
-                &mixed_candidates(),
-                TARGET_HEIGHT,
-                LockFilter::Policy(&LockedInputPolicy::Exclude),
-            ),
-            vec![1, 3]
-        );
-    }
-
-    /// `Unfiltered` admits every note, locked or not, by any owner.
-    #[test]
-    fn unfiltered_selects_everything() {
-        assert_eq!(
-            eligible_ids(&mixed_candidates(), TARGET_HEIGHT, LockFilter::Unfiltered),
-            vec![1, 2, 3, 4, 5]
-        );
-    }
-
-    /// Both preference policies admit unlocked notes and the admitted owner's locked notes, but
-    /// never a note locked by a foreign owner (id 4).
-    #[test]
-    fn prefer_policies_admit_unlocked_and_owned_locks_not_foreign() {
-        for prefer_locked in [false, true] {
-            let policy = owner_a_policy(prefer_locked);
-            assert_eq!(
-                eligible_ids(
-                    &mixed_candidates(),
-                    TARGET_HEIGHT,
-                    LockFilter::Policy(&policy),
-                ),
-                vec![1, 2, 3, 5],
-                "prefer_locked = {prefer_locked}"
-            );
-        }
-    }
-
-    /// `PreferUnlocked` draws the unlocked notes first (in age order), reaching into the
-    /// admitted owner's locked notes only to cross the target; the foreign lock never appears.
-    #[test]
-    fn prefer_unlocked_draws_unlocked_before_owned_locks() {
-        let policy = owner_a_policy(false);
-        assert_eq!(
-            selection_order(
-                &mixed_candidates(),
-                TARGET_HEIGHT,
-                250,
-                LockFilter::Policy(&policy),
-            ),
-            vec![1, 3, 2]
-        );
-    }
-
-    /// `PreferLocked` is the mirror image: the admitted owner's locked notes are drawn first,
-    /// reaching into the unlocked notes only to cross the target; the foreign lock never appears.
-    #[test]
-    fn prefer_locked_draws_owned_locks_before_unlocked() {
-        let policy = owner_a_policy(true);
-        assert_eq!(
-            selection_order(
-                &mixed_candidates(),
-                TARGET_HEIGHT,
-                250,
-                LockFilter::Policy(&policy),
-            ),
-            vec![2, 5, 1]
-        );
-    }
-
-    /// A preference is only a preference: when the preferred tier alone covers the target, the
-    /// other tier is not drawn upon at all.
-    #[test]
-    fn preference_stays_within_preferred_tier_when_sufficient() {
-        assert_eq!(
-            selection_order(
-                &mixed_candidates(),
-                TARGET_HEIGHT,
-                150,
-                LockFilter::Policy(&owner_a_policy(false)),
-            ),
-            vec![1, 3],
-            "PreferUnlocked draws only unlocked notes"
-        );
-        assert_eq!(
-            selection_order(
-                &mixed_candidates(),
-                TARGET_HEIGHT,
-                150,
-                LockFilter::Policy(&owner_a_policy(true)),
-            ),
-            vec![2, 5],
-            "PreferLocked draws only the admitted owner's locked notes"
-        );
-    }
-
-    /// `Unfiltered` imposes no tier preference: it draws purely in age order, so a locked note
-    /// can be selected ahead of a later unlocked one.
-    #[test]
-    fn unfiltered_draws_in_age_order() {
-        assert_eq!(
-            selection_order(
-                &mixed_candidates(),
-                TARGET_HEIGHT,
-                150,
-                LockFilter::Unfiltered
-            ),
-            vec![1, 2]
-        );
-    }
-
-    proptest! {
-        /// `LockFilter::Unfiltered` ignores lock state entirely: a candidate is eligible
-        /// whatever its lock expiry height or owner.
-        #[test]
-        fn unfiltered_admits_all_lock_states(
-            target in any::<u32>(),
-            lock in prop::option::of(any::<u32>()),
-        ) {
-            let candidate = match lock {
-                None => unlocked(1, 100),
-                Some(h) => locked(1, 100, h, OWNER_A),
-            };
-            prop_assert_eq!(
-                eligible_ids(&[candidate], target, LockFilter::Unfiltered),
-                vec![1]
-            );
-        }
-
-        /// Under `Policy(Exclude)`, eligibility is the exact complement of the locked-balance
-        /// predicate: an output is eligible for selection iff it is not counted as locked value
-        /// at the target height. Once the target height passes the lock expiry height the output
-        /// is eligible again with no unlock call, while the stale column value is ignored.
-        #[test]
-        fn exclude_selection_is_complement_of_locked_balance(
-            (target, lock) in any::<u32>().prop_flat_map(|t| (Just(t), arb_lock_expiry(t))),
-        ) {
-            let candidate = match lock {
-                None => unlocked(1, 100),
-                Some(h) => locked(1, 100, h, OWNER_A),
-            };
-            let eligible = !eligible_ids(
-                &[candidate],
-                target,
-                LockFilter::Policy(&LockedInputPolicy::Exclude),
-            )
-            .is_empty();
-            let locked_balance = model_locked(lock, target);
-            prop_assert!(
-                eligible ^ locked_balance,
-                "eligible = {eligible}, locked = {locked_balance} for lock {lock:?}, target {target}"
-            );
-        }
-
-        /// The lock-acquisition predicate matches its model: a lock slot is free when no
-        /// lock exists, when the existing lock has expired as of the chain tip, or when the
-        /// existing lock is held by the requesting owner; when the chain tip is unknown a
-        /// foreign lock can never be judged expired.
-        #[test]
-        fn lockable_matches_model(
-            (tip, lock) in prop::option::of(any::<u32>()).prop_flat_map(|tip| {
-                (Just(tip), arb_lock_expiry(tip.unwrap_or(u32::MAX / 2)))
-            }),
-            row_owner in arb_owner(),
-            requesting_owner in arb_owner(),
-        ) {
-            // A row with a lock height always records its owner; a row without one records
-            // no owner (the invariant maintained by lock/unlock/clear).
-            let row_owner = lock.map(|_| row_owner);
-            let expected = match lock {
-                None => true,
-                Some(h) => {
-                    tip.is_some_and(|tip| h <= tip) || row_owner == Some(requesting_owner)
-                }
-            };
-            prop_assert_eq!(
-                sql_lockable(lock, row_owner, tip, requesting_owner),
-                expected
-            );
-        }
-
-        /// Same-owner re-locking is always permitted, regardless of expiry state and even
-        /// when the chain tip is unknown: this is what makes lock acquisition idempotent for
-        /// the flow that holds the lock.
-        #[test]
-        fn same_owner_relock_always_permitted(
-            (tip, lock) in prop::option::of(any::<u32>()).prop_flat_map(|tip| {
-                (Just(tip), arb_lock_expiry(tip.unwrap_or(u32::MAX / 2)))
-            }),
-            owner in arb_owner(),
-        ) {
-            let row_owner = lock.map(|_| owner);
-            prop_assert!(sql_lockable(lock, row_owner, tip, owner));
-        }
-
-        /// No lock stealing: whenever an existing lock held by a DIFFERENT owner may be
-        /// replaced (as of chain tip `tip`), the output is already selectable at the
-        /// corresponding target height `tip + 1`. Acquiring a lock therefore never displaces
-        /// a foreign lock that still protects its output.
-        #[test]
-        fn lockable_implies_selectable(
-            (tip, lock) in (0..u32::MAX).prop_flat_map(|tip| {
-                (Just(tip), arb_lock_expiry(tip))
-            }),
-        ) {
-            let row_owner = lock.map(|_| [0xAA; 32]);
-            if sql_lockable(lock, row_owner, Some(tip), [0xBB; 32]) {
-                prop_assert!(exclude_eligible(lock, tip + 1));
-            }
-        }
     }
 }

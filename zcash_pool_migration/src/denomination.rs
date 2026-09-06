@@ -118,47 +118,43 @@
 //! [ZIP 318]: https://zips.z.cash/zip-0318
 
 use alloc::vec::Vec;
+use core::num::NonZeroUsize;
 
 use rand_core::{CryptoRng, RngCore};
 
-use zcash_protocol::value::{BalanceError, COIN, Zatoshis};
+use zcash_protocol::value::{BalanceError, Zatoshis};
 
 pub mod strategies;
-mod utils;
 
 pub use strategies::CanonicalOneTwoFive;
+
+/// The ZIP 318 denomination bounds, re-exported from the crate that defines them. [`DENOM_CAP`] is
+/// the largest denomination a single crossing may carry; [`MAX_RESIDUAL_VALUE`] is the smallest, and
+/// equally the sub-threshold below which a leftover source-pool balance is never migrated at all —
+/// it is left untouched in the wallet, preserving privacy.
+///
+/// Once the main migration completes, a leftover at or above [`MAX_RESIDUAL_VALUE`] (but too small
+/// to form a whole self-funding note) is surfaced to the user as an opt-in choice: migrate the
+/// remainder too (which can compromise privacy, so it is shown with a disclaimer) or lock it to keep
+/// that privacy.
+///
+/// Both are NORMATIVE: they are the bounds ZIP 318 fixes for the denomination set, so they are not
+/// caller-settable. A wallet chooses how many notes a run prepares (see
+/// [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`]), never which values may cross.
+pub use zcash_protocol::zip318::{DENOM_CAP, MAX_RESIDUAL_VALUE};
 
 /// The default cap on how many notes one migration run prepares. Bounding the note count keeps the
 /// decomposition a bounded problem and bounds each run's transaction and proving cost; a larger
 /// balance migrates over several runs.
-pub const MIGRATION_MAX_PREPARED_NOTES_PER_RUN: usize = 50;
-
-/// The default largest denomination (in whole ZEC) the canonical `{1, 2, 5} * 10^k` strategy gives a
-/// single note: `1 * 10^4 = 10_000` ZEC, itself a `{1, 2, 5} * 10^k` value. This is ZIP 318's
-/// `DENOM_CAP`. Capping the top denomination keeps even a whale's crossings within the shared
-/// denomination set, so no single crossing is a near-unique fingerprint. This is only a default: the
-/// actual cap is chosen per run by the caller (the wallet) and passed to the strategy constructor.
-pub const MIGRATION_MAX_DENOMINATION_ZEC: u64 = 10_000;
-
-/// The sub-threshold (0.01 ZEC) below which a leftover source-pool balance is never migrated: it is
-/// left untouched in the wallet, preserving privacy. Once the main migration completes, a leftover
-/// at or above this threshold (but too small to form a whole self-funding note) is surfaced to the
-/// user as an opt-in choice: migrate the remainder too (which can compromise privacy, so it is shown
-/// with a disclaimer) or lock it to keep that privacy. Consumed by the context module in a later
-/// slice. Also the default minimum denomination of [`CanonicalOneTwoFive`] (ZIP 318's `MAX_RESIDUAL_VALUE`).
-pub const RESIDUAL_MIGRATION_MIN: Zatoshis = Zatoshis::const_from_u64(COIN / 100); // 0.01 ZEC
-
-/// Source-pool (Orchard) logical actions in a canonical migration transfer: the spend and its
-/// change. With [`DESTINATION_ACTIONS_PER_TRANSFER`], this is the canonical transfer shape whose
-/// ZIP-317 fee is the per-note transfer-fee buffer.
-pub(crate) const SOURCE_ACTIONS_PER_TRANSFER: usize = 2;
-
-/// Destination-pool (Ironwood) logical actions in a canonical migration transfer: the single
-/// canonical output, UNPADDED. The Ironwood builder permits a one-action bundle (no padding dummy),
-/// which the migration uses to save proving bandwidth on hardware signers; every migration transfer
-/// shares this shape, so the action count reveals nothing a canonical transfer does not already
-/// reveal.
-pub(crate) const DESTINATION_ACTIONS_PER_TRANSFER: usize = 1;
+///
+/// This is a policy default of this crate, not a ZIP 318 constant: the ZIP fixes the denomination
+/// set (`{1, 2, 5} * 10^k`) and its bounds ([`DENOM_CAP`] and [`MAX_RESIDUAL_VALUE`]), but says
+/// nothing about how many notes one run may prepare. The count is therefore the caller's to choose
+/// — a wallet may override it per run — while the set and its bounds are not caller-settable.
+pub const MIGRATION_MAX_PREPARED_NOTES_PER_RUN: NonZeroUsize = match NonZeroUsize::new(50) {
+    Some(v) => v,
+    None => panic!("nonzero"),
+};
 
 /// The outcome of denomination planning: the self-funding notes to create, the values that will
 /// cross the turnstile, and the residual kept in the source pool. Produced by a
@@ -303,18 +299,27 @@ pub trait DenominationStrategy {
     /// Decompose `total_input_zatoshi` into self-funding notes, accounting the preparation fees at
     /// each step of the decomposition.
     ///
-    /// `prep_tx_fee_zatoshi` is the ZIP-317 fee of one canonical (padded) preparation transaction,
-    /// computed by the caller from the canonical shape. `prep_tx_count` is the capability that
-    /// answers, for a candidate multiset of prepared-note values (each `crossing + buffer`), how
-    /// many preparation transactions minting them will take — `None` when the wallet's notes cannot
-    /// mint that multiset at all. The engine backs it with the preparation planner, so the
-    /// decomposition reserves the TRUE preparation cost (consolidation, fan-out layers, and all) as
-    /// it grows, instead of a fixed guess repaired after the fact. `rng` is used by randomized
-    /// strategies and ignored by deterministic ones; it is bound as [`CryptoRng`] because a
-    /// randomized strategy's draws decide the on-chain crossing values, which are privacy-relevant.
+    /// `spendable_note_count` is how many spendable notes hold `total_input`. A strategy may
+    /// consult it only through the single predicate `spendable_note_count == 1`, which decides
+    /// whether preparation is avoidable at all: a lone note necessarily equals the balance, so a
+    /// balance of exactly one denomination plus its buffer is certain to fund that crossing
+    /// directly with no preparation fee, while with two or more notes no note can equal that
+    /// funding value and the fee reserve is mandatory. Beyond that bit, the published values must
+    /// remain a function of the balance alone. `prep_tx_fee_zatoshi` is the ZIP-317 fee of one
+    /// canonical (padded) preparation transaction, computed by the caller from the canonical
+    /// shape. `prep_tx_count` is the capability that answers, for a candidate multiset of
+    /// prepared-note values (each `crossing + buffer`), how many preparation transactions minting
+    /// them will take — `None` when the wallet's notes cannot mint that multiset at all. The
+    /// engine backs it with the preparation planner. A strategy must use it only to RECONCILE a
+    /// split it computed as above — dropping parts the wallet cannot fund, never substituting
+    /// different denominations — so the published values cannot otherwise depend on the wallet's
+    /// note shape. `rng` is used by randomized strategies and ignored by deterministic ones; it is
+    /// bound as [`CryptoRng`] because a randomized strategy's draws decide the on-chain crossing
+    /// values, which are privacy-relevant.
     fn plan<R: RngCore + CryptoRng>(
         &self,
         total_input: Zatoshis,
+        spendable_note_count: usize,
         prep_tx_fee: Zatoshis,
         prep_tx_count: &dyn Fn(&[Zatoshis]) -> Option<usize>,
         rng: &mut R,
@@ -328,19 +333,59 @@ pub(crate) fn zat(value: u64) -> Zatoshis {
     Zatoshis::from_u64(value).expect("split values are bounded by the validated total input")
 }
 
-/// Convenience wrapper: plan with the recommended [`CanonicalOneTwoFive`] strategy (ZIP 318 canonical
-/// quantization), sized by the caller-computed canonical fees (see [`DenominationStrategy::plan`]).
-pub fn plan_denominations<R: RngCore + CryptoRng>(
+/// Convenience wrapper: plan with the canonical [`CanonicalOneTwoFive`] strategy (ZIP 318 canonical
+/// quantization) capped at `max_notes` prepared notes, sized by the caller-computed canonical fees
+/// (see [`DenominationStrategy::plan`]).
+///
+/// `max_notes` is the ONLY knob: the denomination set and its [`DENOM_CAP`]/[`MAX_RESIDUAL_VALUE`]
+/// bounds are normative ZIP 318 values, not parameters. Pass
+/// [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`] for this crate's default.
+pub fn plan_denominations<R>(
     total_input: Zatoshis,
+    spendable_note_count: usize,
+    max_notes: NonZeroUsize,
     transfer_fee_buffer: Zatoshis,
     prep_tx_fee: Zatoshis,
     prep_tx_count: &dyn Fn(&[Zatoshis]) -> Option<usize>,
     rng: &mut R,
-) -> DenominationPlan {
-    CanonicalOneTwoFive::recommended(transfer_fee_buffer).plan(
+) -> DenominationPlan
+where
+    R: RngCore + CryptoRng,
+{
+    CanonicalOneTwoFive::with_max_notes(max_notes, transfer_fee_buffer).plan(
         total_input,
+        spendable_note_count,
         prep_tx_fee,
         prep_tx_count,
         rng,
     )
+}
+
+/// Whether `total_input`, held as `spendable_note_count` notes, quantizes to at least one canonical
+/// part under the recommended strategy — that is, whether a wallet in this state could migrate part
+/// of its balance if its note values allowed. Independent of the note VALUES: reconciliation
+/// against them can only truncate the canonical split, never extend it, so a state for which this
+/// is `false` has nothing to migrate regardless of how the notes hold the value, while `true` with
+/// an empty reconciled plan means the note values — not the balance — blocked the run (see
+/// [`MigrationError::UnfundableSplit`](crate::engine::MigrationError::UnfundableSplit)).
+///
+/// The answer does not in fact depend on `max_notes`: a first part forms or not from the balance,
+/// the transfer buffer and the preparation fee alone, and every positive cap admits that first
+/// part, so the emptiness of the split is invariant across caps. The cap is taken anyway so that
+/// the question is asked of the run actually being planned rather than of a hypothetical default
+/// one.
+pub(crate) fn balance_has_canonical_split(
+    total_input: Zatoshis,
+    spendable_note_count: usize,
+    max_notes: NonZeroUsize,
+    transfer_fee_buffer: Zatoshis,
+    prep_tx_fee: Zatoshis,
+) -> bool {
+    !CanonicalOneTwoFive::with_max_notes(max_notes, transfer_fee_buffer)
+        .unconstrained_split(
+            u64::from(total_input),
+            spendable_note_count,
+            u64::from(prep_tx_fee),
+        )
+        .is_empty()
 }

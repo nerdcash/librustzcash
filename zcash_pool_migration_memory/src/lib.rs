@@ -22,6 +22,9 @@
 //! [`MigrationCrypto`]: zcash_pool_migration::engine::MigrationCrypto
 //! [`zcash_client_memory`]: https://docs.rs/zcash_client_memory
 
+use core::cell::Cell;
+use std::collections::BTreeMap;
+
 use incrementalmerkletree::{Hashable, Level};
 use orchard::keys::{FullViewingKey, Scope, SpendAuthorizingKey, SpendingKey};
 use orchard::note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho};
@@ -30,15 +33,17 @@ use orchard::value::NoteValue;
 use orchard::{Anchor, NOTE_COMMITMENT_TREE_DEPTH};
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
+use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::local_consensus::LocalNetwork;
 use zcash_protocol::value::Zatoshis;
 
-use zcash_pool_migration::build::sign_pczt;
+use zcash_pool_migration::build::AccountDerivation;
 use zcash_pool_migration::engine::{
     MigrationBackend, MigrationCrypto, MigrationState, MigrationTransaction, MigrationTransferId,
-    MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
+    MigrationTxState, PoolMigrationRead, PoolMigrationWrite, ProvedTransaction,
 };
+use zcash_pool_migration::satisfiability::{ReorgSettleDepth, StepSatisfiability};
 use zcash_pool_migration::scheduling::SchedulingParams;
 
 /// A post-NU6.3 height (past the regtest NU6.3 activation) at which the migration transactions are
@@ -62,6 +67,19 @@ pub fn spending_key(seed: u64) -> SpendingKey {
             return sk;
         }
     }
+}
+
+/// The ZIP 32 account derivation a wallet seeded with `seed` would report, matching the account
+/// [`spending_key`] derives. The seed fingerprint is a stand-in, not a real ZIP 32 fingerprint of
+/// the test seed: nothing downstream re-derives keys from it, and an external Signer only needs the
+/// derivation to be a stable identifier for the account.
+pub fn account_derivation(seed: u64) -> AccountDerivation {
+    let mut seed_fingerprint = [0u8; 32];
+    seed_fingerprint[..8].copy_from_slice(&seed.to_le_bytes());
+    AccountDerivation::new(
+        zip32::fingerprint::SeedFingerprint::from_bytes(seed_fingerprint),
+        zip32::AccountId::ZERO,
+    )
 }
 
 /// A regtest network with the pre-NU6.3 upgrades active, and NU6.3 active only when requested.
@@ -211,6 +229,11 @@ pub fn shared_anchor_witnesses(
 /// untouched. The engine's [`MigrationState`] keeps its transactions behind read-only accessors, so
 /// an external test backend advances one transaction's lifecycle by reconstructing the state from
 /// its public parts.
+///
+/// Every other part is carried across verbatim, including the determinations a transaction row
+/// carries (its unsatisfiability mark, its broadcast-failure report): a store advancing a
+/// lifecycle state records exactly that, and dropping a field here would silently erase a
+/// determination the engine is relying on.
 fn set_transaction_state(
     stored: &mut MigrationState,
     id: MigrationTransferId,
@@ -229,8 +252,12 @@ fn set_transaction_state(
                     t.scheduled_height(),
                     t.expiry_height(),
                     t.anchor_boundary(),
+                    t.txid(),
                     state,
                     t.lock_owner(),
+                    t.unsatisfiable(),
+                    t.spend_nullifiers().clone(),
+                    t.broadcast_failure_at(),
                 )
             } else {
                 t.clone()
@@ -243,6 +270,7 @@ fn set_transaction_state(
         stored.preparation().clone(),
         transactions,
         stored.anchor_bucket_interval(),
+        stored.replan_threshold(),
     );
 }
 
@@ -254,6 +282,18 @@ pub struct MockBackend {
     tip: BlockHeight,
     stored: Option<MigrationState>,
     sched_params: SchedulingParams,
+    /// Configured per-transaction answers for
+    /// [`check_step_satisfiability`](PoolMigrationRead::check_step_satisfiability); a transaction
+    /// with no entry answers `Satisfiable` at the mock's chain tip.
+    pub satisfiability: BTreeMap<MigrationTransferId, StepSatisfiability>,
+    /// How many times `check_step_satisfiability` has been called, for tests asserting that a
+    /// consumer queries the oracle lazily.
+    pub satisfiability_queries: Cell<usize>,
+    /// Configured mined heights by transaction id, for
+    /// [`mined_height`](PoolMigrationRead::mined_height): a txid with no entry is not observed
+    /// mined. The engine's in-flight sweep promotes a broadcast transaction listed here, so a test
+    /// models mining by adding its txid rather than by calling `mark_mined`.
+    pub mined: BTreeMap<TxId, BlockHeight>,
 }
 
 impl MockBackend {
@@ -268,6 +308,9 @@ impl MockBackend {
             tip: BlockHeight::from_u32(tip),
             stored: None,
             sched_params: SchedulingParams::ZIP_318,
+            satisfiability: BTreeMap::new(),
+            satisfiability_queries: Cell::new(0),
+            mined: BTreeMap::new(),
         }
     }
 
@@ -300,7 +343,32 @@ impl PoolMigrationRead for MockBackend {
     type Error = core::convert::Infallible;
 
     fn get_migration(&self) -> Result<Option<MigrationState>, Self::Error> {
-        Ok(self.stored.clone())
+        // Pending-only, per the trait contract: a terminal state is history.
+        Ok(self.stored.clone().filter(|s| !s.is_terminal()))
+    }
+
+    fn check_step_satisfiability(
+        &self,
+        tx: &MigrationTransaction,
+        _settle: ReorgSettleDepth,
+    ) -> Result<StepSatisfiability, Self::Error> {
+        self.satisfiability_queries
+            .set(self.satisfiability_queries.get() + 1);
+        // The empty-cache-is-corruption contract cannot be honored here: this mock's `Error` is
+        // `Infallible`, so there is no error to surface. The mock answers the configured value
+        // (or `Satisfiable` at its tip) regardless; tests that need the corruption path use the
+        // SQLite implementation.
+        Ok(self
+            .satisfiability
+            .get(&tx.id())
+            .cloned()
+            .unwrap_or(StepSatisfiability::Satisfiable {
+                as_of_height: self.tip,
+            }))
+    }
+
+    fn mined_height(&self, txid: TxId) -> Result<Option<BlockHeight>, Self::Error> {
+        Ok(self.mined.get(&txid).copied())
     }
 }
 
@@ -320,7 +388,22 @@ impl PoolMigrationWrite for MockBackend {
         }
         Ok(())
     }
+
+    /// The contract's no-wallet-tables form: this mock maintains no wallet-level transaction
+    /// records, so it applies the proof to the state and persists that alone.
+    fn store_proved_transaction(
+        &mut self,
+        state: &mut MigrationState,
+        proven: ProvedTransaction,
+    ) -> Result<(), Self::Error> {
+        proven.apply(state);
+        self.replace_migration(state)
+    }
 }
+
+/// The fixed chain-tip height [`CommitMock`] reports (and the height its default
+/// satisfiability answers rest on).
+const COMMIT_MOCK_TIP: u32 = 2_000_000;
 
 /// A wallet mock holding the account's key and its spendable notes' PLAINTEXTS, nothing more: with
 /// anchors and witnesses deferred to proving time (ZIP 374), building and signing an entire
@@ -333,10 +416,28 @@ pub struct CommitMock {
     pub wallet_notes: Vec<Note>,
     /// The account's Orchard full viewing key.
     pub fvk: FullViewingKey,
-    /// The account's Orchard spend-authorizing key, used to sign the migration PCZTs.
+    /// The account's Orchard spend-authorizing key. The mock does NOT sign with it: the engine
+    /// takes the spend authority as an argument to the calls that sign, so a test passes this to
+    /// `commit_preparation` / `rebuild_expired_transfer` (and uses it to play the external signer)
+    /// rather than the backend signing on its own behalf.
     pub ask: SpendAuthorizingKey,
+    /// The ZIP 32 account the notes belong to, as a seeded wallet would report it. `None` models a
+    /// wallet that knows no derivation for the account (an imported viewing key).
+    pub account_derivation: Option<AccountDerivation>,
     /// The in-memory migration state (`None` until a migration is committed).
     pub stored: Option<MigrationState>,
+    /// Configured per-transaction answers for
+    /// [`check_step_satisfiability`](PoolMigrationRead::check_step_satisfiability); a transaction
+    /// with no entry answers `Satisfiable` at the mock's chain tip.
+    pub satisfiability: BTreeMap<MigrationTransferId, StepSatisfiability>,
+    /// How many times `check_step_satisfiability` has been called, for tests asserting that a
+    /// consumer queries the oracle lazily.
+    pub satisfiability_queries: Cell<usize>,
+    /// Configured mined heights by transaction id, for
+    /// [`mined_height`](PoolMigrationRead::mined_height): a txid with no entry is not observed
+    /// mined. The engine's in-flight sweep promotes a broadcast transaction listed here, so a test
+    /// models mining by adding its txid rather than by calling `mark_mined`.
+    pub mined: BTreeMap<TxId, BlockHeight>,
     /// The scheduling parameters this backend reports to the engine.
     sched_params: SchedulingParams,
 }
@@ -355,9 +456,20 @@ impl CommitMock {
             wallet_notes,
             fvk,
             ask: SpendAuthorizingKey::from(&sk),
+            account_derivation: Some(account_derivation(seed)),
             stored: None,
+            satisfiability: BTreeMap::new(),
+            satisfiability_queries: Cell::new(0),
+            mined: BTreeMap::new(),
             sched_params: SchedulingParams::ZIP_318,
         }
+    }
+
+    /// Models a wallet that knows no ZIP 32 derivation for the account, so the migration's spends
+    /// carry no derivation metadata and only an in-process signer can authorize them.
+    pub fn without_account_derivation(mut self) -> Self {
+        self.account_derivation = None;
+        self
     }
 
     /// Overrides the scheduling parameters this backend reports (the default is
@@ -381,7 +493,7 @@ impl MigrationBackend for CommitMock {
     }
 
     fn chain_tip_height(&self) -> Result<BlockHeight, Self::Error> {
-        Ok(BlockHeight::from_u32(2_000_000))
+        Ok(BlockHeight::from_u32(COMMIT_MOCK_TIP))
     }
 
     fn scheduling_params(&self) -> SchedulingParams {
@@ -393,7 +505,32 @@ impl PoolMigrationRead for CommitMock {
     type Error = core::convert::Infallible;
 
     fn get_migration(&self) -> Result<Option<MigrationState>, Self::Error> {
-        Ok(self.stored.clone())
+        // Pending-only, per the trait contract: a terminal state is history.
+        Ok(self.stored.clone().filter(|s| !s.is_terminal()))
+    }
+
+    fn check_step_satisfiability(
+        &self,
+        tx: &MigrationTransaction,
+        _settle: ReorgSettleDepth,
+    ) -> Result<StepSatisfiability, Self::Error> {
+        self.satisfiability_queries
+            .set(self.satisfiability_queries.get() + 1);
+        // The empty-cache-is-corruption contract cannot be honored here: this mock's `Error` is
+        // `Infallible`, so there is no error to surface. The mock answers the configured value
+        // (or `Satisfiable` at its tip) regardless; tests that need the corruption path use the
+        // SQLite implementation.
+        Ok(self
+            .satisfiability
+            .get(&tx.id())
+            .cloned()
+            .unwrap_or(StepSatisfiability::Satisfiable {
+                as_of_height: BlockHeight::from_u32(COMMIT_MOCK_TIP),
+            }))
+    }
+
+    fn mined_height(&self, txid: TxId) -> Result<Option<BlockHeight>, Self::Error> {
+        Ok(self.mined.get(&txid).copied())
     }
 }
 
@@ -413,20 +550,31 @@ impl PoolMigrationWrite for CommitMock {
         }
         Ok(())
     }
+
+    /// The contract's no-wallet-tables form: this mock maintains no wallet-level transaction
+    /// records, so it applies the proof to the state and persists that alone.
+    fn store_proved_transaction(
+        &mut self,
+        state: &mut MigrationState,
+        proven: ProvedTransaction,
+    ) -> Result<(), Self::Error> {
+        proven.apply(state);
+        self.replace_migration(state)
+    }
 }
 
 impl MigrationCrypto for CommitMock {
     type Error = core::convert::Infallible;
 
-    fn orchard_fvk(&self) -> Result<FullViewingKey, Self::Error> {
-        Ok(self.fvk.clone())
+    fn orchard_fvk(&self) -> Option<&FullViewingKey> {
+        Some(&self.fvk)
+    }
+
+    fn account_derivation(&self) -> Result<Option<AccountDerivation>, Self::Error> {
+        Ok(self.account_derivation.clone())
     }
 
     fn resolve_wallet_note(&self, index: usize) -> Result<Note, Self::Error> {
         Ok(self.wallet_notes[index])
-    }
-
-    fn sign(&self, pczt: pczt::Pczt) -> Result<pczt::Pczt, Self::Error> {
-        Ok(sign_pczt(pczt, &self.ask).expect("signs the migration PCZT"))
     }
 }

@@ -5,7 +5,6 @@
 
 use prost::Message;
 use rusqlite::params;
-use tempfile::NamedTempFile;
 
 use zcash_client_backend::{
     data_api::testing::{CacheInsertionResult, NoteCommitments, TestCache},
@@ -13,12 +12,19 @@ use zcash_client_backend::{
 };
 use zcash_protocol::TxId;
 #[cfg(feature = "orchard")]
-use zcash_protocol::consensus::BlockHeight;
+use {
+    shardtree::{error::ShardTreeError, store::ShardStore},
+    zcash_client_backend::data_api::WalletCommitmentTrees,
+    zcash_protocol::consensus::BlockHeight,
+};
 
 use crate::{chain::init::init_cache_database, error::SqliteClientError};
 
 use super::BlockDb;
 
+#[cfg(all(test, feature = "unstable"))]
+#[cfg(all(test, feature = "unstable"))]
+use std::io::Write;
 #[cfg(all(test, feature = "unstable"))]
 use {
     crate::{
@@ -39,21 +45,16 @@ pub(crate) mod pool;
 /// An in-memory compact-block cache backed by a temporary [`BlockDb`], implementing the
 /// `zcash_client_backend` testing framework's [`TestCache`].
 pub struct BlockCache {
-    _cache_file: NamedTempFile,
     db_cache: BlockDb,
 }
 
 impl BlockCache {
-    /// Creates an empty cache over a fresh temporary block database.
+    /// Creates an empty cache over a fresh in-memory block database.
     pub fn new() -> Self {
-        let cache_file = NamedTempFile::new().unwrap();
-        let db_cache = BlockDb::for_path(cache_file.path()).unwrap();
+        let db_cache = BlockDb::from_connection(rusqlite::Connection::open_in_memory().unwrap());
         init_cache_database(&db_cache).unwrap();
 
-        BlockCache {
-            _cache_file: cache_file,
-            db_cache,
-        }
+        BlockCache { db_cache }
     }
 }
 
@@ -130,10 +131,6 @@ pub fn highest_rooted_orchard_checkpoint<W>(db: &mut W, from: BlockHeight) -> Op
 where
     W: zcash_client_backend::data_api::WalletCommitmentTrees,
 {
-    use shardtree::error::ShardTreeError;
-    use shardtree::store::ShardStore;
-    use zcash_client_backend::data_api::WalletCommitmentTrees;
-
     db.with_orchard_tree_mut::<_, _, ShardTreeError<<W as WalletCommitmentTrees>::Error>>(|tree| {
         // Take the highest checkpoint id at or below `from` directly from the checkpoint set,
         // rather than probing the tree at every height down from `from`.
@@ -200,8 +197,6 @@ impl TestCache for FsBlockCache {
     }
 
     fn insert(&mut self, cb: &CompactBlock) -> Self::InsertResult {
-        use std::io::Write;
-
         let txids = cb.vtx.iter().map(|tx| tx.txid()).collect();
         let block_meta = BlockMeta {
             height: cb.height(),

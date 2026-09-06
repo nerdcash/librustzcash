@@ -6,20 +6,31 @@ use core::num::NonZeroU32;
 
 use crate::{
     SAPLING_TABLES_PREFIX,
+    error::SqliteClientError,
     testing::{BlockCache, db::TestDbFactory},
 };
 use zcash_client_backend::data_api::{
+    WalletWrite,
     anchor_retention::AnchorRetentionInterval,
+    chain::{ChainState, error::Error},
     testing::{
-        pool::{InputTrust, ShieldedPoolTester},
+        AddressType,
+        pool::{InputTrust, ShieldedPoolTester, dsl::TestDsl},
         sapling::SaplingPoolTester,
     },
 };
 
+#[cfg(feature = "transparent-inputs")]
+use rusqlite::named_params;
+use zcash_protocol::{
+    consensus::{NetworkUpgrade, Parameters},
+    value::Zatoshis,
+};
 #[cfg(feature = "orchard")]
 use {
     crate::ORCHARD_TABLES_PREFIX,
     zcash_client_backend::data_api::testing::orchard::OrchardPoolTester,
+    zcash_protocol::ShieldedPool,
 };
 
 pub(crate) trait ShieldedPoolPersistence {
@@ -229,86 +240,6 @@ pub(crate) fn spend_fails_on_unverified_notes<T: ShieldedPoolTester>() {
     )
 }
 
-pub(crate) fn spend_fails_on_locked_notes<T: ShieldedPoolTester>() {
-    zcash_client_backend::data_api::testing::pool::spend_fails_on_locked_notes::<T>(
-        TestDbFactory::default(),
-        BlockCache::new(),
-    )
-}
-
-pub(crate) fn explicit_note_locking<T: ShieldedPoolTester>() {
-    zcash_client_backend::data_api::testing::pool::explicit_note_locking::<T>(
-        TestDbFactory::default(),
-        BlockCache::new(),
-    )
-}
-
-pub(crate) fn note_locking_height_boundary<T: ShieldedPoolTester>() {
-    zcash_client_backend::data_api::testing::pool::note_locking_height_boundary::<T>(
-        TestDbFactory::default(),
-        BlockCache::new(),
-    )
-}
-
-pub(crate) fn clear_locked_outputs<T: ShieldedPoolTester>() {
-    zcash_client_backend::data_api::testing::pool::clear_locked_outputs::<T>(
-        TestDbFactory::default(),
-        BlockCache::new(),
-    )
-}
-
-pub(crate) fn proposal_level_note_locking<T: ShieldedPoolTester>() {
-    zcash_client_backend::data_api::testing::pool::proposal_level_note_locking::<T>(
-        TestDbFactory::default(),
-        BlockCache::new(),
-    )
-}
-
-pub(crate) fn locked_proposal_proto_roundtrip<T: ShieldedPoolTester>() {
-    zcash_client_backend::data_api::testing::pool::locked_proposal_proto_roundtrip::<T>(
-        TestDbFactory::default(),
-        BlockCache::new(),
-    )
-}
-
-pub(crate) fn lock_expiry_restores_spendability<T: ShieldedPoolTester>() {
-    zcash_client_backend::data_api::testing::pool::lock_expiry_restores_spendability::<T>(
-        TestDbFactory::default(),
-        BlockCache::new(),
-    )
-}
-
-pub(crate) fn lock_conflict_and_batch_atomicity<T: ShieldedPoolTester>() {
-    zcash_client_backend::data_api::testing::pool::lock_conflict_and_batch_atomicity::<T>(
-        TestDbFactory::default(),
-        BlockCache::new(),
-    )
-}
-
-pub(crate) fn unlock_proposal_inputs_releases_locks<T: ShieldedPoolTester>() {
-    zcash_client_backend::data_api::testing::pool::unlock_proposal_inputs_releases_locks::<T>(
-        TestDbFactory::default(),
-        BlockCache::new(),
-    )
-}
-
-pub(crate) fn spend_policy_locked_input_policy_reaches_selection<T: ShieldedPoolTester>() {
-    zcash_client_backend::data_api::testing::pool::spend_policy_locked_input_policy_reaches_selection::<T>(
-        TestDbFactory::default(),
-        BlockCache::new(),
-    )
-}
-
-pub(crate) fn check_note_locking_model<T: ShieldedPoolTester>(
-    ops: &[zcash_client_backend::data_api::testing::pool::LockOp],
-) {
-    zcash_client_backend::data_api::testing::pool::check_note_locking_model::<T>(
-        TestDbFactory::default(),
-        BlockCache::new(),
-        ops,
-    )
-}
-
 pub(crate) fn ovk_policy_prevents_recovery_from_chain<T: ShieldedPoolTester>() {
     zcash_client_backend::data_api::testing::pool::ovk_policy_prevents_recovery_from_chain::<T, _>(
         TestDbFactory::default(),
@@ -398,6 +329,95 @@ pub(crate) fn anchor_checkpoints_retained_across_deep_scan<T: ShieldedPoolTester
             _,
         >(TestDbFactory::default(), BlockCache::new(), interval)
     }
+}
+
+pub(crate) fn oldest_note_is_selected_first<T: ShieldedPoolTester>() {
+    zcash_client_backend::data_api::testing::pool::oldest_note_is_selected_first::<T, _>(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
+/// Runs the empty-boundary retention check at a short interval, so a handful of filler blocks
+/// crosses two boundaries.
+#[cfg(feature = "orchard")]
+pub(crate) fn empty_boundary_blocks_are_checkpointed_and_retained<T: ShieldedPoolTester>() {
+    zcash_client_backend::data_api::testing::pool::empty_boundary_blocks_are_checkpointed_and_retained::<
+        T,
+        _,
+    >(
+        TestDbFactory::default(),
+        BlockCache::new(),
+        AnchorRetentionInterval::custom(NonZeroU32::new(7).expect("nonzero")),
+    )
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn canonical_crossing_is_bucketed_and_unpadded() {
+    zcash_client_backend::data_api::testing::pool::canonical_crossing_is_bucketed_and_unpadded(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn canonical_crossing_builds_at_empty_boundary_block() {
+    zcash_client_backend::data_api::testing::pool::canonical_crossing_builds_at_empty_boundary_block(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
+/// Deletes every checkpoint record at `height`, simulating a wallet that scanned past NU6.3
+/// activation before boundary checkpointing was repaired and so is permanently missing the
+/// boundary.
+#[cfg(feature = "orchard")]
+pub(crate) fn canonical_crossing_abandoned_without_anchor_checkpoint() {
+    zcash_client_backend::data_api::testing::pool::canonical_crossing_abandoned_without_anchor_checkpoint(
+        TestDbFactory::default(),
+        BlockCache::new(),
+        |st, height| {
+            let conn = st.wallet().conn();
+            for table in [
+                "sapling_tree_checkpoints",
+                "orchard_tree_checkpoints",
+                "ironwood_tree_checkpoints",
+                "sapling_tree_retained_checkpoints",
+                "orchard_tree_retained_checkpoints",
+                "ironwood_tree_retained_checkpoints",
+            ] {
+                conn.execute(
+                    &format!("DELETE FROM {table} WHERE checkpoint_id = :height"),
+                    rusqlite::named_params![":height": u32::from(height)],
+                )
+                .expect("checkpoint records can be deleted");
+            }
+        },
+    )
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn canonical_crossing_prefers_single_note() {
+    zcash_client_backend::data_api::testing::pool::canonical_crossing_prefers_single_note(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn multi_note_crossing_is_not_bucketed() {
+    zcash_client_backend::data_api::testing::pool::multi_note_crossing_is_not_bucketed(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn self_migration_keeps_spending_orchard() {
+    zcash_client_backend::data_api::testing::pool::self_migration_keeps_spending_orchard(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
 }
 
 #[cfg(feature = "orchard")]
@@ -499,18 +519,6 @@ pub(crate) fn truncate_to_chain_state_above_scanned<T: ShieldedPoolTester>() {
 /// one captured from a second wallet that scanned the same number of blocks with different note
 /// values, so it has the same tree shape but conflicting node hashes.
 pub(crate) fn truncate_to_chain_state_commitment_tree_error<T: ShieldedPoolTester>() {
-    use zcash_client_backend::data_api::{
-        WalletWrite, chain::ChainState, testing::AddressType, testing::pool::dsl::TestDsl,
-    };
-    #[cfg(feature = "orchard")]
-    use zcash_protocol::ShieldedPool;
-    use zcash_protocol::{
-        consensus::{NetworkUpgrade, Parameters},
-        value::Zatoshis,
-    };
-
-    use crate::error::SqliteClientError;
-
     // `zcash_client_backend::data_api::ll::wallet::PRUNING_DEPTH` is crate-private; mirror it
     // here. Scanning this far past the captured height guarantees its checkpoint is pruned.
     const PRUNING_DEPTH: u32 = 100;
@@ -642,20 +650,6 @@ pub(crate) fn truncate_to_chain_state_commitment_tree_error<T: ShieldedPoolTeste
 /// `put_blocks`' sequentiality checks) but conflicting node hashes, so `insert_frontier` inside
 /// `put_blocks` fails.
 pub(crate) fn put_blocks_commitment_tree_error<T: ShieldedPoolTester>() {
-    use zcash_client_backend::data_api::{
-        chain::{ChainState, error::Error},
-        testing::AddressType,
-        testing::pool::dsl::TestDsl,
-    };
-    #[cfg(feature = "orchard")]
-    use zcash_protocol::ShieldedPool;
-    use zcash_protocol::{
-        consensus::{NetworkUpgrade, Parameters},
-        value::Zatoshis,
-    };
-
-    use crate::error::SqliteClientError;
-
     // Wallet A: scan an initial range of blocks and capture its (consistent) chain state at the
     // last scanned height.
     let mut wallet_a =
@@ -793,6 +787,7 @@ pub(crate) fn rewind_after_non_contiguous_scan<T: ShieldedPoolTester>() {
     )
 }
 
+#[cfg(feature = "expensive-tests")]
 pub(crate) fn stabilized_note_spendable_after_deep_rewind<T: ShieldedPoolTester>() {
     zcash_client_backend::data_api::testing::pool::stabilized_note_spendable_after_deep_rewind::<T, _>(
         TestDbFactory::default(),
@@ -800,6 +795,7 @@ pub(crate) fn stabilized_note_spendable_after_deep_rewind<T: ShieldedPoolTester>
     )
 }
 
+#[cfg(feature = "expensive-tests")]
 pub(crate) fn newly_discovered_notes_become_stabilized<T: ShieldedPoolTester>() {
     zcash_client_backend::data_api::testing::pool::newly_discovered_notes_become_stabilized::<T, _>(
         TestDbFactory::default(),
@@ -863,8 +859,6 @@ pub(crate) fn pczt_single_step<P0: ShieldedPoolTester, P1: ShieldedPoolTester>(
 
 #[cfg(feature = "transparent-inputs")]
 pub(crate) fn wallet_recovery_computes_fees<T: ShieldedPoolTester>() {
-    use rusqlite::named_params;
-
     zcash_client_backend::data_api::testing::pool::wallet_recovery_computes_fees::<T, _>(
         TestDbFactory::default(),
         BlockCache::new(),
@@ -990,6 +984,22 @@ pub(crate) fn shielding_coinbase_to_orchard_receiver_delivers_via_ironwood() {
 }
 
 #[cfg(feature = "orchard")]
+pub(crate) fn orchard_to_ironwood_payment_reports_net_value_delta() {
+    zcash_client_backend::data_api::testing::pool::orchard_to_ironwood_payment_reports_net_value_delta(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    );
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn orchard_to_ironwood_self_migration_reports_fee_only_delta() {
+    zcash_client_backend::data_api::testing::pool::orchard_to_ironwood_self_migration_reports_fee_only_delta(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    );
+}
+
+#[cfg(feature = "orchard")]
 pub(crate) fn propose_v5_payment_to_orchard_receiver_is_rejected() {
     zcash_client_backend::data_api::testing::pool::propose_v5_payment_to_orchard_receiver_is_rejected(
         TestDbFactory::default(),
@@ -1011,174 +1021,4 @@ pub(crate) fn proposal_records_and_serializes_proposed_version() {
         TestDbFactory::default(),
         BlockCache::new(),
     );
-}
-
-#[cfg(test)]
-mod concurrency_tests {
-    use assert_matches::assert_matches;
-
-    use zcash_client_backend::{
-        data_api::{
-            Account as _, InputSource as _, WalletRead as _, WalletTest as _, WalletWrite as _,
-            error::LockError,
-            testing::{
-                AddressType, TestBuilder, pool::ShieldedPoolTester, sapling::SaplingPoolTester,
-            },
-            wallet::{
-                TargetHeight,
-                input_selection::{LockFilter, LockedInputPolicy},
-            },
-        },
-        wallet::{LockOwner, OutputRef},
-    };
-    use zcash_primitives::block::BlockHash;
-    use zcash_protocol::{PoolType, ShieldedPool, consensus::BlockHeight, value::Zatoshis};
-
-    use crate::{
-        WalletDb,
-        testing::{
-            BlockCache,
-            db::{TestDbFactory, test_clock, test_rng},
-        },
-    };
-
-    /// Two independent `WalletDb` connections to the same wallet database resolve a lock race
-    /// at the storage layer: both handles observe the same spendable note (the shared
-    /// select-before-lock state of the TOCTOU window), only the first `lock_outputs` succeeds,
-    /// the loser's failure names the contested note, and lock state changes are immediately
-    /// visible across handles. Also pins the ownerless-lock property across connections: the
-    /// losing handle is able to release the winner's lock.
-    #[test]
-    fn concurrent_handles_resolve_lock_conflict() {
-        let mut st = TestBuilder::new()
-            .with_block_cache(BlockCache::new())
-            .with_data_store_factory(TestDbFactory::default())
-            .with_account_from_sapling_activation(BlockHash([0; 32]))
-            .build();
-
-        // Fund the wallet with a single note.
-        let dfvk = SaplingPoolTester::test_account_fvk(&st);
-        let value = Zatoshis::const_from_u64(60000);
-        let (h, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
-        st.scan_cached_blocks(h, 1);
-
-        let account_id = st.test_account().unwrap().id();
-        let notes = st.wallet().get_notes(ShieldedPool::Sapling).unwrap();
-        assert_eq!(notes.len(), 1);
-        let note = &notes[0];
-        let txid = *note.txid();
-        let output_index = u32::from(note.output_index());
-        let output_ref = OutputRef::new(txid, PoolType::SAPLING, output_index);
-
-        let tip = st.wallet().chain_height().unwrap().unwrap();
-        let target_height = TargetHeight::from(tip + 1);
-
-        // Open a second, independent connection to the same wallet database file.
-        let network = *st.network();
-        let mut db2 = WalletDb::for_path(
-            st.wallet().data_file_path(),
-            network,
-            test_clock(),
-            test_rng(),
-        )
-        .unwrap();
-
-        // Both handles observe the note as spendable: this is the shared state from which two
-        // concurrent proposal flows would each select the same input.
-        assert!(
-            st.wallet()
-                .get_spendable_note(
-                    &txid,
-                    ShieldedPool::Sapling,
-                    output_index,
-                    target_height,
-                    LockFilter::Policy(&LockedInputPolicy::Exclude)
-                )
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            db2.get_spendable_note(
-                &txid,
-                ShieldedPool::Sapling,
-                output_index,
-                target_height,
-                LockFilter::Policy(&LockedInputPolicy::Exclude)
-            )
-            .unwrap()
-            .is_some()
-        );
-
-        // The second handle locks first, under its own owner...
-        let owner_a = LockOwner::new([0xA1; 32]);
-        let owner_b = LockOwner::new([0xB2; 32]);
-        assert_eq!(
-            db2.lock_outputs(&[output_ref], owner_b, BlockHeight::from(u32::MAX))
-                .unwrap(),
-            1
-        );
-
-        // ... so the first handle's lock (under a different owner) fails, naming the
-        // contested output: the race is resolved at the storage layer, across connections.
-        assert_matches!(
-            st.wallet_mut()
-                .lock_outputs(&[output_ref], owner_a, BlockHeight::from(u32::MAX)),
-            Err(LockError::LockFailure(r)) if r == output_ref
-        );
-
-        // The winner's lock is immediately visible to the losing handle.
-        assert!(
-            st.wallet()
-                .get_spendable_note(
-                    &txid,
-                    ShieldedPool::Sapling,
-                    output_index,
-                    target_height,
-                    LockFilter::Policy(&LockedInputPolicy::Exclude)
-                )
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            st.wallet().get_locked_outputs(account_id).unwrap(),
-            vec![output_ref]
-        );
-
-        // Locks are owner-scoped, so the losing handle CANNOT release the winner's lock:
-        // its unlock is a no-op and the note stays locked.
-        assert!(!st.wallet_mut().unlock_output(&output_ref, owner_a).unwrap());
-        assert!(
-            st.wallet()
-                .get_spendable_note(
-                    &txid,
-                    ShieldedPool::Sapling,
-                    output_index,
-                    target_height,
-                    LockFilter::Policy(&LockedInputPolicy::Exclude)
-                )
-                .unwrap()
-                .is_none()
-        );
-
-        // The winning handle releases its own lock; the release is visible to the losing
-        // handle, whose retry then succeeds.
-        assert!(db2.unlock_output(&output_ref, owner_b).unwrap());
-        assert!(
-            db2.get_spendable_note(
-                &txid,
-                ShieldedPool::Sapling,
-                output_index,
-                target_height,
-                LockFilter::Policy(&LockedInputPolicy::Exclude)
-            )
-            .unwrap()
-            .is_some()
-        );
-        assert_eq!(
-            st.wallet_mut()
-                .lock_outputs(&[output_ref], owner_a, BlockHeight::from(u32::MAX))
-                .unwrap(),
-            1
-        );
-    }
 }

@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashSet},
+    convert::Infallible,
+};
 
 use assert_matches::assert_matches;
 
@@ -6,7 +9,7 @@ use sapling::zip32::ExtendedSpendingKey;
 use transparent::{
     address::{Script, TransparentAddress},
     bundle::{Authorized, Bundle, OutPoint, TxIn, TxOut},
-    keys::TransparentKeyScope,
+    keys::{NonHardenedChildIndex, TransparentKeyScope},
 };
 use zcash_keys::{
     address::Address,
@@ -17,7 +20,6 @@ use zcash_primitives::{
     transaction::{Transaction, TransactionData, TxVersion, fees::zip317},
 };
 use zcash_protocol::{
-    PoolType, TxId,
     consensus::{BlockHeight, BranchId, COINBASE_MATURITY_BLOCKS},
     local_consensus::LocalNetwork,
     value::Zatoshis,
@@ -26,8 +28,19 @@ use zip321::{Payment, TransactionRequest};
 
 #[cfg(feature = "transparent-key-import")]
 use {
-    crate::wallet::TransparentAddressSource,
-    zcash_script::{descriptor::sh, script},
+    crate::{
+        data_api::{
+            AccountBirthday,
+            chain::ChainState,
+            wallet::{self, SpendingKeys},
+        },
+        wallet::TransparentAddressSource,
+    },
+    secp256k1::{Secp256k1, SecretKey},
+    secrecy::Secret,
+    std::collections::HashMap,
+    zcash_protocol::consensus::{NetworkUpgrade, Parameters},
+    zcash_script::{descriptor::sh, pattern::check_multisig, script},
 };
 
 use super::TestAccount;
@@ -35,8 +48,10 @@ use crate::{
     data_api::{
         Account as _, AccountBalance, Balance, CoinbaseFilter, InputSource as _, MaxSpendMode,
         TargetValue, WalletRead as _, WalletTest as _, WalletWrite,
-        error::LockError,
-        testing::{AddressType, DataStoreFactory, ShieldedPool, TestBuilder, TestCache, TestState},
+        testing::{
+            AddressType, DataStoreFactory, ShieldedPool, TestBuilder, TestCache, TestState,
+            single_output_change_strategy,
+        },
         wallet::{
             ConfirmationsPolicy, TargetHeight, decrypt_and_store_transaction,
             input_selection::{
@@ -45,9 +60,11 @@ use crate::{
             },
         },
     },
-    fees::{DustOutputPolicy, StandardFeeRule, standard},
-    wallet::{LockOwner, OutputRef, WalletTransparentOutput},
+    fees::{ChangeValue, StandardFeeRule, TransparentChangePolicy},
+    wallet::{Exposure, OvkPolicy, WalletTransparentOutput},
 };
+
+pub use super::pool::locking::transparent_note_locking;
 
 /// Checks whether the transparent balance of the given test `account` is as `expected`
 /// considering the `confirmations_policy`.
@@ -229,178 +246,6 @@ where
     );
 }
 
-/// Exercises note locking for transparent outputs.
-///
-/// A locked UTXO is still returned by a by-outpoint lookup (which is not a selection query and
-/// so does not filter by lock state), but is excluded from spendable-output listing unless the
-/// query passes `LockFilter::Unfiltered`, is reported as locked (not spendable) value in the
-/// per-address balances, conflicts with a second lock, and returns to spendability when the
-/// chain tip passes the lock expiry height, with no unlock call.
-pub fn transparent_note_locking<DSF>(dsf: DSF)
-where
-    DSF: DataStoreFactory,
-    <<DSF as DataStoreFactory>::DataStore as WalletWrite>::UtxoRef: std::fmt::Debug,
-{
-    let mut st = TestBuilder::new()
-        .with_data_store_factory(dsf)
-        .with_account_from_sapling_activation(BlockHash([0; 32]))
-        .build();
-
-    let birthday = st.test_account().unwrap().birthday().height();
-    let account_id = st.test_account().unwrap().id();
-    let uaddr = st
-        .wallet()
-        .get_last_generated_address_matching(account_id, UnifiedAddressRequest::AllAvailableKeys)
-        .unwrap()
-        .unwrap();
-    let taddr = uaddr.transparent().unwrap();
-
-    let height = birthday + 12345;
-    st.wallet_mut().update_chain_tip(height).unwrap();
-
-    // Create a fake transparent output mined at `height`.
-    let value = Zatoshis::const_from_u64(100000);
-    let outpoint = OutPoint::fake();
-    let txout = TxOut::new(value, taddr.script().into());
-    let utxo = WalletTransparentOutput::from_parts(
-        outpoint.clone(),
-        txout,
-        Some(height),
-        Some(account_id),
-        Some(TransparentKeyScope::EXTERNAL),
-        None,
-    )
-    .unwrap();
-    st.wallet_mut()
-        .put_received_transparent_utxo(&utxo)
-        .unwrap();
-
-    let target_height = TargetHeight::from(height + 1);
-    let output_ref = OutputRef::new(
-        TxId::from_bytes(*outpoint.hash()),
-        PoolType::TRANSPARENT,
-        outpoint.n(),
-    );
-
-    // The output is retrievable and spendable before locking.
-    assert_matches!(
-        st.wallet()
-            .get_unspent_transparent_output(&outpoint, target_height),
-        Ok(Some(_))
-    );
-
-    // Lock the UTXO until ten blocks past the tip.
-    let owner = LockOwner::new([1; 32]);
-    assert_eq!(
-        st.wallet_mut()
-            .lock_outputs(&[output_ref], owner, height + 10)
-            .unwrap(),
-        1
-    );
-
-    // A lock by a different owner conflicts while the first is active.
-    let other_owner = LockOwner::new([2; 32]);
-    assert_matches!(
-        st.wallet_mut().lock_outputs(&[output_ref], other_owner, height + 20),
-        Err(LockError::LockFailure(r)) if r == output_ref
-    );
-
-    // A by-outpoint lookup of a known output is not a selection query, so it does not filter by
-    // lock state: the output is still returned even though it is locked. Lock exclusion is
-    // verified via `get_spendable_transparent_outputs`, below.
-    assert_matches!(
-        st.wallet()
-            .get_unspent_transparent_output(&outpoint, target_height),
-        Ok(Some(_))
-    );
-
-    // ... and from the spendable-outputs listing unless the query is unfiltered.
-    assert_matches!(
-        st.wallet()
-            .get_spendable_transparent_outputs(
-                taddr,
-                target_height,
-                ConfirmationsPolicy::MIN,
-                CoinbaseFilter::AllTransparentOutputs,
-                LockFilter::Policy(&LockedInputPolicy::Exclude),
-            )
-            .as_deref(),
-        Ok(&[])
-    );
-    assert_matches!(
-        st.wallet()
-            .get_spendable_transparent_outputs(
-                taddr,
-                target_height,
-                ConfirmationsPolicy::MIN,
-                CoinbaseFilter::AllTransparentOutputs,
-                LockFilter::Unfiltered,
-            )
-            .as_deref(),
-        Ok([_])
-    );
-
-    // The per-address balances report the value as locked, not spendable; the total is
-    // unaffected by lock state.
-    let balances = st
-        .wallet()
-        .get_transparent_balances(account_id, target_height, ConfirmationsPolicy::MIN)
-        .unwrap();
-    let (_, bal) = balances
-        .get(taddr)
-        .expect("the address has a balance entry");
-    assert_eq!(bal.locked_value(), value);
-    assert_eq!(bal.spendable_value(), Zatoshis::ZERO);
-    assert_eq!(bal.total(), value);
-
-    // The locked-outputs listing includes the transparent lock.
-    assert_eq!(
-        st.wallet().get_locked_outputs(account_id).unwrap(),
-        vec![output_ref]
-    );
-
-    // Advancing the chain tip to the expiry height restores spendability with no unlock call.
-    st.wallet_mut().update_chain_tip(height + 10).unwrap();
-    let expired_target = TargetHeight::from(height + 11);
-    let balances = st
-        .wallet()
-        .get_transparent_balances(account_id, expired_target, ConfirmationsPolicy::MIN)
-        .unwrap();
-    let (_, bal) = balances
-        .get(taddr)
-        .expect("the address has a balance entry");
-    assert_eq!(bal.spendable_value(), value);
-    assert_eq!(bal.locked_value(), Zatoshis::ZERO);
-    assert!(
-        st.wallet()
-            .get_locked_outputs(account_id)
-            .unwrap()
-            .is_empty()
-    );
-
-    // The expired lock is replaceable without an explicit unlock, even by a different owner,
-    // and the new holder can then release it.
-    assert_eq!(
-        st.wallet_mut()
-            .lock_outputs(&[output_ref], other_owner, height + 30)
-            .unwrap(),
-        1
-    );
-    assert!(
-        st.wallet_mut()
-            .unlock_output(&output_ref, other_owner)
-            .unwrap()
-    );
-    let balances = st
-        .wallet()
-        .get_transparent_balances(account_id, expired_target, ConfirmationsPolicy::MIN)
-        .unwrap();
-    let (_, bal) = balances
-        .get(taddr)
-        .expect("the address has a balance entry");
-    assert_eq!(bal.spendable_value(), value);
-}
-
 pub fn transparent_balance_across_shielding<DSF>(dsf: DSF, cache: impl TestCache)
 where
     DSF: DataStoreFactory,
@@ -473,12 +318,8 @@ where
 
     // Shield the output.
     let input_selector = GreedyInputSelector::new();
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    );
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling);
     let txid = st
         .shield_transparent_funds(
             &input_selector,
@@ -616,12 +457,8 @@ where
 
     // Shield the transparent balance.
     let input_selector = GreedyInputSelector::new();
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    );
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling);
     let txids = st
         .shield_transparent_funds(
             &input_selector,
@@ -829,12 +666,8 @@ where
     // Propose shielding with a 1%-of-block-space input cap.
     let input_selector =
         GreedyInputSelector::new().with_shielding_block_space_percent(BLOCK_SPACE_PERCENT);
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    );
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling);
     let proposal = st
         .propose_shielding(
             &input_selector,
@@ -1364,9 +1197,6 @@ where
 /// Builds a test 1-of-1 multisig redeem script from a single keypair.
 #[cfg(feature = "transparent-key-import")]
 fn build_test_redeem_script() -> (script::Redeem, secp256k1::SecretKey) {
-    use secp256k1::{Secp256k1, SecretKey};
-    use zcash_script::pattern::check_multisig;
-
     let secp = Secp256k1::new();
     let secret_key = SecretKey::from_slice(&[1u8; 32]).expect("valid secret key");
     let pubkey = secret_key.public_key(&secp);
@@ -1379,14 +1209,288 @@ fn build_test_redeem_script() -> (script::Redeem, secp256k1::SecretKey) {
     (redeem_script, secret_key)
 }
 
+/// Tests that importing standalone transparent addresses without key material succeeds and
+/// the addresses appear in `get_transparent_receivers` with the
+/// [`TransparentAddressSource::StandaloneAddress`] source.
+#[cfg(feature = "transparent-key-import")]
+pub fn import_standalone_transparent_address<DSF>(dsf: DSF)
+where
+    DSF: DataStoreFactory,
+{
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(dsf)
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+
+    let account_id = st.test_account().unwrap().id();
+
+    // A P2PKH address, imported without its pubkey.
+    let secp = Secp256k1::new();
+    let secret_key = SecretKey::from_slice(&[1u8; 32]).expect("valid secret key");
+    let p2pkh_addr = TransparentAddress::from_pubkey(&secret_key.public_key(&secp));
+    assert_matches!(
+        st.wallet_mut()
+            .import_standalone_transparent_address(account_id, p2pkh_addr),
+        Ok(_)
+    );
+
+    // A P2SH address, imported without its redeem script.
+    let (redeem_script, _) = build_test_redeem_script();
+    let p2sh_addr =
+        TransparentAddress::from_script_pubkey(&sh(&redeem_script)).expect("valid P2SH address");
+    assert_matches!(
+        st.wallet_mut()
+            .import_standalone_transparent_address(account_id, p2sh_addr),
+        Ok(_)
+    );
+
+    let receivers = st
+        .wallet()
+        .get_transparent_receivers(account_id, false, true)
+        .unwrap();
+    for addr in [p2pkh_addr, p2sh_addr] {
+        let metadata = receivers.get(&addr).expect("address should be present");
+        assert!(matches!(
+            metadata.source(),
+            TransparentAddressSource::StandaloneAddress
+        ));
+    }
+}
+
+/// Tests that importing the same standalone address twice to the same account is idempotent.
+#[cfg(feature = "transparent-key-import")]
+pub fn import_standalone_transparent_address_idempotent<DSF>(dsf: DSF)
+where
+    DSF: DataStoreFactory,
+{
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(dsf)
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+
+    let account_id = st.test_account().unwrap().id();
+
+    let secp = Secp256k1::new();
+    let secret_key = SecretKey::from_slice(&[1u8; 32]).expect("valid secret key");
+    let taddr = TransparentAddress::from_pubkey(&secret_key.public_key(&secp));
+
+    assert_matches!(
+        st.wallet_mut()
+            .import_standalone_transparent_address(account_id, taddr),
+        Ok(_)
+    );
+
+    let receivers_before = st
+        .wallet()
+        .get_transparent_receivers(account_id, false, true)
+        .unwrap();
+
+    // Second import to the same account should also succeed (idempotent).
+    assert_matches!(
+        st.wallet_mut()
+            .import_standalone_transparent_address(account_id, taddr),
+        Ok(_)
+    );
+
+    let receivers_after = st
+        .wallet()
+        .get_transparent_receivers(account_id, false, true)
+        .unwrap();
+    assert_eq!(receivers_before.len(), receivers_after.len());
+}
+
+/// Tests that importing the same standalone address to a different account fails.
+#[cfg(feature = "transparent-key-import")]
+pub fn import_standalone_transparent_address_conflict<DSF>(dsf: DSF)
+where
+    DSF: DataStoreFactory,
+{
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(dsf)
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+
+    let account1_id = st.test_account().unwrap().id();
+
+    let secp = Secp256k1::new();
+    let secret_key = SecretKey::from_slice(&[1u8; 32]).expect("valid secret key");
+    let taddr = TransparentAddress::from_pubkey(&secret_key.public_key(&secp));
+
+    assert_matches!(
+        st.wallet_mut()
+            .import_standalone_transparent_address(account1_id, taddr),
+        Ok(_)
+    );
+
+    // Create a second account
+    let birthday = AccountBirthday::from_parts(
+        ChainState::empty(
+            st.network()
+                .activation_height(NetworkUpgrade::Sapling)
+                .unwrap()
+                - 1,
+            BlockHash([0; 32]),
+        ),
+        None,
+    );
+    let seed2 = Secret::new(vec![42u8; 32]);
+    let (account2_id, _) = st
+        .wallet_mut()
+        .create_account("account2", &seed2, &birthday, None)
+        .unwrap();
+
+    // Import of the same address to the second account should fail
+    assert_matches!(
+        st.wallet_mut()
+            .import_standalone_transparent_address(account2_id, taddr),
+        Err(_)
+    );
+}
+
+/// Tests that a UTXO received at an address imported without key material is reflected in the
+/// wallet balance, but is not offered as a spendable output.
+#[cfg(feature = "transparent-key-import")]
+pub fn import_standalone_transparent_address_balance<DSF>(dsf: DSF)
+where
+    DSF: DataStoreFactory,
+    <<DSF as DataStoreFactory>::DataStore as WalletWrite>::UtxoRef: std::fmt::Debug,
+{
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(dsf)
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+
+    let account_id = st.test_account().unwrap().id();
+    let birthday = st.test_account().unwrap().birthday().height();
+
+    let secp = Secp256k1::new();
+    let secret_key = SecretKey::from_slice(&[1u8; 32]).expect("valid secret key");
+    let taddr = TransparentAddress::from_pubkey(&secret_key.public_key(&secp));
+
+    // Import the address without its pubkey.
+    st.wallet_mut()
+        .import_standalone_transparent_address(account_id, taddr)
+        .unwrap();
+
+    let height = birthday + 1000;
+    st.wallet_mut().update_chain_tip(height).unwrap();
+
+    // Create a fake UTXO at the address.
+    let value = Zatoshis::const_from_u64(50_000);
+    let outpoint = OutPoint::fake();
+    let txout = TxOut::new(value, taddr.script().into());
+    let utxo = WalletTransparentOutput::from_parts(
+        outpoint,
+        txout,
+        Some(height),
+        Some(account_id),
+        None,
+        None,
+    )
+    .unwrap();
+    st.wallet_mut()
+        .put_received_transparent_utxo(&utxo)
+        .unwrap();
+
+    // Verify the balance is reflected via get_transparent_balances.
+    let target_height = TargetHeight::from(height + 1);
+    let balances = st
+        .wallet()
+        .get_transparent_balances(account_id, target_height, ConfirmationsPolicy::MIN)
+        .unwrap();
+    assert_eq!(balances.get(&taddr).map(|(_, b)| b.total()), Some(value),);
+
+    // The output must not be offered for spending: the wallet holds no key material with
+    // which a spend could be constructed.
+    let utxos = st
+        .wallet()
+        .get_spendable_transparent_outputs(
+            &taddr,
+            target_height,
+            ConfirmationsPolicy::MIN,
+            CoinbaseFilter::AllTransparentOutputs,
+            LockFilter::Policy(&LockedInputPolicy::Exclude),
+        )
+        .unwrap();
+    assert_eq!(utxos, vec![]);
+}
+
+/// Tests that importing key material for a previously address-only import upgrades the
+/// address in place: the pubkey (P2PKH) or redeem script (P2SH) becomes the address's
+/// source, without a duplicate receiver appearing.
+#[cfg(feature = "transparent-key-import")]
+pub fn import_standalone_transparent_address_upgrade<DSF>(dsf: DSF)
+where
+    DSF: DataStoreFactory,
+{
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(dsf)
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+
+    let account_id = st.test_account().unwrap().id();
+
+    let secp = Secp256k1::new();
+    let secret_key = SecretKey::from_slice(&[1u8; 32]).expect("valid secret key");
+    let pubkey = secret_key.public_key(&secp);
+    let p2pkh_addr = TransparentAddress::from_pubkey(&pubkey);
+
+    let (redeem_script, _) = build_test_redeem_script();
+    let p2sh_addr =
+        TransparentAddress::from_script_pubkey(&sh(&redeem_script)).expect("valid P2SH address");
+
+    // Import both addresses without key material.
+    st.wallet_mut()
+        .import_standalone_transparent_address(account_id, p2pkh_addr)
+        .unwrap();
+    st.wallet_mut()
+        .import_standalone_transparent_address(account_id, p2sh_addr)
+        .unwrap();
+
+    let receivers_before = st
+        .wallet()
+        .get_transparent_receivers(account_id, false, true)
+        .unwrap();
+
+    // Import the key material for each address.
+    st.wallet_mut()
+        .import_standalone_transparent_pubkey(account_id, pubkey)
+        .unwrap();
+    st.wallet_mut()
+        .import_standalone_transparent_script(account_id, redeem_script)
+        .unwrap();
+
+    // The addresses were upgraded in place: no new receivers, and each address's source
+    // now reflects the imported key material.
+    let receivers_after = st
+        .wallet()
+        .get_transparent_receivers(account_id, false, true)
+        .unwrap();
+    assert_eq!(receivers_before.len(), receivers_after.len());
+
+    let p2pkh_metadata = receivers_after
+        .get(&p2pkh_addr)
+        .expect("address should be present");
+    assert!(matches!(
+        p2pkh_metadata.source(),
+        TransparentAddressSource::StandalonePubkey(_)
+    ));
+
+    let p2sh_metadata = receivers_after
+        .get(&p2sh_addr)
+        .expect("address should be present");
+    assert!(matches!(
+        p2sh_metadata.source(),
+        TransparentAddressSource::StandaloneScript(_)
+    ));
+}
+
 /// Tests that importing a standalone transparent public key succeeds.
 #[cfg(feature = "transparent-key-import")]
 pub fn import_standalone_transparent_pubkey<DSF>(dsf: DSF)
 where
     DSF: DataStoreFactory,
 {
-    use secp256k1::{Secp256k1, SecretKey};
-
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
         .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -1410,8 +1514,6 @@ pub fn import_standalone_transparent_pubkey_idempotent<DSF>(dsf: DSF)
 where
     DSF: DataStoreFactory,
 {
-    use secp256k1::{Secp256k1, SecretKey};
-
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
         .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -1467,12 +1569,6 @@ pub fn import_standalone_transparent_pubkey_conflict<DSF>(dsf: DSF)
 where
     DSF: DataStoreFactory,
 {
-    use secp256k1::{Secp256k1, SecretKey};
-    use secrecy::Secret;
-
-    use crate::data_api::{AccountBirthday, chain::ChainState};
-    use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
-
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
         .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -1523,9 +1619,6 @@ where
     DSF: DataStoreFactory,
     <<DSF as DataStoreFactory>::DataStore as WalletWrite>::UtxoRef: std::fmt::Debug,
 {
-    use crate::data_api::wallet::ConfirmationsPolicy;
-    use secp256k1::{Secp256k1, SecretKey};
-
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
         .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -1598,10 +1691,6 @@ pub fn spend_from_standalone_pubkey<DSF>(dsf: DSF, cache: impl TestCache)
 where
     DSF: DataStoreFactory,
 {
-    use crate::data_api::wallet::{self, SpendingKeys};
-    use secp256k1::{Secp256k1, SecretKey};
-    use std::collections::HashMap;
-
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
         .with_block_cache(cache)
@@ -1662,12 +1751,8 @@ where
 
     // Shield the P2PKH UTXO.
     let input_selector = GreedyInputSelector::new();
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    );
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling);
 
     let prover = ::zcash_proofs::prover::LocalTxProver::bundled();
     let network = *st.network();
@@ -1820,11 +1905,6 @@ pub fn import_standalone_transparent_p2sh_conflict<DSF>(dsf: DSF)
 where
     DSF: DataStoreFactory,
 {
-    use secrecy::Secret;
-
-    use crate::data_api::{AccountBirthday, chain::ChainState};
-    use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
-
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
         .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -1872,8 +1952,6 @@ where
     DSF: DataStoreFactory,
     <<DSF as DataStoreFactory>::DataStore as WalletWrite>::UtxoRef: std::fmt::Debug,
 {
-    use crate::data_api::wallet::ConfirmationsPolicy;
-
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
         .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -1945,9 +2023,6 @@ pub fn spend_from_standalone_p2sh<DSF>(dsf: DSF, cache: impl TestCache)
 where
     DSF: DataStoreFactory,
 {
-    use crate::data_api::wallet::{self, SpendingKeys};
-    use std::collections::HashMap;
-
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
         .with_block_cache(cache)
@@ -2006,12 +2081,8 @@ where
 
     // Shield the P2SH UTXO.
     let input_selector = GreedyInputSelector::new();
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    );
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling);
 
     let prover = ::zcash_proofs::prover::LocalTxProver::bundled();
     let network = *st.network();
@@ -2069,9 +2140,6 @@ pub fn mark_transparent_addresses_exposed<DSF>(dsf: DSF)
 where
     DSF: DataStoreFactory,
 {
-    use crate::{data_api::WalletRead, wallet::Exposure};
-    use zcash_protocol::consensus::BlockHeight;
-
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
         .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -2153,9 +2221,6 @@ pub fn mark_transparent_addresses_exposed_bulk<DSF>(dsf: DSF)
 where
     DSF: DataStoreFactory,
 {
-    use crate::{data_api::WalletRead, wallet::Exposure};
-    use zcash_protocol::consensus::BlockHeight;
-
     let gap_limits = GapLimits::new(5, 2, 2);
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
@@ -2248,8 +2313,6 @@ pub fn mark_transparent_addresses_exposed_unknown_address<DSF>(dsf: DSF)
 where
     DSF: DataStoreFactory,
 {
-    use zcash_protocol::consensus::BlockHeight;
-
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
         .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -2356,12 +2419,8 @@ where
     let request = t2t_request(&network, Zatoshis::const_from_u64(40_000));
 
     let input_selector = GreedyInputSelector::new();
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    );
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling);
 
     let result = st.propose_transfer_with_policy(
         account.id(),
@@ -2394,12 +2453,8 @@ where
     let request = t2t_request(&network, transfer_amount);
 
     let input_selector = GreedyInputSelector::new();
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    );
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling);
 
     let proposal = st
         .propose_transfer_with_policy(
@@ -2517,12 +2572,8 @@ where
     .unwrap();
 
     let input_selector = GreedyInputSelector::new();
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    );
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling);
 
     // Independently reproduce the initial gather that `GreedyInputSelector` will perform
     // (bounded only by the payment amount, since that's the only information available
@@ -2652,12 +2703,8 @@ where
 
     let input_selector =
         GreedyInputSelector::new().with_shielding_block_space_percent(BLOCK_SPACE_PERCENT);
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    );
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling);
 
     let result = st.propose_transfer_with_policy(
         account.id(),
@@ -2749,12 +2796,8 @@ where
     let request = t2t_request(&network, Zatoshis::const_from_u64(40_000));
 
     let input_selector = GreedyInputSelector::new();
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    );
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling);
 
     let proposal = st
         .propose_transfer_with_policy(
@@ -2936,9 +2979,6 @@ pub fn reserve_next_n_internal_addresses_gap_limit<DSF>(
 ) where
     DSF: DataStoreFactory,
 {
-    use std::collections::HashSet;
-    use transparent::keys::NonHardenedChildIndex;
-
     let mut st = TestBuilder::new()
         .with_data_store_factory(dsf)
         .with_block_cache(cache)
@@ -3023,13 +3063,6 @@ pub fn propose_t2t_with_transparent_change<DSF>(dsf: DSF, cache: impl TestCache)
 where
     DSF: DataStoreFactory,
 {
-    use std::convert::Infallible;
-
-    use crate::{
-        fees::{ChangeValue, TransparentChangePolicy},
-        wallet::{Exposure, OvkPolicy},
-    };
-
     let utxo_value = Zatoshis::const_from_u64(100_000);
     let transfer_amount = Zatoshis::const_from_u64(40_000);
     let (mut st, account, outpoint) = setup_transparent_only_account(dsf, cache, utxo_value);
@@ -3038,13 +3071,9 @@ where
     let request = t2t_request(&network, transfer_amount);
 
     let input_selector = GreedyInputSelector::new();
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    )
-    .with_transparent_change_policy(TransparentChangePolicy::TransparentChangeAllowed);
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling)
+            .with_transparent_change_policy(TransparentChangePolicy::TransparentChangeAllowed);
 
     let proposal = st
         .propose_transfer_with_policy(
@@ -3161,8 +3190,6 @@ pub fn propose_t2t_transparent_change_exact_match<DSF>(dsf: DSF, cache: impl Tes
 where
     DSF: DataStoreFactory,
 {
-    use crate::fees::TransparentChangePolicy;
-
     // Under ZIP 317, one P2PKH input and one P2PKH output require the minimum fee of
     // 10_000 zats, so a 50_000-zat UTXO exactly covers a 40_000-zat payment.
     let utxo_value = Zatoshis::const_from_u64(50_000);
@@ -3173,13 +3200,9 @@ where
     let request = t2t_request(&network, transfer_amount);
 
     let input_selector = GreedyInputSelector::new();
-    let change_strategy = standard::SingleOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        ShieldedPool::Sapling,
-        DustOutputPolicy::default(),
-    )
-    .with_transparent_change_policy(TransparentChangePolicy::TransparentChangeAllowed);
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Sapling)
+            .with_transparent_change_policy(TransparentChangePolicy::TransparentChangeAllowed);
 
     let proposal = st
         .propose_transfer_with_policy(

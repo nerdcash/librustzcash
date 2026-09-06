@@ -8,18 +8,18 @@
 //! [ZIP 318]: https://zips.z.cash/zip-0318
 
 use alloc::vec::Vec;
+use core::num::NonZeroUsize;
 
 use rand_core::{CryptoRng, RngCore};
 
-use zcash_protocol::value::COIN;
-
-use super::utils::largest_one_two_five;
 use zcash_protocol::value::Zatoshis;
+use zcash_protocol::zip318::largest_one_two_five;
 
 use super::{
-    DenominationPlan, DenominationStrategy, MIGRATION_MAX_DENOMINATION_ZEC,
-    MIGRATION_MAX_PREPARED_NOTES_PER_RUN, RESIDUAL_MIGRATION_MIN, zat,
+    DENOM_CAP, DenominationPlan, DenominationStrategy, MAX_RESIDUAL_VALUE,
+    MIGRATION_MAX_PREPARED_NOTES_PER_RUN, zat,
 };
+use crate::preparation::FUNDING_OUTPUTS_PER_TX;
 
 /// The canonical `{1, 2, 5} * 10^k` quantization of [ZIP 318]: at each step it takes the largest such
 /// denomination the remaining budget can fund (bounded by the maximum denomination), so the parts are
@@ -42,70 +42,95 @@ pub struct CanonicalOneTwoFive {
 }
 
 impl CanonicalOneTwoFive {
-    /// A strategy with an explicit note cap, maximum denomination (in whole ZEC), minimum denomination (in
-    /// zatoshi, which MUST be a power of ten), and per-note transfer-fee buffer (the ZIP-317 fee of
-    /// the canonical transfer shape, computed by the caller).
+    /// A strategy with an explicit note cap, maximum denomination, minimum denomination (which MUST
+    /// be a power of ten), and per-note transfer-fee buffer (the ZIP-317 fee of the canonical
+    /// transfer shape, computed by the caller).
     pub fn new(
         max_notes: usize,
-        max_denomination_zec: u64,
+        max_denomination: Zatoshis,
         min_denomination: Zatoshis,
         transfer_fee_buffer: Zatoshis,
     ) -> Self {
         Self {
             max_notes,
-            max_denomination_zatoshi: max_denomination_zec.saturating_mul(COIN),
+            max_denomination_zatoshi: u64::from(max_denomination),
             min_denomination_zatoshi: u64::from(min_denomination),
             buffer_zatoshi: u64::from(transfer_fee_buffer),
         }
     }
 
-    /// The recommended configuration: [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`] notes,
-    /// [`MIGRATION_MAX_DENOMINATION_ZEC`] cap, [`RESIDUAL_MIGRATION_MIN`] minimum
-    /// denomination, and the caller-computed transfer-fee buffer.
-    pub fn recommended(transfer_fee_buffer: Zatoshis) -> Self {
+    /// The ZIP 318 configuration with a caller-chosen per-run note count: `max_notes` notes, the
+    /// [`DENOM_CAP`] maximum denomination, the [`MAX_RESIDUAL_VALUE`] minimum denomination, and the
+    /// caller-computed transfer-fee buffer.
+    ///
+    /// The two bounds are NOT parameters here: they are the normative ZIP 318 values that fix which
+    /// denominations may cross the turnstile, and moving them would move this wallet's crossings out
+    /// of the anonymity set every other wallet shares. Only the per-run note count is the caller's
+    /// to choose; it bounds one run's transaction and proving cost and says nothing about which
+    /// values are published.
+    pub fn with_max_notes(max_notes: NonZeroUsize, transfer_fee_buffer: Zatoshis) -> Self {
         Self::new(
-            MIGRATION_MAX_PREPARED_NOTES_PER_RUN,
-            MIGRATION_MAX_DENOMINATION_ZEC,
-            RESIDUAL_MIGRATION_MIN,
+            max_notes.get(),
+            DENOM_CAP,
+            MAX_RESIDUAL_VALUE,
             transfer_fee_buffer,
         )
     }
+
+    /// The recommended configuration: [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`] notes, the
+    /// [`DENOM_CAP`] maximum denomination, the [`MAX_RESIDUAL_VALUE`] minimum denomination, and the
+    /// caller-computed transfer-fee buffer.
+    pub fn recommended(transfer_fee_buffer: Zatoshis) -> Self {
+        Self::with_max_notes(MIGRATION_MAX_PREPARED_NOTES_PER_RUN, transfer_fee_buffer)
+    }
 }
 
-impl DenominationStrategy for CanonicalOneTwoFive {
-    fn plan<R: RngCore + CryptoRng>(
+impl CanonicalOneTwoFive {
+    /// The UNCONSTRAINED canonical split of `total_input_zatoshi`: the non-increasing sequence of
+    /// crossing values the balance quantizes into, a function of the balance (and this strategy's
+    /// bounds) plus exactly one bit of the wallet's note structure — whether a single note holds
+    /// the whole balance — and nothing else about how the notes hold it.
+    ///
+    /// Fees are reserved as the split grows, under the optimistic one-transaction-per-
+    /// [`FUNDING_OUTPUTS_PER_TX`]-notes preparation model. The exception is a balance of exactly
+    /// one self-funding canonical denomination held as a SINGLE note: the note necessarily equals
+    /// the balance, so it is certain to fund the crossing directly with no preparation transaction,
+    /// and the fee reserve is safely omitted. The count gates that exception rather than merely
+    /// informing it: with two or more notes none can equal that funding value, preparation — and
+    /// its fee — is inevitable, and omitting the reserve would leave the split unfundable by every
+    /// wallet holding the balance. The count participates ONLY through this
+    /// `spendable_note_count == 1` predicate; the published values otherwise remain a function of
+    /// the balance alone.
+    pub(crate) fn unconstrained_split(
         &self,
-        total_input: Zatoshis,
-        prep_tx_fee: Zatoshis,
-        prep_tx_count: &dyn Fn(&[Zatoshis]) -> Option<usize>,
-        _rng: &mut R,
-    ) -> DenominationPlan {
-        // The greedy partition arithmetic below runs in the u64 domain; every value it derives is
-        // bounded by the validated total input, so `zat` conversions at the capability boundary and
-        // in `from_notes` are infallible.
-        let total_input_zatoshi = u64::from(total_input);
-        let prep_tx_fee_zatoshi = u64::from(prep_tx_fee);
+        total_input_zatoshi: u64,
+        spendable_note_count: usize,
+        prep_tx_fee_zatoshi: u64,
+    ) -> Vec<u64> {
         let buffer = self.buffer_zatoshi;
         // Smallest self-funding note: the minimum denomination plus its transfer buffer.
         let min_note = self.min_denomination_zatoshi + buffer;
+        let exact_crossing = total_input_zatoshi.saturating_sub(buffer);
+        if spendable_note_count == 1
+            && self.max_notes > 0
+            && total_input_zatoshi >= buffer
+            && (self.min_denomination_zatoshi..=self.max_denomination_zatoshi)
+                .contains(&exact_crossing)
+            && largest_one_two_five(exact_crossing, self.min_denomination_zatoshi) == exact_crossing
+        {
+            return alloc::vec![exact_crossing];
+        }
+        let optimistic_txs = |minted: usize| minted.div_ceil(FUNDING_OUTPUTS_PER_TX) as u64;
 
-        // The chosen crossings, their prepared-note values (`crossing + buffer`), and the
-        // preparation transaction count for the CURRENT multiset. The capability is consulted at
-        // every step, so consolidation and fan-out costs are reserved exactly as they arise.
-        let mut crossing_values: Vec<u64> = Vec::new();
-        let mut notes: Vec<u64> = Vec::new();
-        let typed = |notes: &[u64]| notes.iter().map(|&v| zat(v)).collect::<Vec<Zatoshis>>();
-        let mut n_txs = prep_tx_count(&typed(&notes)).unwrap_or(0);
-
-        while crossing_values.len() < self.max_notes {
-            let committed = notes.iter().sum::<u64>() + n_txs as u64 * prep_tx_fee_zatoshi;
+        let mut crossings: Vec<u64> = Vec::new();
+        // Running sum of the prepared-note values (`crossing + buffer`) chosen so far.
+        let mut committed_notes = 0u64;
+        while crossings.len() < self.max_notes {
+            let committed = committed_notes + optimistic_txs(crossings.len()) * prep_tx_fee_zatoshi;
             let budget = total_input_zatoshi.saturating_sub(committed);
             if budget < min_note {
                 break;
             }
-            // Try the largest `{1, 2, 5} * 10^k` denomination that fits the budget under the
-            // CURRENT preparation cost; a candidate whose minting raises that cost past the budget
-            // steps down the series.
             let mut affordable = (budget - buffer).min(self.max_denomination_zatoshi);
             let mut accepted = false;
             while affordable >= self.min_denomination_zatoshi {
@@ -113,39 +138,78 @@ impl DenominationStrategy for CanonicalOneTwoFive {
                 if crossing < self.min_denomination_zatoshi {
                     break;
                 }
-                notes.push(crossing + buffer);
-                let fits = prep_tx_count(&typed(&notes)).filter(|&n| {
-                    notes
-                        .iter()
-                        .sum::<u64>()
-                        .checked_add(n as u64 * prep_tx_fee_zatoshi)
-                        .is_some_and(|c| c <= total_input_zatoshi)
-                });
-                match fits {
-                    Some(n) => {
-                        n_txs = n;
-                        crossing_values.push(crossing);
-                        accepted = true;
-                        break;
-                    }
-                    None => {
-                        notes.pop();
-                        if crossing == self.min_denomination_zatoshi {
-                            break;
-                        }
-                        affordable = crossing - 1;
-                    }
+                let cost = committed_notes
+                    + crossing
+                    + buffer
+                    + optimistic_txs(crossings.len() + 1) * prep_tx_fee_zatoshi;
+                if cost <= total_input_zatoshi {
+                    committed_notes += crossing + buffer;
+                    crossings.push(crossing);
+                    accepted = true;
+                    break;
                 }
+                affordable = crossing - 1;
             }
             if !accepted {
                 break;
             }
         }
+        crossings
+    }
+}
 
-        // Nothing migrated means no preparation happens, so nothing is reserved for its fees.
-        if crossing_values.is_empty() {
-            n_txs = 0;
-        }
+impl DenominationStrategy for CanonicalOneTwoFive {
+    fn plan<R: RngCore + CryptoRng>(
+        &self,
+        total_input: Zatoshis,
+        spendable_note_count: usize,
+        prep_tx_fee: Zatoshis,
+        prep_tx_count: &dyn Fn(&[Zatoshis]) -> Option<usize>,
+        _rng: &mut R,
+    ) -> DenominationPlan {
+        // The partition arithmetic below runs in the u64 domain; every value it derives is bounded
+        // by the validated total input, so `zat` conversions at the capability boundary and in
+        // `from_notes` are infallible.
+        let total_input_zatoshi = u64::from(total_input);
+        let prep_tx_fee_zatoshi = u64::from(prep_tx_fee);
+        let buffer = self.buffer_zatoshi;
+
+        // QUANTIZE once: the canonical split is a function of the BALANCE alone (plus the one
+        // exact-funding bit of the note count — see `unconstrained_split`), so the published
+        // values can collide across wallets holding the same balance differently.
+        let mut crossing_values = self.unconstrained_split(
+            total_input_zatoshi,
+            spendable_note_count,
+            prep_tx_fee_zatoshi,
+        );
+        let mut notes: Vec<u64> = crossing_values.iter().map(|&c| c + buffer).collect();
+        let typed = |notes: &[u64]| notes.iter().map(|&v| zat(v)).collect::<Vec<Zatoshis>>();
+
+        // RECONCILE against the wallet: drop parts smallest-first (the split is non-increasing, so
+        // from the back) until the preparation planner can mint the remainder and its true fees fit
+        // the balance. Dropping is the ONLY repair — no part is ever replaced by smaller
+        // denominations, so the crossing multiset stays a sub-multiset of the canonical split and
+        // the note shape can only truncate what is published, never reshape it.
+        let n_txs = loop {
+            if crossing_values.is_empty() {
+                break 0;
+            }
+            let fits = prep_tx_count(&typed(&notes)).filter(|&n| {
+                notes
+                    .iter()
+                    .sum::<u64>()
+                    .checked_add(n as u64 * prep_tx_fee_zatoshi)
+                    .is_some_and(|c| c <= total_input_zatoshi)
+            });
+            match fits {
+                Some(n) => break n,
+                None => {
+                    crossing_values.pop();
+                    notes.pop();
+                }
+            }
+        };
+
         let prep_fees_zatoshi = n_txs as u64 * prep_tx_fee_zatoshi;
         let remaining = total_input_zatoshi
             .saturating_sub(notes.iter().sum::<u64>())
@@ -167,16 +231,15 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
     use rand_core::SeedableRng;
     use zcash_primitives::transaction::fees::zip317::MARGINAL_FEE;
-    use zcash_protocol::value::MAX_MONEY;
+    use zcash_protocol::value::{COIN, MAX_MONEY};
 
-    use crate::denomination::{DESTINATION_ACTIONS_PER_TRANSFER, SOURCE_ACTIONS_PER_TRANSFER};
     use crate::preparation::FUNDING_OUTPUTS_PER_TX;
+    use zcash_protocol::zip318::{CROSSING_DESTINATION_ACTIONS, CROSSING_SOURCE_ACTIONS};
 
     /// The ZIP-317 transfer-fee buffer of the canonical transfer shape (all four actions exceed the
     /// grace allowance, so each pays the marginal fee).
     fn zip317_buffer() -> u64 {
-        (SOURCE_ACTIONS_PER_TRANSFER + DESTINATION_ACTIONS_PER_TRANSFER) as u64
-            * MARGINAL_FEE.into_u64()
+        (CROSSING_SOURCE_ACTIONS + CROSSING_DESTINATION_ACTIONS) as u64 * MARGINAL_FEE.into_u64()
     }
 
     /// A count-only preparation-layout stub: one padded transaction per [`FUNDING_OUTPUTS_PER_TX`]
@@ -185,6 +248,11 @@ mod tests {
     fn prep_tx_count_stub(notes: &[Zatoshis]) -> Option<usize> {
         Some(notes.len().div_ceil(FUNDING_OUTPUTS_PER_TX))
     }
+
+    /// A generic multi-note wallet count for tests that model no concrete wallet: any count
+    /// above one keeps the optimistic fee reserve in place (the exact-funding special case
+    /// requires a lone note).
+    const MULTI_NOTE: usize = 2;
 
     /// Read a plan's crossing values back into the tests' u64 domain.
     fn crossings_u64(p: &DenominationPlan) -> Vec<u64> {
@@ -207,24 +275,31 @@ mod tests {
         )
     }
 
-    /// Whether `zat` is a `{1, 2, 5} * 10^k` amount (in zatoshi), including sub-1-ZEC denominations.
-    fn is_one_two_five_zat(zat: u64) -> bool {
-        if zat == 0 {
-            return false;
-        }
-        let mut n = zat;
-        while n.is_multiple_of(10) {
-            n /= 10;
-        }
-        matches!(n, 1 | 2 | 5)
+    /// A spendable-note count: one (the exact-funding special case `unconstrained_split` gates on)
+    /// or more (the general fee-reserving path).
+    fn arb_note_count() -> impl Strategy<Value = usize> {
+        1usize..=4
+    }
+
+    /// One balance and preparation fee, held as some note count, asked of TWO independently drawn
+    /// note caps: the input shape of the cap-invariance law.
+    fn arb_two_caps_over_one_balance() -> impl Strategy<Value = (u64, u64, usize, usize, usize)> {
+        (
+            arb_plan_input(),
+            1usize..=MAX_SAMPLED_NOTE_CAP,
+            arb_note_count(),
+        )
+            .prop_map(|((total, fee, cap_a), cap_b, note_count)| {
+                (total, fee, cap_a, cap_b, note_count)
+            })
     }
 
     /// The canonical strategy with the given note cap and the ZIP-317 transfer buffer.
     fn canonical(max_notes: usize) -> CanonicalOneTwoFive {
         CanonicalOneTwoFive::new(
             max_notes,
-            MIGRATION_MAX_DENOMINATION_ZEC,
-            RESIDUAL_MIGRATION_MIN,
+            DENOM_CAP,
+            MAX_RESIDUAL_VALUE,
             zat(zip317_buffer()),
         )
     }
@@ -232,14 +307,15 @@ mod tests {
     /// The exact fee-free crossing decomposition of `total` (no buffer, no preparation fee), for
     /// the golden vectors.
     fn crossings(total: u64) -> Vec<u64> {
-        let s = CanonicalOneTwoFive::new(
-            64,
-            MIGRATION_MAX_DENOMINATION_ZEC,
-            RESIDUAL_MIGRATION_MIN,
-            Zatoshis::ZERO,
-        );
+        let s = CanonicalOneTwoFive::new(64, DENOM_CAP, MAX_RESIDUAL_VALUE, Zatoshis::ZERO);
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        crossings_u64(&s.plan(zat(total), Zatoshis::ZERO, &prep_tx_count_stub, &mut rng))
+        crossings_u64(&s.plan(
+            zat(total),
+            MULTI_NOTE,
+            Zatoshis::ZERO,
+            &prep_tx_count_stub,
+            &mut rng,
+        ))
     }
 
     proptest! {
@@ -251,10 +327,9 @@ mod tests {
         fn honours_the_contract((total, fee, max_notes) in arb_plan_input()) {
             let s = canonical(max_notes);
             let buffer = zip317_buffer();
-            let cap = MIGRATION_MAX_DENOMINATION_ZEC * COIN;
-            let floor = u64::from(RESIDUAL_MIGRATION_MIN);
+            let floor = u64::from(MAX_RESIDUAL_VALUE);
             let mut rng = ChaCha8Rng::seed_from_u64(0);
-            let p = s.plan(zat(total), zat(fee), &prep_tx_count_stub, &mut rng);
+            let p = s.plan(zat(total), MULTI_NOTE, zat(fee), &prep_tx_count_stub, &mut rng);
 
             // Value is conserved exactly: the prepared notes, the stepwise-reserved preparation
             // fees, and the change partition the balance; and the reserved fees are the per-tx fee
@@ -281,8 +356,13 @@ mod tests {
             prop_assert_eq!(u64::from(p.total_migratable()), sum);
 
             for &cv in &cvs {
-                prop_assert!(is_one_two_five_zat(cv), "invalid denom {}", cv);
-                prop_assert!(cv >= floor && cv <= cap, "out of bounds {}", cv);
+                // One assertion, not two: being a canonical ZIP 318 denomination is exactly being
+                // on the `{1, 2, 5} * 10^k` series AND within the specified bounds.
+                prop_assert!(
+                    zcash_protocol::zip318::is_canonical_denomination(zat(cv)),
+                    "not a canonical denomination: {}",
+                    cv
+                );
             }
             for w in cvs.windows(2) {
                 prop_assert!(w[0] >= w[1], "crossings must be non-increasing");
@@ -295,7 +375,34 @@ mod tests {
 
             // The RNG is ignored: a different seed yields the same plan.
             let mut other = ChaCha8Rng::seed_from_u64(1);
-            prop_assert_eq!(&p, &s.plan(zat(total), zat(fee), &prep_tx_count_stub, &mut other));
+            prop_assert_eq!(&p, &s.plan(zat(total), MULTI_NOTE, zat(fee), &prep_tx_count_stub, &mut other));
+        }
+
+        /// WHETHER a balance quantizes to anything at all is invariant across note caps: the split
+        /// is empty under one positive cap exactly when it is empty under every other. The first
+        /// part forms (or does not) from the balance, the transfer buffer and the preparation fee
+        /// alone, and every positive cap admits that first part, so only the LENGTH of the split
+        /// depends on the cap, never its emptiness.
+        ///
+        /// This is the lemma
+        /// [`balance_has_canonical_split`](super::super::balance_has_canonical_split) rests on when
+        /// it distinguishes "this balance has nothing to migrate" from "this wallet's note values
+        /// cannot fund what the balance quantizes to": that verdict must not turn on the caller's
+        /// per-run note count.
+        #[test]
+        fn split_emptiness_is_cap_invariant(
+            (total, fee, cap_a, cap_b, note_count) in arb_two_caps_over_one_balance(),
+        ) {
+            let a = canonical(cap_a).unconstrained_split(total, note_count, fee);
+            let b = canonical(cap_b).unconstrained_split(total, note_count, fee);
+            prop_assert_eq!(
+                a.is_empty(),
+                b.is_empty(),
+                "caps {} and {} disagree on emptiness for balance {}",
+                cap_a,
+                cap_b,
+                total
+            );
         }
     }
 
@@ -303,16 +410,16 @@ mod tests {
     /// and the rest rolls over as change.
     #[test]
     fn whale_is_capped_and_rolls_over() {
-        let s = canonical(MIGRATION_MAX_PREPARED_NOTES_PER_RUN);
+        let s = canonical(MIGRATION_MAX_PREPARED_NOTES_PER_RUN.get());
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let p = s.plan(
             zat(MAX_MONEY),
+            MULTI_NOTE,
             Zatoshis::ZERO,
             &prep_tx_count_stub,
             &mut rng,
         );
-        let per_run_cap =
-            MIGRATION_MAX_PREPARED_NOTES_PER_RUN as u64 * MIGRATION_MAX_DENOMINATION_ZEC * COIN;
+        let per_run_cap = MIGRATION_MAX_PREPARED_NOTES_PER_RUN.get() as u64 * u64::from(DENOM_CAP);
         assert!(u64::from(p.total_migratable()) <= per_run_cap);
         assert!(
             p.change().map(u64::from).unwrap_or(0) > per_run_cap,
@@ -323,29 +430,35 @@ mod tests {
     /// A balance below the smallest self-funding note migrates nothing and keeps it all as change.
     #[test]
     fn below_min_note_migrates_nothing() {
-        let s = canonical(MIGRATION_MAX_PREPARED_NOTES_PER_RUN);
+        let s = canonical(MIGRATION_MAX_PREPARED_NOTES_PER_RUN.get());
         let buffer = zip317_buffer();
-        let below = u64::from(RESIDUAL_MIGRATION_MIN) + buffer - 1;
+        let below = u64::from(MAX_RESIDUAL_VALUE) + buffer - 1;
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let p = s.plan(zat(below), Zatoshis::ZERO, &prep_tx_count_stub, &mut rng);
+        let p = s.plan(
+            zat(below),
+            MULTI_NOTE,
+            Zatoshis::ZERO,
+            &prep_tx_count_stub,
+            &mut rng,
+        );
         assert!(p.crossing_values().is_empty());
         assert_eq!(p.change(), Some(zat(below)));
     }
 
     /// The largest reserved preparation fee the single-quantum tests sample. Kept below the smallest
-    /// gap between adjacent denominations (`RESIDUAL_MIGRATION_MIN`, the 0.01 -> 0.02 ZEC step) so
+    /// gap between adjacent denominations (`MAX_RESIDUAL_VALUE`, the 0.01 -> 0.02 ZEC step) so
     /// that `quantum + fee` never rounds up to the next `{1, 2, 5} * 10^k` denomination: the plan
     /// must then pick exactly the quantum. Realistic ZIP-317 preparation fees are far smaller (a
     /// handful of marginal fees).
     const MAX_SINGLE_QUANTUM_PREP_FEE_ZATOSHI: u64 = COIN / 200; // 0.005 ZEC, half the minimum denom
 
     /// Every `{1, 2, 5} * 10^k` denomination (a "quantum") within the valid range
-    /// `[RESIDUAL_MIGRATION_MIN, MIGRATION_MAX_DENOMINATION_ZEC]`, in zatoshi. These are exactly the
+    /// `[MAX_RESIDUAL_VALUE, DENOM_CAP]`, in zatoshi. These are exactly the
     /// crossing values the strategy can emit, so a balance of one of them plus its fees is the
     /// smallest input that migrates that denomination as a single note.
     fn all_quanta() -> Vec<u64> {
-        let min = u64::from(RESIDUAL_MIGRATION_MIN);
-        let cap = MIGRATION_MAX_DENOMINATION_ZEC * COIN;
+        let min = u64::from(MAX_RESIDUAL_VALUE);
+        let cap = u64::from(DENOM_CAP);
         let mut quanta = Vec::new();
         let mut pow = 1u64;
         while pow <= cap {
@@ -375,9 +488,15 @@ mod tests {
     fn assert_one_quantum_plus_fees(quantum: u64, prep_fee: u64) {
         let buffer = zip317_buffer();
         let balance = quantum + buffer + prep_fee;
-        let s = canonical(MIGRATION_MAX_PREPARED_NOTES_PER_RUN);
+        let s = canonical(MIGRATION_MAX_PREPARED_NOTES_PER_RUN.get());
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let p = s.plan(zat(balance), zat(prep_fee), &prep_tx_count_stub, &mut rng);
+        let p = s.plan(
+            zat(balance),
+            MULTI_NOTE,
+            zat(prep_fee),
+            &prep_tx_count_stub,
+            &mut rng,
+        );
 
         assert_eq!(
             crossings_u64(&p),
@@ -414,19 +533,49 @@ mod tests {
         // A realistic reserved preparation fee: the ZIP-317 marginal fee for a few actions.
         let prep_fee = 3 * MARGINAL_FEE.into_u64();
         let examples = [
-            u64::from(RESIDUAL_MIGRATION_MIN), // 0.01 ZEC, the minimum denomination
-            COIN / 50,                         // 0.02 ZEC
-            COIN / 20,                         // 0.05 ZEC
-            COIN / 10,                         // 0.1 ZEC
-            COIN,                              // 1 ZEC
-            2 * COIN,                          // 2 ZEC
-            5 * COIN,                          // 5 ZEC
-            100 * COIN,                        // 100 ZEC
-            MIGRATION_MAX_DENOMINATION_ZEC * COIN, // 10,000 ZEC, the cap
+            u64::from(MAX_RESIDUAL_VALUE), // 0.01 ZEC, the minimum denomination
+            COIN / 50,                     // 0.02 ZEC
+            COIN / 20,                     // 0.05 ZEC
+            COIN / 10,                     // 0.1 ZEC
+            COIN,                          // 1 ZEC
+            2 * COIN,                      // 2 ZEC
+            5 * COIN,                      // 5 ZEC
+            100 * COIN,                    // 100 ZEC
+            u64::from(DENOM_CAP),          // 10,000 ZEC, the cap
         ];
         for quantum in examples {
             assert_one_quantum_plus_fees(quantum, prep_fee);
         }
+    }
+
+    /// An exact funding note is used directly, so it does not need the preparation fee that the
+    /// balance-only quantizer cannot know whether to reserve.
+    #[test]
+    fn exact_funding_note_needs_no_preparation_fee() {
+        let buffer = zip317_buffer();
+        let crossing = u64::from(MAX_RESIDUAL_VALUE);
+        let funding = crossing + buffer;
+        let available = [zat(funding)];
+        let prep_fee = 16 * MARGINAL_FEE.into_u64();
+        let prep_tx_count = |wanted: &[Zatoshis]| {
+            crate::preparation::plan_preparation(&available, wanted, zat(prep_fee))
+                .ok()
+                .map(|plan| plan.transaction_count())
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+
+        let plan = canonical(MIGRATION_MAX_PREPARED_NOTES_PER_RUN.get()).plan(
+            zat(funding),
+            available.len(),
+            zat(prep_fee),
+            &prep_tx_count,
+            &mut rng,
+        );
+
+        assert_eq!(crossings_u64(&plan), vec![crossing]);
+        assert_eq!(plan.migration_outputs(), vec![zat(funding)]);
+        assert_eq!(plan.prep_fees(), Zatoshis::ZERO);
+        assert_eq!(plan.change(), None);
     }
 
     proptest! {
@@ -513,6 +662,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let plan = s.plan(
             zat(balance_zatoshi),
+            MULTI_NOTE,
             Zatoshis::ZERO,
             &prep_tx_count_stub,
             &mut rng,
@@ -773,5 +923,148 @@ mod tests {
         for (balance, crossings, change) in &cases {
             check_user_preparation(*balance, crossings, *change);
         }
+    }
+
+    proptest! {
+        /// The note shape can only TRUNCATE the published split, never reshape it: against the real
+        /// preparation planner, whatever the wallet's notes, the crossings are a prefix of the
+        /// balance's canonical split ([`CanonicalOneTwoFive::unconstrained_split`] itself, NOT the
+        /// plan under the optimistic stub: for a balance of exactly one denomination plus its
+        /// buffer, the split forgoes the fee reserve so an exact note can fund it directly, and a
+        /// stub that charges a fee reconciles that split away). This is the reconciliation kernel's
+        /// contract — dropping from the bottom is the only repair.
+        #[test]
+        fn the_note_shape_only_truncates_the_canonical_split(
+            notes in prop::collection::vec(1u64..2_000_000_000, 1..20),
+        ) {
+            let total: u64 = notes.iter().sum();
+            let available: Vec<Zatoshis> = notes.iter().map(|&v| zat(v)).collect();
+            let fee = 16 * MARGINAL_FEE.into_u64();
+            let s = CanonicalOneTwoFive::recommended(zat(zip317_buffer()));
+
+            let real = |funding: &[Zatoshis]| {
+                crate::preparation::plan_preparation(&available, funding, zat(fee))
+                    .ok()
+                    .map(|plan| plan.transaction_count())
+            };
+            let mut rng = ChaCha8Rng::seed_from_u64(0);
+            let constrained =
+                crossings_u64(&s.plan(zat(total), notes.len(), zat(fee), &real, &mut rng));
+            let canonical = s.unconstrained_split(total, notes.len(), fee);
+
+            prop_assert!(
+                constrained.len() <= canonical.len()
+                    && constrained == canonical[..constrained.len()],
+                "crossings {:?} are not a prefix of the canonical split {:?}",
+                constrained,
+                canonical,
+            );
+        }
+    }
+
+    /// The exact-funding bit at the corner the proptest's generator cannot reach: a balance of
+    /// exactly one canonical denomination plus its transfer buffer. Held as a SINGLE note, the
+    /// split is that denomination with NO fee reserve, and the note is certain to fund it directly
+    /// — zero preparation fees. Held any other way, no note can equal the funding value, so
+    /// preparation is inevitable: the split retains its fee reserve, steps down the series, and the
+    /// wallet migrates the stepped-down split in full. The note count is what keeps a balance the
+    /// wallet CAN fund from quantizing into one it cannot.
+    #[test]
+    fn an_exact_denomination_balance_migrates_under_any_holding() {
+        let buffer = zip317_buffer();
+        let fee = 16 * MARGINAL_FEE.into_u64();
+        let total = COIN + buffer;
+        let s = CanonicalOneTwoFive::recommended(zat(buffer));
+        assert_eq!(s.unconstrained_split(total, 1, fee), vec![COIN]);
+
+        let plan_against = |notes: &[u64]| {
+            let available: Vec<Zatoshis> = notes.iter().map(|&v| zat(v)).collect();
+            let real = |funding: &[Zatoshis]| {
+                crate::preparation::plan_preparation(&available, funding, zat(fee))
+                    .ok()
+                    .map(|plan| plan.transaction_count())
+            };
+            let mut rng = ChaCha8Rng::seed_from_u64(0);
+            s.plan(zat(total), notes.len(), zat(fee), &real, &mut rng)
+        };
+
+        // The exact note: the full canonical split, funded directly, nothing reserved.
+        let exact = plan_against(&[total]);
+        assert_eq!(crossings_u64(&exact), vec![COIN]);
+        assert_eq!(exact.prep_fees(), Zatoshis::ZERO);
+
+        // The same balance as two notes: the fee-reserving split, migrated in full through one
+        // preparation transaction rather than deferred.
+        let split = plan_against(&[60 * COIN / 100, 40 * COIN / 100 + buffer]);
+        assert_eq!(crossings_u64(&split), s.unconstrained_split(total, 2, fee));
+        assert!(!split.crossing_values().is_empty());
+        assert_eq!(split.prep_fees(), zat(fee));
+    }
+
+    /// The cap regime: a balance whose canonical split saturates
+    /// [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`] repeated [`DENOM_CAP`] parts, planned against the
+    /// real preparation planner over more than 50 source notes. The published crossings are the
+    /// full capped split — a prefix of the canonical split by construction — and the excess balance
+    /// waits as change.
+    #[test]
+    fn the_cap_regime_publishes_repeated_denom_cap_parts() {
+        let buffer = zip317_buffer();
+        let fee = 16 * MARGINAL_FEE.into_u64();
+        let cap = DENOM_CAP.into_u64();
+        // 55 wallet notes of one DENOM_CAP each: none is an exact funding note (each lacks the
+        // buffer), so every funding note is minted by consolidation.
+        let notes: Vec<u64> = vec![cap; 55];
+        let total: u64 = notes.iter().sum();
+        let available: Vec<Zatoshis> = notes.iter().map(|&v| zat(v)).collect();
+        let s = CanonicalOneTwoFive::recommended(zat(buffer));
+
+        let canonical = s.unconstrained_split(total, notes.len(), fee);
+        assert_eq!(
+            canonical,
+            vec![cap; MIGRATION_MAX_PREPARED_NOTES_PER_RUN.get()],
+            "the canonical split saturates the per-run cap with repeated DENOM_CAP parts"
+        );
+
+        let real = |funding: &[Zatoshis]| {
+            crate::preparation::plan_preparation(&available, funding, zat(fee))
+                .ok()
+                .map(|plan| plan.transaction_count())
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let plan = s.plan(zat(total), notes.len(), zat(fee), &real, &mut rng);
+        assert_eq!(crossings_u64(&plan), canonical);
+    }
+
+    /// Reconciliation drops a SUFFIX when the wallet's true consolidation costs exceed the
+    /// optimistic reserve: a wallet of hundreds of sub-funding notes pays its extra preparation
+    /// fees by deferring the smallest parts, and what it publishes is still a nonempty strict
+    /// prefix of the balance's canonical split.
+    #[test]
+    fn consolidation_costs_truncate_a_suffix_of_the_split() {
+        let buffer = zip317_buffer();
+        let fee = 16 * MARGINAL_FEE.into_u64();
+        // 300 notes of the minimum denomination: each is below the smallest self-funding note
+        // (which needs the buffer on top), so everything must consolidate, and the ~20+ transaction
+        // fees far exceed the optimistic single-transaction reserve.
+        let notes: Vec<u64> = vec![u64::from(MAX_RESIDUAL_VALUE); 300];
+        let total: u64 = notes.iter().sum();
+        let available: Vec<Zatoshis> = notes.iter().map(|&v| zat(v)).collect();
+        let s = CanonicalOneTwoFive::recommended(zat(buffer));
+
+        let real = |funding: &[Zatoshis]| {
+            crate::preparation::plan_preparation(&available, funding, zat(fee))
+                .ok()
+                .map(|plan| plan.transaction_count())
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let constrained =
+            crossings_u64(&s.plan(zat(total), notes.len(), zat(fee), &real, &mut rng));
+        let canonical = s.unconstrained_split(total, notes.len(), fee);
+
+        assert!(
+            !constrained.is_empty() && constrained.len() < canonical.len(),
+            "the split truncates without emptying: {constrained:?} from {canonical:?}"
+        );
+        assert_eq!(constrained, canonical[..constrained.len()]);
     }
 }

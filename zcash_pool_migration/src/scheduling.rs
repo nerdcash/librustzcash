@@ -37,6 +37,12 @@
 //!    validity as a pure function of the current height, so the expiry height itself carries no
 //!    per-wallet information.
 //!
+//! Beyond the ZIP 318 draws, [`schedule_sync_wakeups`] derives from a committed transfer schedule
+//! the MINIMAL set of sync/proving wake-ups a background-constrained wallet needs: every transfer
+//! is proved after its drawn anchor boundary settles and strictly before its broadcast height, and
+//! each wake-up lands a settle margin past a bucketed anchor height plus an anti-thundering-herd
+//! jitter ([`WakeupParams`]).
+//!
 //! # Cohorts
 //!
 //! Transfers (across all wallets) that prove against the same boundary anchor form a COHORT: to an
@@ -56,116 +62,52 @@
 //!   with its broadcasts. That is a scheduling-engine runtime policy over live network activity.
 //! - AT MOST ONE OVERDUE TRANSFER at wallet open: when a wallet reopens after being offline past
 //!   several scheduled heights, at most one overdue transfer is released immediately (the rest are
-//!   re-spread). That requires the persisted schedule and wall-clock state the engine owns.
+//!   re-spread). That requires the persisted schedule and wall-clock state the engine owns; the
+//!   drive API implements it as the overdue shift (see
+//!   [`advance_migration`](crate::satisfiability::advance_migration) and
+//!   [`overdue_shift_tolerance`](crate::satisfiability::overdue_shift_tolerance)), which moves the
+//!   whole pending schedule forward by the overdue amount rather than redrawing it.
 //!
 //! This module supplies the heights and anchors those policies act on; it does not enact them.
 //!
 //! [ZIP 318]: https://zips.z.cash/zip-0318
 
 use alloc::vec::Vec;
+use core::fmt;
 use core::num::NonZeroU32;
 
 use rand_core::{CryptoRng, RngCore};
 use zcash_protocol::consensus::BlockHeight;
 
-/// The block-height grid defining the BOUNDARY blocks: a height `h` is a boundary iff `h` is a
-/// multiple of this interval. Boundaries are the only tree states a transfer may anchor to, so many
-/// transfers share a small, common set of anchors (cohorts) rather than each pinning a unique
-/// recent block. See [`draw_anchor_boundary`].
+/// The block-height grid defining the BOUNDARY blocks that a transfer may anchor to.
 ///
-/// The wallet that will prove a transfer must have RETAINED the checkpoint at the boundary the
-/// transfer anchors to, so this interval must equal the one on which that wallet retains its
-/// durable anchors. A migration run over a `zcash_client_backend` wallet obtains it by converting
-/// the wallet's own `AnchorRetentionInterval` (see the `From` implementations available under the
-/// `wallet` feature), which is what keeps the two grids from diverging.
+/// Re-exported from [`zcash_protocol::zip318`], which owns the single definition shared with the
+/// wallet's durable anchor retention. The wallet that will prove a transfer must have RETAINED the
+/// checkpoint at the boundary the transfer anchors to, so the migration's grid and the wallet's
+/// retention grid must be the same — they are now the same type, rather than two types kept aligned
+/// by a conversion.
 ///
-/// The interval is a modulus, so it is necessarily non-zero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AnchorBucketInterval(NonZeroU32);
+/// See [`draw_anchor_boundary`] for how a boundary is chosen from this grid.
+pub use zcash_protocol::zip318::AnchorBucketInterval;
 
-impl AnchorBucketInterval {
-    /// The interval specified by [ZIP 318]: 144 blocks, about three hours at the Zcash ~75-second
-    /// target block spacing.
-    ///
-    /// [ZIP 318]: https://zips.z.cash/zip-0318
-    pub const ZIP_318: Self = Self(NonZeroU32::new(144).expect("144 is nonzero"));
-
-    /// Constructs an interval other than the [ZIP 318] one, for use on test networks.
-    ///
-    /// A migration on the production network MUST use [`Self::ZIP_318`]: the anonymity set a shared
-    /// anchor provides is exactly the set of transfers that chose the same boundary, so a wallet
-    /// anchoring to a different grid than its peers is distinguishable from them.
-    ///
-    /// [ZIP 318]: https://zips.z.cash/zip-0318
-    pub const fn custom(blocks: NonZeroU32) -> Self {
-        Self(blocks)
-    }
-
-    /// Returns the interval as a number of blocks.
-    pub fn block_count(&self) -> NonZeroU32 {
-        self.0
-    }
-
-    /// Returns whether `height` is a boundary of this interval.
-    pub fn is_boundary(&self, height: BlockHeight) -> bool {
-        u32::from(height) % self.0 == 0
-    }
-
-    /// Returns the greatest boundary height that does not exceed `height`, i.e. `height` rounded
-    /// DOWN to a multiple of this interval.
-    pub fn boundary_at_or_below(&self, height: BlockHeight) -> BlockHeight {
-        BlockHeight::from_u32(self.boundary_at_or_below_u32(u32::from(height)))
-    }
-
-    /// [`Self::boundary_at_or_below`] on the raw `u32` representation, for internal boundary
-    /// arithmetic.
-    fn boundary_at_or_below_u32(&self, height: u32) -> u32 {
-        height - (height % self.0)
-    }
-
-    /// Returns the least boundary height that is not below `height`, i.e. `height` rounded UP to a
-    /// multiple of this interval. Saturates at [`u32::MAX`].
-    pub fn boundary_at_or_above(&self, height: BlockHeight) -> BlockHeight {
-        BlockHeight::from_u32(self.boundary_at_or_above_u32(u32::from(height)))
-    }
-
-    /// [`Self::boundary_at_or_above`] on the raw `u32` representation, for internal boundary
-    /// arithmetic.
-    fn boundary_at_or_above_u32(&self, height: u32) -> u32 {
-        let r = height % self.0;
-        if r == 0 {
-            height
-        } else {
-            height.saturating_add(self.0.get() - r)
-        }
-    }
+/// [`AnchorBucketInterval::boundary_at_or_below`] on the raw `u32` representation, for the boundary
+/// arithmetic below. The public API is `BlockHeight`-typed; the scheduling arithmetic works in `u32`
+/// spans, so it converts once here rather than at every call site.
+fn boundary_at_or_below_u32(interval: &AnchorBucketInterval, height: u32) -> u32 {
+    u32::from(interval.boundary_at_or_below(BlockHeight::from_u32(height)))
 }
 
-impl Default for AnchorBucketInterval {
-    fn default() -> Self {
-        Self::ZIP_318
-    }
+/// [`AnchorBucketInterval::boundary_at_or_above`] on the raw `u32` representation. See
+/// [`boundary_at_or_below_u32`].
+fn boundary_at_or_above_u32(interval: &AnchorBucketInterval, height: u32) -> u32 {
+    u32::from(interval.boundary_at_or_above(BlockHeight::from_u32(height)))
 }
 
-/// The grid a `zcash_client_backend` wallet retains its durable anchor checkpoints on is exactly
-/// the grid a migration over that wallet may anchor to, so the two are freely interconvertible.
-/// Converting rather than configuring the migration separately is what keeps them from diverging.
-#[cfg(feature = "wallet")]
-impl From<zcash_client_backend::data_api::anchor_retention::AnchorRetentionInterval>
-    for AnchorBucketInterval
-{
-    fn from(
-        interval: zcash_client_backend::data_api::anchor_retention::AnchorRetentionInterval,
-    ) -> Self {
-        Self(interval.block_count())
-    }
-}
-
-// The reverse conversion is deliberately absent. The wallet is the authority on the grid — it is
-// the side that retains the checkpoints — so a migration derives its interval from a wallet, never
-// the other way around. Constructing a non-ZIP-318 retention interval goes through
-// `AnchorRetentionInterval::custom`, which `zcash_client_backend` gates behind its `unstable`
-// feature precisely so that choosing a non-standard grid is a deliberate act.
+// There is no conversion in either direction, because there is nothing to convert: the wallet's
+// retention interval and a migration's bucket interval are one type. The wallet remains the
+// authority on the grid — it is the side that retains the checkpoints — so a migration still reads
+// its interval off a wallet rather than choosing one. Constructing a non-ZIP-318 interval goes
+// through `AnchorBucketInterval::custom`, which is documented for use on test networks only.
 
 /// A truncated exponential inter-arrival delay distribution, in blocks: draws have mean
 /// [`Self::mean`], and a draw exceeding [`Self::cap`] is discarded and redrawn (truncating the
@@ -223,21 +165,6 @@ impl DelayDistribution {
     }
 }
 
-/// The ratio a [ZIP 318] delay distribution's cap bears to its mean: a draw more than four times
-/// the mean is discarded and redrawn, truncating the exponential's heavy tail. It is the same for
-/// the transfer and preparation delays. See [`SchedulingParams::new_with_default_distributions`].
-///
-/// [ZIP 318]: https://zips.z.cash/zip-0318
-pub const DELAY_CAP_RATIO: NonZeroU32 = NonZeroU32::new(4).expect("4 is nonzero");
-
-/// The ratio the anchor bucket interval bears to the PREPARATION delay mean: at the [ZIP 318]
-/// values, 144 blocks per bucket against 24 blocks between preparations. Preparations need only
-/// temporal decoupling from one another, not anchor bucketing, so they are spaced this much more
-/// tightly than the transfers. See [`SchedulingParams::new_with_default_distributions`].
-///
-/// [ZIP 318]: https://zips.z.cash/zip-0318
-pub const PREP_MEAN_DIVISOR: NonZeroU32 = NonZeroU32::new(6).expect("6 is nonzero");
-
 /// The scheduling parameters a migration runs under: the anchor bucket grid and the two
 /// inter-arrival delay distributions.
 ///
@@ -253,26 +180,25 @@ pub struct SchedulingParams {
 }
 
 impl SchedulingParams {
-    /// The parameters specified by [ZIP 318] (with the provisional preparation spacing): a 144-block
-    /// anchor bucket interval, transfer delays of mean 144 blocks capped at 576 (`4 * mean`, about
-    /// twelve hours), and preparation delays of mean 24 blocks capped at 96.
+    /// The parameters specified by [ZIP 318]: a 144-block anchor bucket interval, transfer delays
+    /// of mean 66 blocks capped at 576 (about twelve hours), and preparation delays of mean 16
+    /// blocks capped at 96 (about two hours).
     ///
     /// Preparation transactions are fully shielded self-sends: they need TEMPORAL decoupling from
     /// one another (a burst of identically shaped transactions from one wallet is a linkable
     /// cluster), but no anchor bucketing — only the pool-crossing transfers anchor to boundaries —
-    /// so their spacing is much tighter than the transfers'. That spacing is provisional; it is not
-    /// yet specified by ZIP 318.
+    /// so their spacing is much tighter than the transfers'.
     ///
     /// [ZIP 318]: https://zips.z.cash/zip-0318
     pub const ZIP_318: Self = Self {
         anchor_bucket_interval: AnchorBucketInterval::ZIP_318,
         transfer_delay: DelayDistribution {
-            mean: NonZeroU32::new(144).expect("144 is nonzero"),
-            cap: NonZeroU32::new(576).expect("576 is nonzero"),
+            mean: zcash_protocol::zip318::TRANSFER_DELAY_MEAN,
+            cap: zcash_protocol::zip318::TRANSFER_DELAY_CAP,
         },
         preparation_delay: DelayDistribution {
-            mean: NonZeroU32::new(24).expect("24 is nonzero"),
-            cap: NonZeroU32::new(96).expect("96 is nonzero"),
+            mean: zcash_protocol::zip318::PREP_DELAY_MEAN,
+            cap: zcash_protocol::zip318::PREP_DELAY_CAP,
         },
     };
 
@@ -289,10 +215,10 @@ impl SchedulingParams {
         }
     }
 
-    /// Constructs scheduling parameters for `anchor_bucket_interval`, deriving both delay
-    /// distributions from it by the ratios [`Self::ZIP_318`] uses: the transfer delay has a mean of
-    /// one bucket interval, the preparation delay a mean of a
-    /// [`PREP_MEAN_DIVISOR`]th of one, and each is capped at [`DELAY_CAP_RATIO`] times its own mean.
+    /// Constructs scheduling parameters for `anchor_bucket_interval`, scaling every delay
+    /// parameter of [`Self::ZIP_318`] by the ratio the interval bears to
+    /// [`AnchorBucketInterval::ZIP_318`]: each mean and cap is its ZIP 318 value multiplied by
+    /// `interval / 144`, truncated.
     ///
     /// At [`AnchorBucketInterval::ZIP_318`] this reproduces [`Self::ZIP_318`] exactly. It is the
     /// constructor to reach for on a test network: shortening the bucket interval alone would leave
@@ -300,29 +226,31 @@ impl SchedulingParams {
     /// the whole schedule by the same factor compresses it while preserving the shape ZIP 318
     /// specifies.
     ///
-    /// The preparation mean is clamped up to one block for bucket intervals below
-    /// [`PREP_MEAN_DIVISOR`], and the caps saturate at [`u32::MAX`], so every interval yields a
-    /// usable distribution.
+    /// A scaled value that truncates to zero is clamped up to one block, and one that exceeds
+    /// `u32::MAX` saturates, so every interval yields a usable pair of distributions.
     pub fn new_with_default_distributions(anchor_bucket_interval: AnchorBucketInterval) -> Self {
-        let transfer_mean = anchor_bucket_interval.block_count();
-        // Integer division truncates, and a mean of zero is not a distribution, so clamp up.
-        let preparation_mean = match NonZeroU32::new(transfer_mean.get() / PREP_MEAN_DIVISOR.get())
-        {
-            Some(mean) => mean,
-            None => NonZeroU32::MIN,
+        let scale = |value: NonZeroU32| -> NonZeroU32 {
+            let scaled = u64::from(value.get())
+                * u64::from(anchor_bucket_interval.block_count().get())
+                / u64::from(AnchorBucketInterval::ZIP_318.block_count().get());
+            match u32::try_from(scaled) {
+                Ok(v) => NonZeroU32::new(v).unwrap_or(NonZeroU32::MIN),
+                Err(_) => NonZeroU32::MAX,
+            }
         };
-        // Built directly rather than through `DelayDistribution::new`: each cap is its own mean
-        // multiplied by `DELAY_CAP_RATIO` under saturating arithmetic, so it is never below that
-        // mean and the validated constructor's failure case is unreachable here.
+        // Built directly rather than through `DelayDistribution::new`: scaling is monotone
+        // (truncation, the clamp, and the saturation all preserve order), so each scaled cap is
+        // never below its scaled mean and the validated constructor's failure case is unreachable
+        // here.
         Self {
             anchor_bucket_interval,
             transfer_delay: DelayDistribution {
-                mean: transfer_mean,
-                cap: transfer_mean.saturating_mul(DELAY_CAP_RATIO),
+                mean: scale(zcash_protocol::zip318::TRANSFER_DELAY_MEAN),
+                cap: scale(zcash_protocol::zip318::TRANSFER_DELAY_CAP),
             },
             preparation_delay: DelayDistribution {
-                mean: preparation_mean,
-                cap: preparation_mean.saturating_mul(DELAY_CAP_RATIO),
+                mean: scale(zcash_protocol::zip318::PREP_DELAY_MEAN),
+                cap: scale(zcash_protocol::zip318::PREP_DELAY_CAP),
             },
         }
     }
@@ -349,22 +277,147 @@ impl Default for SchedulingParams {
     }
 }
 
-/// Maximum anchor AGE, in boundaries, that the recency-weighted draw will accept. Age `a` counts
-/// boundaries strictly before the most recent boundary observed at proving time; a draw exceeding
-/// this cap (a very old anchor) is discarded and redrawn. Bounds how stale a proof's anchor can be
-/// (16 boundaries is about two days). See [`draw_anchor_boundary`].
-pub const ANCHOR_AGE_CAP: u32 = 16;
+/// How deep below the wallet's fully-scanned tip a transfer's drawn anchor boundary must sit —
+/// AT LEAST this many blocks — before the planning kernel offers the transfer's proof: about
+/// 12.5 minutes of reorg stability at the target block spacing, so the boundary checkpoint
+/// proved against is one a reorg can no longer plausibly displace. This is the same settling
+/// judgment [`WakeupParams::DEFAULT`] expresses as a wake-up margin — that margin IS this
+/// constant, so a zero-jitter wake-up landing exactly on its scheduled height syncs to the
+/// first tip at which the kernel offers the proofs the wake-up exists to produce — and it
+/// matches the conventional [`ReorgSettleDepth`](crate::satisfiability::ReorgSettleDepth).
+/// Not specified by ZIP 318; provisional.
+///
+/// Proving a shallower boundary would cost correctness nothing — the satisfiability oracle
+/// detects an anchor a settled reorg invalidated, and the proof is simply redone — but it
+/// spends the proving work exactly when a reorg is most plausible, so the kernel holds the
+/// proof until the boundary is this deep. The gate is judged only against the SCANNED target
+/// ([`DuenessTargets::scanned`](crate::satisfiability::DuenessTargets::scanned)): an estimate
+/// cannot conjure the checkpoint, nor its depth.
+pub const PROVABLE_ANCHOR_DEPTH: u32 = 10;
 
-/// Block-height modulus of the canonical rolling EXPIRY window, in blocks. 34560 blocks is about 30
-/// days at the target block spacing. The expiry height is anchored to the most recent multiple of
-/// this modulus plus [`EXPIRY_WINDOW`]. See [`expiry_height`].
-pub const EXPIRY_MODULUS: u32 = 34_560;
+/// Parameters shaping the sync/proving wake-up schedule ([`schedule_sync_wakeups`]): how many
+/// blocks past an anchor boundary a wake-up waits for that boundary to settle, and how much random
+/// jitter spreads independent wallets' wake-ups apart as a thundering-herd defense. These values
+/// are provisional; they are not specified by ZIP 318.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeupParams {
+    settle_margin: u32,
+    jitter_cap: u32,
+}
 
-/// Width of the rolling expiry window added past the anchoring modulus, in blocks. Two expiry
-/// moduli (`2 * EXPIRY_MODULUS`, about 60 days) so that every transfer, whenever in the current
-/// modulus period it is scheduled, keeps between one and two [`EXPIRY_MODULUS`] periods of validity.
-/// See [`expiry_height`].
-pub const EXPIRY_WINDOW: u32 = 2 * EXPIRY_MODULUS;
+impl WakeupParams {
+    /// The provisional defaults: a settle margin of [`PROVABLE_ANCHOR_DEPTH`] blocks (10 —
+    /// about 12.5 minutes at the target block spacing; the kernel's provability gate and this
+    /// margin are the SAME depth, so a zero-jitter wake-up syncs to the first tip at which the
+    /// kernel offers the proofs the wake-up exists to produce) and a 12-block jitter cap (about
+    /// 15 minutes).
+    ///
+    /// The jitter cap exists as a THUNDERING-HERD defense, and for nothing else: anchor
+    /// boundaries sit on a GLOBAL grid shared by every migrating wallet, so un-jittered wake-ups
+    /// would all land exactly `settle_margin` blocks after the same grid heights, hitting the
+    /// light wallet servers in synchronized bursts. A uniform draw over `[0, jitter_cap]` divides
+    /// that per-block peak load by roughly the cap, while staying small against the 133-block
+    /// worst-case slack a transfer's proving window guarantees, so most of the window remains as
+    /// headroom for wake-ups the operating system delivers late.
+    ///
+    /// The jitter is denominated in blocks even though the herd is a wall-clock phenomenon: a
+    /// background wallet realizes a wake-up height as a wall-clock OS timer estimated from the
+    /// target block spacing, and the per-wallet estimation error (block-time variance accumulated
+    /// between scheduling and the wake-up) plus the OS's own delivery slop already smear
+    /// same-height wallets WITHIN a block, so the jitter only needs to spread wallets ACROSS
+    /// blocks.
+    pub const DEFAULT: Self = Self {
+        settle_margin: PROVABLE_ANCHOR_DEPTH,
+        jitter_cap: 12,
+    };
+
+    /// Constructs wake-up parameters from their parts, for a test network that scales the schedule
+    /// down (a production migration uses [`Self::DEFAULT`]).
+    pub const fn new(settle_margin: u32, jitter_cap: u32) -> Self {
+        Self {
+            settle_margin,
+            jitter_cap,
+        }
+    }
+
+    /// The number of blocks past an anchor boundary at which a wake-up may be scheduled, giving
+    /// the boundary time to settle. A zero margin is treated as one block when scheduling: a
+    /// wake-up AT the boundary height cannot prove against it (the boundary must be strictly below
+    /// the tip for its checkpoint to exist).
+    pub fn settle_margin(&self) -> u32 {
+        self.settle_margin
+    }
+
+    /// The inclusive upper bound on the uniform random jitter added to each wake-up height — a
+    /// thundering-herd defense that spreads wallets' otherwise-synchronized wake-ups across the
+    /// blocks after each shared grid point (see [`Self::DEFAULT`]). The jitter actually drawn is
+    /// also bounded by the group's slack to its earliest broadcast deadline, so it never pushes a
+    /// wake-up past a deadline.
+    pub fn jitter_cap(&self) -> u32 {
+        self.jitter_cap
+    }
+}
+
+impl Default for WakeupParams {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// One sync/proving wake-up of the schedule produced by [`schedule_sync_wakeups`]: the block
+/// height at which to wake, and the transfers this wake-up is RESPONSIBLE for proving. At runtime
+/// a wallet proves every transfer whose anchor boundary has settled at the time of the wake-up, so
+/// a transfer may well be proved earlier than the wake-up that covers it; `covers` is the
+/// assignment that guarantees every transfer is proved before its broadcast, not a restriction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncWakeup<T> {
+    height: BlockHeight,
+    covers: Vec<T>,
+}
+
+impl<T> SyncWakeup<T> {
+    /// The block height at which the wallet should wake to sync and prove.
+    pub fn height(&self) -> BlockHeight {
+        self.height
+    }
+
+    /// The transfers this wake-up is responsible for proving, in a deterministic order (any
+    /// overdue transfers first, then in broadcast-deadline order).
+    pub fn covers(&self) -> &[T] {
+        &self.covers
+    }
+}
+
+/// The error returned when a transfer passed to [`schedule_sync_wakeups`] admits no valid wake-up
+/// height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeupScheduleError<T> {
+    /// The transfer's broadcast height is not at least two blocks above its anchor boundary, so no
+    /// height exists at which the boundary has settled (is strictly below the tip) strictly before
+    /// the broadcast. Unreachable for a schedule produced by this crate — a drawn anchor sits at
+    /// least one full bucket interval below its broadcast height — so it indicates an inconsistent
+    /// hand-assembled schedule, or a degenerate custom bucket interval of one block.
+    InfeasibleTransfer(T),
+}
+
+impl<T: fmt::Debug> fmt::Display for WakeupScheduleError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WakeupScheduleError::InfeasibleTransfer(id) => write!(
+                f,
+                "transfer {id:?} has no height at which its anchor has settled strictly before its broadcast"
+            ),
+        }
+    }
+}
+
+impl<T: fmt::Debug> core::error::Error for WakeupScheduleError<T> {}
+
+/// The anchor-age cap that bounds the recency-weighted anchor draw (see [`draw_anchor_boundary`]),
+/// and the modulus and width of the canonical rolling expiry window (see [`expiry_height`]).
+///
+/// Re-exported from [`zcash_protocol::zip318`], which owns the ZIP's specified values.
+pub use zcash_protocol::zip318::{ANCHOR_AGE_CAP, EXPIRY_MODULUS, EXPIRY_WINDOW};
 
 /// The scheduled broadcast and expiry heights of one migration transfer. Produced by
 /// [`schedule`]; ties a part's [`broadcast_height`](Self::broadcast_height) (from the cumulative
@@ -526,10 +579,145 @@ pub fn schedule_prep_broadcast_heights<R: RngCore + CryptoRng>(
 /// and two [`EXPIRY_MODULUS`] periods (about 1 to 2 months) of remaining validity: the result is
 /// always strictly greater than `current_height` and at most `EXPIRY_WINDOW` above it. Saturates at
 /// `u32::MAX`.
-pub fn expiry_height(current_height: BlockHeight) -> BlockHeight {
-    let h = u32::from(current_height);
-    // `BlockHeight`'s delta addition saturates at `u32::MAX`.
-    BlockHeight::from_u32(h - (h % EXPIRY_MODULUS)) + EXPIRY_WINDOW
+pub use zcash_protocol::zip318::expiry_height;
+
+/// Compute the MINIMAL schedule of sync/proving wake-ups covering `transfers`, each given as
+/// `(id, anchor_boundary, broadcast_height)` — for a committed migration, a transfer's drawn
+/// [`MigrationTransaction::anchor_boundary`] and [`Schedule::broadcast_height`]. Returns one
+/// [`SyncWakeup`] per wake-up, in strictly increasing height order; at each, the wallet syncs to
+/// the wake-up height and proves every transfer whose anchor boundary has settled.
+///
+/// Each transfer must be proved after its anchor boundary settles (strictly below the tip, at
+/// least [`WakeupParams::settle_margin`] blocks past it) and strictly before its broadcast height
+/// (sync and broadcast never share a wake window), giving it a proving WINDOW of heights. The
+/// fewest wake-ups piercing every window is the classic minimum piercing-set problem, solved
+/// optimally by a greedy pass over the windows in deadline order; each wake-up lands at the
+/// latest window-opening height of the group it covers — under real parameters, a bucketed anchor
+/// height plus the settle margin — plus a uniform random jitter bounded by both
+/// [`WakeupParams::jitter_cap`] and the group's slack. The jitter exists as a THUNDERING-HERD
+/// defense: anchor boundaries sit on a global grid shared by every migrating wallet, so
+/// un-jittered wake-ups would all land on the same heights and stampede the light wallet servers
+/// (as well as mark the wallet as migrating). It is drawn from a [`CryptoRng`] because wake-up
+/// times are observables.
+///
+/// No wake-up is scheduled below `current_tip` (the chain tip the wallet has observed — for a
+/// freshly committed schedule, the commit height); a wake-up at exactly `current_tip` means
+/// "right now". A transfer whose deadline is already below the tip but which still needs a proof
+/// joins an immediate wake-up at exactly `current_tip` instead (mirroring
+/// [`advance_migration`], which offers `Prove` for it now); this is not an error. That
+/// immediate wake-up also absorbs any transfer whose proving window CONTAINS `current_tip` (i.e.
+/// whose clamped ready height is exactly `current_tip`): its mandatory piercing point covers them
+/// for free, which is what keeps the schedule minimal whenever overdue transfers are present.
+///
+/// Returns [`WakeupScheduleError::InfeasibleTransfer`] for a transfer whose broadcast height is
+/// not at least two blocks above its anchor boundary (no settle-then-prove height exists), which
+/// no schedule produced by this crate contains.
+///
+/// [`MigrationTransaction::anchor_boundary`]: crate::engine::MigrationTransaction::anchor_boundary
+/// [`advance_migration`]: crate::satisfiability::advance_migration
+pub fn schedule_sync_wakeups<T: Copy, R: RngCore + CryptoRng>(
+    params: &WakeupParams,
+    current_tip: BlockHeight,
+    transfers: &[(T, BlockHeight, BlockHeight)],
+    rng: &mut R,
+) -> Result<Vec<SyncWakeup<T>>, WakeupScheduleError<T>> {
+    let tip = u32::from(current_tip);
+    // A zero margin would place a wake-up AT the boundary height, where the boundary is not yet
+    // strictly below the tip and cannot be proved against; clamp up to one block.
+    let margin = params.settle_margin().max(1);
+
+    // Assemble each transfer's proving window `[ready, deadline]`, splitting off the overdue ones
+    // (deadline already below the tip).
+    let mut overdue: Vec<T> = Vec::new();
+    let mut windows: Vec<(u32, u32, T)> = Vec::new();
+    for &(id, anchor, broadcast) in transfers {
+        let a = u32::from(anchor);
+        let b = u32::from(broadcast);
+        if b <= a.saturating_add(1) {
+            return Err(WakeupScheduleError::InfeasibleTransfer(id));
+        }
+        let deadline = b - 1;
+        // The min-clamp keeps a window whose gap is below the margin feasible (tiny test-network
+        // intervals); the max-clamp keeps the wake-up out of the past.
+        let ready = a.saturating_add(margin).min(deadline).max(tip);
+        if deadline < tip {
+            overdue.push(id);
+        } else {
+            windows.push((deadline, ready, id));
+        }
+    }
+    windows.sort_by_key(|&(deadline, ready, _)| (deadline, ready));
+
+    // When an overdue transfer forces a mandatory wake-up at the tip, that wake-up's piercing
+    // point is fixed in advance; every window whose clamped ready height is exactly the tip (its
+    // proving window CONTAINS `current_tip`) is covered by it for free. Fold those ids into the
+    // immediate wake-up instead of letting them enter the greedy below, where they could open (or
+    // worse, drag later windows into) a suboptimal group. Without an overdue transfer there is no
+    // mandatory point, and the classic greedy over all windows is already optimal on its own.
+    if !overdue.is_empty() {
+        let mut surviving = Vec::with_capacity(windows.len());
+        for (deadline, ready, id) in windows {
+            if ready == tip {
+                overdue.push(id);
+            } else {
+                surviving.push((deadline, ready, id));
+            }
+        }
+        windows = surviving;
+    }
+
+    // Greedy grouping in deadline order: a window joins the open group iff it still contains the
+    // group's first (smallest) deadline; the group's wake-up point will lie in
+    // `[max_ready, first_deadline]`, which every member's window contains. A window that fails the
+    // open group fails every earlier (smaller-deadline) group too, so a new group is opened
+    // exactly when the classic optimal greedy would place a new piercing point.
+    struct Group<T> {
+        first_deadline: u32,
+        max_ready: u32,
+        covers: Vec<T>,
+    }
+    let mut groups: Vec<Group<T>> = Vec::new();
+    for (deadline, ready, id) in windows {
+        match groups.last_mut() {
+            Some(g) if ready <= g.first_deadline => {
+                g.max_ready = g.max_ready.max(ready);
+                g.covers.push(id);
+            }
+            _ => groups.push(Group {
+                first_deadline: deadline,
+                max_ready: ready,
+                covers: vec![id],
+            }),
+        }
+    }
+
+    // Assemble: an immediate wake-up covering the overdue transfers plus every window that
+    // contains `current_tip` (folded in above), then one jittered wake-up per surviving group.
+    // Every surviving group's ready height is strictly above the tip (windows landing on it were
+    // folded into the immediate wake-up), and group heights were already strictly increasing
+    // among themselves, so no merge between the immediate wake-up and the first group is needed.
+    let mut wakeups: Vec<SyncWakeup<T>> = Vec::with_capacity(groups.len() + 1);
+    if !overdue.is_empty() {
+        wakeups.push(SyncWakeup {
+            height: BlockHeight::from_u32(tip),
+            covers: overdue,
+        });
+    }
+    for g in groups {
+        let slack = g.first_deadline - g.max_ready;
+        let bound = params.jitter_cap().min(slack);
+        let jitter = if bound == 0 {
+            0
+        } else {
+            gen_index(rng, bound as usize + 1) as u32
+        };
+        let height = g.max_ready + jitter;
+        wakeups.push(SyncWakeup {
+            height: BlockHeight::from_u32(height),
+            covers: g.covers,
+        });
+    }
+    Ok(wakeups)
 }
 
 /// Assemble a [`Schedule`] for each part: draw the cumulative broadcast heights from `commit_height`
@@ -554,6 +742,13 @@ pub fn schedule<R: RngCore + CryptoRng>(
 /// number of failed fair-coin flips plus one (ZIP 318 ANCHOR-AGE-DRAW MUST). So `P(a = 1) = 1/2`,
 /// `P(a = 2) = 1/4`, ...; the modal age is 1, the mean age is 2, and age 0 (the most recent
 /// boundary) is NEVER produced. Each bit of a fresh `u64` is one fair coin flip.
+///
+/// Age 0 is excluded DELIBERATELY, declining a proposed ZIP 318 revision that would admit it: a
+/// transfer anchored to the most recent boundary must have been proved in the interval since that
+/// boundary, so when its broadcast falls close to the boundary, a light wallet server that also
+/// saw the wallet sync inside that narrow window can correlate the two by IP address. Ages `>= 1`
+/// keep the proving window at least one full boundary interval wide. See
+/// <https://github.com/zcash/zips/pull/1343#issuecomment-5124302101>.
 fn draw_anchor_age<R: RngCore>(rng: &mut R) -> u32 {
     let mut age: u32 = 1;
     loop {
@@ -593,15 +788,81 @@ pub fn draw_anchor_boundary<R: RngCore + CryptoRng>(
     chain_tip_height: BlockHeight,
     rng: &mut R,
 ) -> Option<BlockHeight> {
-    let most_recent = interval.boundary_at_or_below_u32(u32::from(chain_tip_height));
+    let most_recent = boundary_at_or_below_u32(&interval, u32::from(chain_tip_height));
     let (lowest, highest) = candidate_boundary_bounds(
         interval,
         u32::from(nu63_activation),
         u32::from(funding_creation_height),
         most_recent,
     )?;
+    Some(BlockHeight::from_u32(sample_recency_weighted_boundary(
+        interval,
+        lowest,
+        highest,
+        most_recent,
+        rng,
+    )))
+}
 
-    // Rejection-sample the geometric age until the candidate lands in [lowest, highest].
+/// Select a REPLACEMENT boundary for a transfer whose broadcast schedule has moved out from under
+/// its drawn anchor — the overdue shift
+/// ([`advance_migration`](crate::satisfiability::advance_migration)) defers every pending
+/// broadcast when a wallet resumes after downtime, and a boundary that was in-distribution for
+/// the ORIGINAL schedule sits `delta` blocks too old against the shifted one. With
+/// [`ANCHOR_AGE_CAP`] at 4 buckets, even a modest shift leaves an anchor age no honest draw
+/// produces, and every deferred transfer of one wallet would carry the SAME excess age — a
+/// linkable fingerprint. Redrawing against the new schedule restores the age distribution the
+/// anchor cohorts rely on.
+///
+/// The draw is [`draw_anchor_boundary`]'s recency-weighted draw against the NEW
+/// `broadcast_height`, with the candidate set floored at `prior_boundary` — the boundary being
+/// replaced — instead of the funding constraints: every note witnessable in the prior boundary's
+/// tree state is witnessable in every later one, so the floor preserves provability without the
+/// funding-note heights this crate's state does not hold. (A funding note that POSTDATES the
+/// prior boundary is the separate staleness `prove_transfer` re-validates and re-draws for at
+/// proving time, with the real mined heights in hand.) The prior boundary also subsumes the
+/// NU6.3-activation bound, which it satisfies by construction.
+///
+/// Returns `None` when no candidate at or above `prior_boundary` lies strictly below the most
+/// recent boundary at `broadcast_height` — possible only when the prior boundary was itself
+/// drawn against a tip past the new schedule (a proving-time re-draw followed by a small shift);
+/// the caller keeps the prior boundary, which remains provable.
+///
+/// [`prove_transfer`]: crate::engine::prove_transfer
+pub fn redraw_anchor_boundary<R: RngCore + CryptoRng>(
+    interval: AnchorBucketInterval,
+    prior_boundary: BlockHeight,
+    broadcast_height: BlockHeight,
+    rng: &mut R,
+) -> Option<BlockHeight> {
+    let most_recent = boundary_at_or_below_u32(&interval, u32::from(broadcast_height));
+    // Highest candidate: strictly below the most recent boundary (age >= 1), one interval down.
+    let highest = most_recent.checked_sub(interval.block_count().get())?;
+    let lowest = boundary_at_or_above_u32(&interval, u32::from(prior_boundary));
+    if lowest > highest {
+        return None;
+    }
+    Some(BlockHeight::from_u32(sample_recency_weighted_boundary(
+        interval,
+        lowest,
+        highest,
+        most_recent,
+        rng,
+    )))
+}
+
+/// The rejection-sampling core shared by [`draw_anchor_boundary`] and
+/// [`redraw_anchor_boundary`]: draw recency-weighted ages until `most_recent - age * interval`
+/// lands in `[lowest, highest]`, and return that candidate. The caller guarantees
+/// `lowest <= highest` and `highest = most_recent - interval` (both grid boundaries), so age 1
+/// always yields `highest` and the loop terminates.
+fn sample_recency_weighted_boundary<R: RngCore>(
+    interval: AnchorBucketInterval,
+    lowest: u32,
+    highest: u32,
+    most_recent: u32,
+    rng: &mut R,
+) -> u32 {
     loop {
         let age = draw_anchor_age(rng);
         if age > ANCHOR_AGE_CAP {
@@ -617,7 +878,7 @@ pub fn draw_anchor_boundary<R: RngCore + CryptoRng>(
             None => continue,
         };
         if candidate >= lowest && candidate <= highest {
-            return Some(BlockHeight::from_u32(candidate));
+            return candidate;
         }
     }
 }
@@ -649,10 +910,9 @@ fn lowest_candidate_boundary(
     nu63_activation: u32,
     funding_creation_height: u32,
 ) -> u32 {
-    let above_activation = interval
-        .boundary_at_or_below_u32(nu63_activation)
+    let above_activation = boundary_at_or_below_u32(&interval, nu63_activation)
         .saturating_add(interval.block_count().get());
-    let at_or_after_funding = interval.boundary_at_or_above_u32(funding_creation_height);
+    let at_or_after_funding = boundary_at_or_above_u32(&interval, funding_creation_height);
     above_activation.max(at_or_after_funding)
 }
 
@@ -681,6 +941,7 @@ mod tests {
     use proptest::prelude::*;
     use rand_chacha::ChaCha8Rng;
     use rand_core::SeedableRng;
+    use zcash_protocol::zip318::{PREP_DELAY_CAP, TRANSFER_DELAY_CAP};
 
     /// A seeded deterministic RNG for a proptest-drawn seed.
     fn rng(seed: u64) -> ChaCha8Rng {
@@ -695,20 +956,6 @@ mod tests {
     /// The ZIP 318 parameters, under which every golden vector in this module was captured.
     const P: SchedulingParams = SchedulingParams::ZIP_318;
 
-    /// The ZIP 318 anchor bucket interval as a raw block count, for arithmetic in test expectations.
-    const MODULUS: u32 = 144;
-
-    /// The ZIP 318 transfer delay cap, as a raw block count.
-    const MAX_DELAY: u32 = 576;
-
-    /// The ZIP 318 preparation delay cap, as a raw block count.
-    const PREP_MAX_DELAY: u32 = 96;
-
-    /// The ZIP 318 anchor bucket interval.
-    fn modulus() -> AnchorBucketInterval {
-        AnchorBucketInterval::ZIP_318
-    }
-
     /// An anchor bucket interval of `blocks` blocks.
     fn interval(blocks: u32) -> AnchorBucketInterval {
         AnchorBucketInterval::custom(NonZeroU32::new(blocks).expect("nonzero"))
@@ -718,42 +965,6 @@ mod tests {
     /// checking that the boundary logic follows the configured grid.
     fn params_with_interval(blocks: u32) -> SchedulingParams {
         SchedulingParams::new(interval(blocks), P.transfer_delay(), P.preparation_delay())
-    }
-
-    #[cfg(feature = "wallet")]
-    proptest! {
-        /// The wallet's `AnchorRetentionInterval` and this crate's `AnchorBucketInterval` implement
-        /// the same boundary arithmetic in two places. The `From` conversion is the seam between
-        /// them, and this is what keeps the two implementations from drifting: for any height and
-        /// any interval, converting and then asking must give the same answer as asking the
-        /// wallet's type directly.
-        ///
-        /// A drift here is exactly the failure this whole design exists to prevent — a migration
-        /// anchoring to a height the wallet does not consider a boundary, and so does not retain.
-        #[test]
-        fn conversion_preserves_the_boundary_arithmetic(
-            h in 0u32..5_000_000,
-            blocks in 1u32..10_000,
-        ) {
-            use zcash_client_backend::data_api::anchor_retention::AnchorRetentionInterval;
-
-            let retention = AnchorRetentionInterval::custom(
-                NonZeroU32::new(blocks).expect("nonzero"),
-            );
-            let bucket = AnchorBucketInterval::from(retention);
-            let height = bh(h);
-
-            prop_assert_eq!(bucket.block_count(), retention.block_count());
-            prop_assert_eq!(bucket.is_boundary(height), retention.is_boundary(height));
-            prop_assert_eq!(
-                bucket.boundary_at_or_below(height),
-                retention.boundary_at_or_below(height)
-            );
-            prop_assert_eq!(
-                bucket.boundary_at_or_above(height),
-                retention.boundary_at_or_above(height)
-            );
-        }
     }
 
     // --- AnchorBucketInterval boundary helpers ------------------------------------------------
@@ -784,12 +995,13 @@ mod tests {
     /// Assert one hand-derived [`AnchorBucketInterval::boundary_at_or_below`] value plus its
     /// invariants (a boundary, `<= height`, and within one interval of it) at the ZIP 318 interval.
     fn check_most_recent_boundary_golden(height: u32, expected: u32) {
-        let b = u32::from(modulus().boundary_at_or_below(bh(height)));
+        let i = P.anchor_bucket_interval();
+        let b = u32::from(i.boundary_at_or_below(bh(height)));
         assert_eq!(b, expected, "boundary_at_or_below({height})");
-        assert!(modulus().is_boundary(bh(b)), "not a boundary");
+        assert!(i.is_boundary(bh(b)), "not a boundary");
         assert!(b <= height, "boundary {b} above height {height}");
         assert!(
-            height - b < MODULUS,
+            height - b < i.block_count().get(),
             "boundary {b} more than an interval below {height}"
         );
     }
@@ -847,21 +1059,23 @@ mod tests {
     /// the ZIP 318 shape compressed rather than a distorted one.
     #[test]
     fn default_distributions_scale_with_the_interval() {
-        // A twelfth of the ZIP 318 interval: 12 blocks per bucket.
+        // A twelfth of the ZIP 318 interval: 12 blocks per bucket, so every delay parameter is a
+        // twelfth of its ZIP 318 value, truncated.
         let p = SchedulingParams::new_with_default_distributions(interval(12));
-        assert_eq!(p.transfer_delay().mean().get(), 12);
-        assert_eq!(p.transfer_delay().cap().get(), 48);
-        assert_eq!(p.preparation_delay().mean().get(), 2);
-        assert_eq!(p.preparation_delay().cap().get(), 8);
+        assert_eq!(p.transfer_delay().mean().get(), 5); // floor(66 / 12)
+        assert_eq!(p.transfer_delay().cap().get(), 48); // 576 / 12
+        assert_eq!(p.preparation_delay().mean().get(), 1); // floor(16 / 12)
+        assert_eq!(p.preparation_delay().cap().get(), 8); // 96 / 12
     }
 
     /// Every bucket interval yields a usable pair of distributions, including the degenerate ends:
-    /// an interval below the preparation divisor would truncate that mean to zero, and a very large
-    /// one would overflow the caps.
+    /// a short enough interval would truncate the preparation mean to zero, and a very large one
+    /// would overflow the caps.
     #[test]
     fn default_distributions_are_usable_at_the_extremes() {
-        // Below `PREP_MEAN_DIVISOR` the preparation mean truncates to zero, and is clamped up.
-        for blocks in 1..=PREP_MEAN_DIVISOR.get() {
+        // Up to 8 blocks per bucket the scaled preparation mean (16 * blocks / 144) truncates to
+        // zero, and is clamped up.
+        for blocks in 1..=8 {
             let p = SchedulingParams::new_with_default_distributions(interval(blocks));
             assert_eq!(p.preparation_delay().mean(), NonZeroU32::MIN, "{blocks}");
             assert!(p.preparation_delay().cap() >= p.preparation_delay().mean());
@@ -920,7 +1134,8 @@ mod tests {
     #[test]
     fn delay_mean_is_near_expected() {
         // Sanity on the distribution: the truncated-exponential mean sits below MEAN_DELAY (the
-        // tail past MAX_DELAY is removed). Large sample keeps this deterministic and robust.
+        // tail past TRANSFER_DELAY_CAP is removed). Large sample keeps this deterministic and
+        // robust.
         let mut r = rng(42);
         let n = 20_000u64;
         let mut sum = 0u64;
@@ -928,9 +1143,10 @@ mod tests {
             sum += u64::from(P.transfer_delay().draw(&mut r));
         }
         let mean = sum as f64 / n as f64;
-        // Analytic truncated mean is ~124 blocks; allow a wide band.
+        // The cap sits at more than eight means, so truncation barely bites: the analytic
+        // truncated mean is ~65.9 blocks. Allow a wide band.
         assert!(
-            (100.0..150.0).contains(&mean),
+            (60.0..72.0).contains(&mean),
             "empirical mean {mean} out of expected band"
         );
     }
@@ -944,22 +1160,389 @@ mod tests {
             .map(|_| P.transfer_delay().draw(&mut r))
             .collect();
         assert_eq!(got, expected, "transfer_delay().draw(seed={seed})");
+        let cap = TRANSFER_DELAY_CAP.get();
         for &d in &got {
-            assert!(d <= MAX_DELAY, "delay {d} exceeds the cap {MAX_DELAY}");
+            assert!(d <= cap, "delay {d} exceeds the cap {cap}");
         }
     }
 
     /// Golden vectors for the ZIP 318 transfer delay over several seeds. These are the captured deterministic
     /// draws; the `seed=1` sequence matches the per-step gaps pinned in
-    /// [`schedule_broadcast_heights_golden`] (74, 12, 131, 36, 48, ...).
+    /// [`schedule_broadcast_heights_golden`] (34, 6, 60, 16, 22, ...).
     #[test]
     fn draw_delay_golden() {
-        let exp_seed1 = [74, 12, 131, 36, 48, 179, 89, 24];
-        let exp_seed42 = [165, 432, 80, 142, 49, 23, 53, 235];
-        let exp_seed7 = [25, 26, 175, 187, 132, 64, 12, 273];
+        let exp_seed1 = [34, 6, 60, 16, 22, 82, 41, 11];
+        let exp_seed42 = [76, 198, 37, 65, 22, 11, 24, 108];
+        let exp_seed7 = [11, 12, 80, 86, 61, 29, 6, 125];
         check_delay_golden(1, &exp_seed1);
         check_delay_golden(42, &exp_seed42);
         check_delay_golden(7, &exp_seed7);
+    }
+
+    // --- schedule_sync_wakeups ----------------------------------------------------------------
+
+    /// The provisional default wake-up parameters: the task-specified 10-block settle margin and a
+    /// 12-block (about 15 minute) thundering-herd jitter cap.
+    #[test]
+    fn wakeup_params_default() {
+        assert_eq!(WakeupParams::DEFAULT.settle_margin(), 10);
+        assert_eq!(WakeupParams::DEFAULT.jitter_cap(), 12);
+        assert_eq!(WakeupParams::default(), WakeupParams::DEFAULT);
+        let custom = WakeupParams::new(3, 5);
+        assert_eq!(custom.settle_margin(), 3);
+        assert_eq!(custom.jitter_cap(), 5);
+    }
+
+    /// The infeasibility error names the offending transfer and renders a diagnostic.
+    #[test]
+    fn wakeup_error_display() {
+        let e = WakeupScheduleError::InfeasibleTransfer(7u32);
+        assert_eq!(
+            alloc::format!("{e}"),
+            "transfer 7 has no height at which its anchor has settled strictly before its broadcast"
+        );
+    }
+
+    /// No pending transfers need no wake-ups.
+    #[test]
+    fn no_transfers_no_wakeups() {
+        let got = schedule_sync_wakeups::<u32, _>(&WakeupParams::DEFAULT, bh(0), &[], &mut rng(1))
+            .expect("an empty schedule is feasible");
+        assert!(got.is_empty());
+    }
+
+    /// A single transfer gets one wake-up inside its proving window: at or after its anchor plus
+    /// the settle margin, within the jitter cap of that base, and strictly before its broadcast.
+    #[test]
+    fn single_transfer_single_wakeup() {
+        let wakeups = schedule_sync_wakeups(
+            &WakeupParams::DEFAULT,
+            bh(0),
+            &[(7u32, bh(1440), bh(1600))],
+            &mut rng(1),
+        )
+        .expect("feasible");
+        assert_eq!(wakeups.len(), 1);
+        let w = u32::from(wakeups[0].height());
+        assert!(
+            (1450..=1450 + WakeupParams::DEFAULT.jitter_cap()).contains(&w),
+            "height {w} outside jitter range"
+        );
+        assert!(w < 1600, "height {w} not before the broadcast");
+        assert_eq!(wakeups[0].covers(), &[7]);
+    }
+
+    /// A broadcast not at least two blocks above its anchor admits no settle-then-prove height.
+    #[test]
+    fn adjacent_broadcast_is_infeasible() {
+        for (id, a, b) in [(1u32, 100, 101), (2, 100, 100), (3, 100, 99)] {
+            assert_eq!(
+                schedule_sync_wakeups(
+                    &WakeupParams::DEFAULT,
+                    bh(0),
+                    &[(id, bh(a), bh(b))],
+                    &mut rng(1)
+                ),
+                Err(WakeupScheduleError::InfeasibleTransfer(id)),
+            );
+        }
+    }
+
+    /// Transfers whose proving windows overlap share one wake-up at the latest ready height among
+    /// them (a bucketed anchor + margin), which is what makes the schedule minimal.
+    #[test]
+    fn overlapping_windows_share_a_wakeup() {
+        // Jitter cap 0 makes the chosen heights exact. Windows [154, 999] and [298, 1099] overlap.
+        let wakeups = schedule_sync_wakeups(
+            &WakeupParams::new(10, 0),
+            bh(0),
+            &[(0u32, bh(144), bh(1000)), (1, bh(288), bh(1100))],
+            &mut rng(1),
+        )
+        .expect("feasible");
+        assert_eq!(wakeups.len(), 1);
+        assert_eq!(u32::from(wakeups[0].height()), 298);
+        assert_eq!(wakeups[0].covers(), &[0, 1]);
+    }
+
+    /// A transfer whose window opens after an earlier group's deadline gets its own wake-up.
+    #[test]
+    fn disjoint_windows_get_separate_wakeups() {
+        // Window [154, 299] closes before window [1450, 2000] opens.
+        let wakeups = schedule_sync_wakeups(
+            &WakeupParams::new(10, 0),
+            bh(0),
+            &[(0u32, bh(144), bh(300)), (1, bh(1440), bh(2001))],
+            &mut rng(1),
+        )
+        .expect("feasible");
+        assert_eq!(wakeups.len(), 2);
+        assert_eq!(u32::from(wakeups[0].height()), 154);
+        assert_eq!(wakeups[0].covers(), &[0]);
+        assert_eq!(u32::from(wakeups[1].height()), 1450);
+        assert_eq!(wakeups[1].covers(), &[1]);
+    }
+
+    /// A transfer whose broadcast deadline already passed while it is unproved joins an immediate
+    /// wake-up at `current_tip`, which also absorbs any transfer whose proving window contains
+    /// `current_tip`.
+    #[test]
+    fn overdue_transfers_wake_immediately() {
+        let wakeups = schedule_sync_wakeups(
+            &WakeupParams::new(10, 0),
+            bh(5000),
+            &[
+                (0u32, bh(144), bh(300)), // deadline 299 < 5000: overdue
+                (1, bh(4320), bh(6000)), // window [4330, 5999] contains 5000: absorbed into the immediate wake-up
+                (2, bh(7200), bh(8000)), // ready 7210: its own group
+            ],
+            &mut rng(1),
+        )
+        .expect("feasible");
+        assert_eq!(wakeups.len(), 2);
+        assert_eq!(u32::from(wakeups[0].height()), 5000);
+        assert_eq!(wakeups[0].covers(), &[0, 1]);
+        assert_eq!(u32::from(wakeups[1].height()), 7210);
+        assert_eq!(wakeups[1].covers(), &[2]);
+    }
+
+    /// When an overdue transfer forces an immediate wake-up, a transfer whose proving window
+    /// contains `current_tip` is absorbed by that mandatory wake-up even under nonzero jitter,
+    /// rather than paying for a jittered wake-up of its own.
+    #[test]
+    fn overdue_wakeup_absorbs_contained_windows_despite_jitter() {
+        let wakeups = schedule_sync_wakeups(
+            &WakeupParams::DEFAULT, // jitter cap 12: a separate group would almost surely jitter off 5000
+            bh(5000),
+            &[
+                (0u32, bh(144), bh(300)), // deadline 299 < 5000: overdue
+                (1, bh(4320), bh(6000)),  // window [4330, 5999] contains 5000: absorbed
+            ],
+            &mut rng(1),
+        )
+        .expect("feasible");
+        assert_eq!(wakeups.len(), 1);
+        assert_eq!(u32::from(wakeups[0].height()), 5000);
+        assert_eq!(wakeups[0].covers(), &[0, 1]);
+    }
+
+    /// Folding `current_tip`-containing windows into the mandatory wake-up keeps the schedule
+    /// minimal even when such a window would otherwise drag later windows into a worse grouping:
+    /// here the greedy over all three windows would produce three wake-ups, but the mandatory
+    /// point covers the first window for free, letting the remaining two share one.
+    #[test]
+    fn overdue_wakeup_folding_preserves_minimality() {
+        let wakeups = schedule_sync_wakeups(
+            &WakeupParams::new(10, 0),
+            bh(100),
+            &[
+                (0u32, bh(10), bh(50)), // overdue
+                (1, bh(50), bh(106)), // window clamps to [100, 105]: absorbed by the mandatory point
+                (2, bh(92), bh(111)), // window [102, 110]
+                (3, bh(96), bh(301)), // window [106, 300]: groups with the previous one
+            ],
+            &mut rng(1),
+        )
+        .expect("feasible");
+        assert_eq!(wakeups.len(), 2);
+        assert_eq!(u32::from(wakeups[0].height()), 100);
+        assert_eq!(wakeups[0].covers(), &[0, 1]);
+        assert_eq!(u32::from(wakeups[1].height()), 106);
+        assert_eq!(wakeups[1].covers(), &[2, 3]);
+    }
+
+    /// At a tiny custom bucket interval the default margin exceeds the anchor->broadcast gap; the
+    /// ready height clamps to the deadline so the schedule stays feasible.
+    #[test]
+    fn tiny_interval_clamps_the_margin() {
+        let wakeups = schedule_sync_wakeups(
+            &WakeupParams::new(10, 0),
+            bh(0),
+            &[(0u32, bh(100), bh(104))], // window would be [110, 103]; ready clamps to 103
+            &mut rng(1),
+        )
+        .expect("feasible");
+        assert_eq!(u32::from(wakeups[0].height()), 103);
+    }
+
+    /// A zero settle margin is clamped up to one block: a wake-up AT the boundary height cannot
+    /// prove against it (the boundary must be strictly below the tip).
+    #[test]
+    fn zero_margin_clamps_to_one() {
+        let wakeups = schedule_sync_wakeups(
+            &WakeupParams::new(0, 0),
+            bh(0),
+            &[(0u32, bh(100), bh(300))],
+            &mut rng(1),
+        )
+        .expect("feasible");
+        assert_eq!(u32::from(wakeups[0].height()), 101);
+    }
+
+    /// A brute-force optimum for the piercing problem: the fewest points covering every window
+    /// `(ready, deadline)`, with candidate points drawn from the window deadlines (an optimal
+    /// solution always exists on deadlines: any piercing point can be shifted up to the deadline
+    /// of the earliest-ending window it pierces without uncovering anything). Exponential in the
+    /// window count; usable only for the small inputs the minimality proptest generates.
+    fn brute_force_min_wakeups(windows: &[(u32, u32)]) -> usize {
+        let n = windows.len();
+        let candidates: Vec<u32> = windows.iter().map(|&(_, d)| d).collect();
+        let mut best = n;
+        for mask in 0u32..(1u32 << n) {
+            let covers_all = windows.iter().all(|&(r, d)| {
+                (0..n).any(|j| mask & (1 << j) != 0 && r <= candidates[j] && candidates[j] <= d)
+            });
+            if covers_all {
+                best = best.min(mask.count_ones() as usize);
+            }
+        }
+        best
+    }
+
+    proptest! {
+        /// Every transfer is covered by exactly one wake-up, inside its proving window (or at
+        /// exactly `current_tip` when overdue); no wake-up is scheduled in the past; wake heights
+        /// strictly increase.
+        #[test]
+        fn wakeups_cover_every_transfer(
+            seed in any::<u64>(),
+            tip in 0u32..3_000_000,
+            xs in prop::collection::vec((0u32..2_000_000, 2u32..100_000), 1..40),
+        ) {
+            let transfers: Vec<(usize, BlockHeight, BlockHeight)> = xs
+                .iter()
+                .enumerate()
+                .map(|(i, &(a, gap))| (i, bh(a), bh(a + gap)))
+                .collect();
+            let wakeups =
+                schedule_sync_wakeups(&WakeupParams::DEFAULT, bh(tip), &transfers, &mut rng(seed))
+                    .expect("a gap of at least 2 blocks is feasible");
+            let margin = WakeupParams::DEFAULT.settle_margin().max(1);
+
+            let mut prev: Option<u32> = None;
+            for w in &wakeups {
+                let h = u32::from(w.height());
+                prop_assert!(h >= tip, "wake-up {h} below the tip {tip}");
+                if let Some(p) = prev {
+                    prop_assert!(h > p, "wake-up heights not strictly increasing");
+                }
+                prev = Some(h);
+            }
+
+            let mut covered = alloc::vec![0usize; transfers.len()];
+            for w in &wakeups {
+                let h = u32::from(w.height());
+                for &i in w.covers() {
+                    covered[i] += 1;
+                    let (a, gap) = xs[i];
+                    let deadline = a + gap - 1;
+                    if deadline < tip {
+                        prop_assert_eq!(h, tip, "overdue transfer {} not woken immediately", i);
+                    } else {
+                        let ready = a.saturating_add(margin).min(deadline).max(tip);
+                        prop_assert!(h >= ready, "wake-up {h} before transfer {}'s window", i);
+                        prop_assert!(h <= deadline, "wake-up {h} after transfer {}'s deadline", i);
+                    }
+                }
+            }
+            prop_assert!(
+                covered.iter().all(|&c| c == 1),
+                "every transfer must be covered exactly once: {covered:?}"
+            );
+        }
+
+        /// The wake-up count is MINIMAL: it equals the brute-force optimum over the clamped
+        /// proving windows — plus, when overdue transfers force a mandatory immediate wake-up,
+        /// exactly one for that wake-up, with every window containing `current_tip` covered by it
+        /// for free.
+        #[test]
+        fn wakeup_count_is_minimal(
+            seed in any::<u64>(),
+            tip in 0u32..15_000,
+            xs in prop::collection::vec((0u32..10_000, 2u32..2_000), 1..8),
+        ) {
+            let transfers: Vec<(usize, BlockHeight, BlockHeight)> = xs
+                .iter()
+                .enumerate()
+                .map(|(i, &(a, gap))| (i, bh(a), bh(a + gap)))
+                .collect();
+            let wakeups =
+                schedule_sync_wakeups(&WakeupParams::DEFAULT, bh(tip), &transfers, &mut rng(seed))
+                    .expect("feasible");
+            let margin = WakeupParams::DEFAULT.settle_margin().max(1);
+            let mut overdue_exists = false;
+            let mut windows: Vec<(u32, u32)> = Vec::new();
+            for &(a, gap) in &xs {
+                let deadline = a + gap - 1;
+                if deadline < tip {
+                    overdue_exists = true;
+                } else {
+                    windows.push((a.saturating_add(margin).min(deadline).max(tip), deadline));
+                }
+            }
+            let expected = if overdue_exists {
+                // The mandatory wake-up at `current_tip` covers every window containing it for
+                // free; only the windows opening strictly after it need piercing.
+                windows.retain(|&(ready, _)| ready > tip);
+                1 + brute_force_min_wakeups(&windows)
+            } else {
+                brute_force_min_wakeups(&windows)
+            };
+            prop_assert_eq!(wakeups.len(), expected);
+        }
+    }
+
+    /// Assert one golden wake-up schedule for a fixed input and seed, pinning the exact
+    /// deterministic [`ChaCha8Rng`] jitter draws as a regression guard. Inputs are ZIP 318-shaped:
+    /// anchors on the 144-block grid, broadcasts a few hundred blocks later.
+    fn check_sync_wakeups_golden(
+        seed: u64,
+        transfers: &[(u32, u32, u32)],
+        expected: &[(u32, &[u32])],
+    ) {
+        let input: Vec<(u32, BlockHeight, BlockHeight)> = transfers
+            .iter()
+            .map(|&(id, a, b)| (id, bh(a), bh(b)))
+            .collect();
+        let wakeups = schedule_sync_wakeups(&WakeupParams::DEFAULT, bh(0), &input, &mut rng(seed))
+            .expect("feasible");
+        let got: Vec<(u32, Vec<u32>)> = wakeups
+            .iter()
+            .map(|w| (u32::from(w.height()), w.covers().to_vec()))
+            .collect();
+        let exp: Vec<(u32, Vec<u32>)> = expected.iter().map(|&(h, c)| (h, c.to_vec())).collect();
+        assert_eq!(got, exp, "schedule_sync_wakeups(seed={seed})");
+    }
+
+    /// Golden vectors for [`schedule_sync_wakeups`]: fixed inputs and seeds pinned to their exact
+    /// wake-up schedules (heights are group-base + jitter; the jitter is the pinned draw).
+    #[test]
+    fn sync_wakeups_golden() {
+        // One cohort pair sharing a wake-up plus a distant third transfer.
+        check_sync_wakeups_golden(
+            1,
+            &[(0, 1440, 1700), (1, 1584, 1800), (2, 4320, 4600)],
+            // heights: max(1440, 1584) + 10 + j1 = 1594 + 5 = 1599 (group of [0, 1]),
+            // 4320 + 10 + j2 = 4330 + 1 = 4331 (transfer 2 alone) — bases are the group max
+            // anchors + 10.
+            &[(1599, &[0, 1]), (4331, &[2])],
+        );
+        // A longer mixed schedule under a different seed.
+        check_sync_wakeups_golden(
+            42,
+            &[
+                (0, 144, 400),
+                (1, 288, 500),
+                (2, 288, 600),
+                (3, 1440, 1700),
+                (4, 2880, 3200),
+            ],
+            // heights: max(144, 288, 288) + 10 + j0 = 298 + 8 = 306 (group of [0, 1, 2]),
+            // 1440 + 10 + j1 = 1450 + 12 = 1462 (transfer 3 alone),
+            // 2880 + 10 + j2 = 2890 + 5 = 2895 (transfer 4 alone) — bases are the group max
+            // anchors + 10.
+            &[(306, &[0, 1, 2]), (1462, &[3]), (2895, &[4])],
+        );
     }
 
     // --- shuffle ------------------------------------------------------------------------------
@@ -1075,7 +1658,7 @@ mod tests {
     /// `(commit, n, seed)`, plus the structural invariants they must satisfy. The heights are captured
     /// from the deterministic [`ChaCha8Rng`], so they pin the exact delay draws as a regression guard;
     /// the invariant checks keep each vector auditable by eye, since each per-step GAP is the drawn
-    /// inter-arrival delay and must be a valid `[0, MAX_DELAY]` value.
+    /// inter-arrival delay and must be a valid `[0, TRANSFER_DELAY_CAP]` value.
     fn check_schedule_golden(commit: u32, n: usize, seed: u64, expected: &[u32]) {
         let hs: Vec<u32> = schedule_broadcast_heights(&P, bh(commit), n, &mut rng(seed))
             .into_iter()
@@ -1083,6 +1666,7 @@ mod tests {
             .collect();
         assert_eq!(hs, expected, "schedule({commit}, {n}, seed={seed})");
         assert_eq!(hs.len(), n);
+        let cap = TRANSFER_DELAY_CAP.get();
         let mut prev = commit;
         for &h in &hs {
             assert!(
@@ -1090,40 +1674,40 @@ mod tests {
                 "heights must be non-decreasing (commit {commit})"
             );
             let gap = h - prev;
-            assert!(gap <= MAX_DELAY, "delay {gap} exceeds the cap {MAX_DELAY}");
+            assert!(gap <= cap, "delay {gap} exceeds the cap {cap}");
             prev = h;
         }
     }
 
     /// Golden vectors for the cumulative broadcast schedule: fixed `(commit, n, seed)` triples pinned
     /// to their exact height sequences (a regression guard on the delay sampling), with the per-step
-    /// gaps noted so the drawn delays are visible. The ZIP 318 transfer delay has mean 144 blocks
+    /// gaps noted so the drawn delays are visible. The ZIP 318 transfer delay has mean 66 blocks
     /// and cap 576.
     #[test]
     fn schedule_broadcast_heights_golden() {
         // n = 0 schedules nothing, whatever the seed.
         check_schedule_golden(1_000_000, 0, 1, &[]);
-        // gaps: 74, 12, 131, 36, 48
+        // gaps: 34, 6, 60, 16, 22
         check_schedule_golden(
             1_000_000,
             5,
             1,
-            &[1_000_074, 1_000_086, 1_000_217, 1_000_253, 1_000_301],
+            &[1_000_034, 1_000_040, 1_000_100, 1_000_116, 1_000_138],
         );
-        // gaps: 165, 432, 80, 142, 49, 23, 53, 235
+        // gaps: 76, 198, 37, 65, 22, 11, 24, 108
         check_schedule_golden(
             2_000_000,
             8,
             42,
             &[
-                2_000_165, 2_000_597, 2_000_677, 2_000_819, 2_000_868, 2_000_891, 2_000_944,
-                2_001_179,
+                2_000_076, 2_000_274, 2_000_311, 2_000_376, 2_000_398, 2_000_409, 2_000_433,
+                2_000_541,
             ],
         );
-        // gaps: 25, 26, 175
-        check_schedule_golden(500_000, 3, 7, &[500_025, 500_051, 500_226]);
-        // commit height 0; gaps: 11, 6, 225, 58, 13, 28
-        check_schedule_golden(0, 6, 12_345, &[11, 17, 242, 300, 313, 341]);
+        // gaps: 11, 12, 80
+        check_schedule_golden(500_000, 3, 7, &[500_011, 500_023, 500_103]);
+        // commit height 0; gaps: 5, 3, 103, 27, 6, 13
+        check_schedule_golden(0, 6, 12_345, &[5, 8, 111, 138, 144, 157]);
     }
 
     proptest! {
@@ -1139,7 +1723,7 @@ mod tests {
             let mut prev = bh(start);
             for h in hs {
                 prop_assert!(h >= prev);
-                prop_assert!(u32::from(h) - u32::from(prev) <= PREP_MAX_DELAY);
+                prop_assert!(u32::from(h) - u32::from(prev) <= PREP_DELAY_CAP.get());
                 prev = h;
             }
         }
@@ -1148,8 +1732,8 @@ mod tests {
     /// Golden vectors for the ZIP 318 preparation delay: the exact deterministic draws for fixed
     /// seeds, pinning the tighter preparation spacing as a regression guard, with every delay within
     /// its cap. Derivable from the transfer goldens in [`draw_delay_golden`] by the scale law: the
-    /// same unit draws scaled by the mean ratio `144 / 24 = 6` (for example seed 1's 74, 12, 131,
-    /// ... become 12, 2, 22, ...).
+    /// same unit draws scaled by the mean ratio `16 / 66` (for example seed 1's 34, 6, 60, ...
+    /// become 8, 1, 15, ...).
     #[test]
     fn draw_prep_delay_golden() {
         fn check(seed: u64, expected: &[u32]) {
@@ -1159,11 +1743,14 @@ mod tests {
                 .collect();
             assert_eq!(got, expected, "preparation_delay().draw(seed={seed})");
             for &d in &got {
-                assert!(d <= PREP_MAX_DELAY, "delay {d} exceeds the preparation cap");
+                assert!(
+                    d <= PREP_DELAY_CAP.get(),
+                    "delay {d} exceeds the preparation cap"
+                );
             }
         }
-        let exp_seed1 = [12, 2, 22, 6, 8, 30, 15, 4];
-        let exp_seed42 = [27, 72, 13, 24, 8, 4, 9, 39];
+        let exp_seed1 = [8, 1, 15, 4, 5, 20, 10, 3];
+        let exp_seed42 = [18, 48, 9, 16, 5, 3, 6, 26];
         check(1, &exp_seed1);
         check(42, &exp_seed42);
     }
@@ -1236,7 +1823,7 @@ mod tests {
             |(act, span_boundaries, blocks, tip_offset)| {
                 let i = interval(blocks);
                 let most_recent =
-                    (i.boundary_at_or_below_u32(act) + span_boundaries * blocks).max(blocks);
+                    (boundary_at_or_below_u32(&i, act) + span_boundaries * blocks).max(blocks);
                 let tip = most_recent + (tip_offset % blocks);
                 // funding creation anywhere from activation up to the highest candidate boundary.
                 let highest = most_recent - blocks;
@@ -1255,7 +1842,7 @@ mod tests {
                                    seed in any::<u64>()) {
             let mut r = rng(seed);
             let blocks = i.block_count().get();
-            let most_recent = i.boundary_at_or_below_u32(tip);
+            let most_recent = boundary_at_or_below_u32(&i, tip);
             let chosen = draw_anchor_boundary(i, bh(act), bh(funding), bh(tip), &mut r);
             prop_assert!(chosen.is_some());
             let b = u32::from(chosen.unwrap());
@@ -1294,7 +1881,7 @@ mod tests {
 
     #[test]
     fn anchor_empty_candidate_set_is_none() {
-        for blocks in [MODULUS, 12] {
+        for blocks in [AnchorBucketInterval::ZIP_318.block_count().get(), 12] {
             let i = interval(blocks);
             let mut r = rng(1);
             // Chain tip below the second boundary: no candidate strictly below the derived boundary
@@ -1338,7 +1925,7 @@ mod tests {
 
     #[test]
     fn anchor_funding_after_most_recent_is_none() {
-        for blocks in [MODULUS, 12] {
+        for blocks in [AnchorBucketInterval::ZIP_318.block_count().get(), 12] {
             let i = interval(blocks);
             let mut r = rng(2);
             // Funding note created after the tip's most recent boundary: nothing at/after it can be
@@ -1358,8 +1945,8 @@ mod tests {
     /// boundary derived from `chain_tip`, at/after `funding`, and with an age in
     /// `[1, ANCHOR_AGE_CAP]`.
     fn check_anchor_golden(act: u32, funding: u32, chain_tip: u32, seed: u64, expected: &[u32]) {
-        let i = modulus();
-        let most_recent = i.boundary_at_or_below_u32(chain_tip);
+        let i = P.anchor_bucket_interval();
+        let most_recent = boundary_at_or_below_u32(&i, chain_tip);
         let mut r = rng(seed);
         let got: Vec<u32> = (0..expected.len())
             .map(|_| {
@@ -1386,7 +1973,7 @@ mod tests {
                 b >= funding,
                 "boundary {b} must be at/after funding {funding}"
             );
-            let age = (most_recent - b) / MODULUS;
+            let age = (most_recent - b) / i.block_count().get();
             assert!(
                 (1..=ANCHOR_AGE_CAP).contains(&age),
                 "age {age} out of [1, cap]"
@@ -1395,25 +1982,93 @@ mod tests {
     }
 
     /// Golden vectors for [`draw_anchor_boundary`]. The candidate set spans boundaries `288..=2736`
-    /// (`act = 144`, `funding = 288`, chain tip `2880`); each pinned sequence is the exact
-    /// recency-weighted draw, and every entry is checked against the candidate-set invariants. The
-    /// modal pick is the highest candidate 2736 (age 1), as the `Geometric(1/2)` age draw expects.
-    /// A tip in the middle of the same boundary interval derives the same boundary and must
-    /// reproduce the same vectors.
+    /// (`act = 144`, `funding = 288`, chain tip `2880`), of which the `ANCHOR_AGE_CAP` of 4
+    /// boundaries admits only `2304..=2736`; each pinned sequence is the exact recency-weighted
+    /// draw, and every entry is checked against the candidate-set invariants. The modal pick is the
+    /// highest candidate 2736 (age 1), as the `Geometric(1/2)` age draw expects. A tip in the
+    /// middle of the same boundary interval derives the same boundary and must reproduce the same
+    /// vectors.
     #[test]
     fn draw_anchor_boundary_golden() {
-        let (act, funding, tip) = (MODULUS, 2 * MODULUS, 20 * MODULUS);
+        let m = AnchorBucketInterval::ZIP_318.block_count().get();
+        let (act, funding, tip) = (m, 2 * m, 20 * m);
         let exp_seed1 = [2736, 2736, 2736, 2592, 2736, 2304];
-        let exp_seed42 = [2736, 2304, 2448, 2592, 2160, 2592];
+        let exp_seed42 = [2736, 2304, 2448, 2592, 2592, 2448];
         let exp_seed7 = [2736, 2592, 2736, 2736, 2304, 2592];
-        let exp_seed100 = [2592, 2736, 2736, 2592, 2016, 2736];
+        let exp_seed100 = [2592, 2736, 2736, 2592, 2736, 2736];
         check_anchor_golden(act, funding, tip, 1, &exp_seed1);
         check_anchor_golden(act, funding, tip, 42, &exp_seed42);
         check_anchor_golden(act, funding, tip, 7, &exp_seed7);
         check_anchor_golden(act, funding, tip, 100, &exp_seed100);
         // A mid-interval tip (not itself a boundary) must yield identical draws.
         check_anchor_golden(act, funding, tip + 100, 1, &exp_seed1);
-        check_anchor_golden(act, funding, tip + MODULUS - 1, 42, &exp_seed42);
+        check_anchor_golden(act, funding, tip + m - 1, 42, &exp_seed42);
+    }
+
+    // --- redraw_anchor_boundary ---------------------------------------------------------------
+
+    proptest! {
+        /// A replacement boundary, when one exists, is on the grid, at or above the boundary it
+        /// replaces, and in-distribution against the NEW broadcast height: within
+        /// [`ANCHOR_AGE_CAP`] buckets strictly below its most recent grid boundary. `None` arises
+        /// exactly when no candidate at or above the prior boundary lies strictly below that
+        /// most recent boundary.
+        #[test]
+        fn redraw_anchor_boundary_props(
+            seed in any::<u64>(),
+            prior_bucket in 0u32..100,
+            broadcast in 0u32..5_000_000,
+            blocks in 2u32..10_000,
+        ) {
+            let i = interval(blocks);
+            let prior = prior_bucket.saturating_mul(blocks);
+            let chosen = redraw_anchor_boundary(i, bh(prior), bh(broadcast), &mut rng(seed));
+            let most_recent = broadcast - (broadcast % blocks);
+            match chosen {
+                Some(b) => {
+                    let b = u32::from(b);
+                    prop_assert!(i.is_boundary(bh(b)));
+                    prop_assert!(b >= prior, "replacement {b} regressed below the prior {prior}");
+                    prop_assert!(b < most_recent, "age >= 1: strictly below {most_recent}");
+                    prop_assert!(
+                        b + ANCHOR_AGE_CAP * blocks >= most_recent,
+                        "replacement {b} is older than the age cap allows"
+                    );
+                }
+                None => prop_assert!(
+                    most_recent < blocks || prior > most_recent - blocks,
+                    "a non-empty candidate window must yield a draw"
+                ),
+            }
+        }
+    }
+
+    /// The endpoints of the replacement window: a prior boundary above the window keeps its
+    /// (still-provable) anchor by yielding `None`, and a prior boundary AT the window's single
+    /// candidate returns that candidate deterministically.
+    #[test]
+    fn redraw_anchor_boundary_window_endpoints() {
+        // Broadcast 1_900: most recent boundary 1_872, highest candidate 1_728.
+        assert_eq!(
+            redraw_anchor_boundary(
+                AnchorBucketInterval::ZIP_318,
+                bh(1_872),
+                bh(1_900),
+                &mut rng(1)
+            ),
+            None,
+            "a prior at the most recent boundary has no strictly-older candidate to move to"
+        );
+        assert_eq!(
+            redraw_anchor_boundary(
+                AnchorBucketInterval::ZIP_318,
+                bh(1_728),
+                bh(1_900),
+                &mut rng(1)
+            ),
+            Some(bh(1_728)),
+            "a single-candidate window is deterministic"
+        );
     }
 
     /// The two axes of [`SchedulingParams`] are independent: changing only the anchor bucket
@@ -1457,7 +2112,7 @@ mod tests {
 
     #[test]
     fn anchor_tiny_range_single_candidate() {
-        for blocks in [MODULUS, 12] {
+        for blocks in [AnchorBucketInterval::ZIP_318.block_count().get(), 12] {
             let i = interval(blocks);
             // Exactly one candidate: the boundary below the tip's, and it satisfies all bounds.
             let mut r = rng(3);
@@ -1536,7 +2191,7 @@ mod tests {
         check_schedule_golden_pairs(1_000_000, 0, 1, &exp_broadcast_empty, &exp_expiry_empty);
 
         // commit = 1_000_000, n = 5, seed = 1: broadcast heights and their shared expiry.
-        let exp_broadcast_c1m_seed1 = [1_000_074, 1_000_086, 1_000_217, 1_000_253, 1_000_301];
+        let exp_broadcast_c1m_seed1 = [1_000_034, 1_000_040, 1_000_100, 1_000_116, 1_000_138];
         let exp_expiry_c1m_seed1 = [1_036_800; 5];
         check_schedule_golden_pairs(
             1_000_000,
@@ -1547,7 +2202,7 @@ mod tests {
         );
 
         // commit = 0, n = 6, seed = 12_345.
-        let exp_broadcast_c0_seed12345 = [11, 17, 242, 300, 313, 341];
+        let exp_broadcast_c0_seed12345 = [5, 8, 111, 138, 144, 157];
         let exp_expiry_c0_seed12345 = [69_120; 6];
         check_schedule_golden_pairs(
             0,

@@ -1,4 +1,20 @@
 //! Types related to the process of selecting inputs to be spent given a transaction request.
+#[cfg(feature = "transparent-inputs")]
+use {
+    crate::{
+        data_api::CoinbaseFilter,
+        fees::{ChangeValue, StandardFeeRule},
+        proposal::{Step, StepOutput, StepOutputIndex},
+    },
+    std::convert::Infallible,
+    transparent::{address::TransparentAddress, bundle::OutPoint, keys::TransparentKeyScope},
+    zcash_primitives::transaction::fees::{
+        transparent as transparent_fees, transparent::InputSize, zip317::P2PKH_STANDARD_INPUT_SIZE,
+    },
+    zcash_protocol::constants::MAX_BLOCK_BYTES,
+    zip321::Payment,
+};
+
 use core::marker::PhantomData;
 use nonempty::NonEmpty;
 use std::{
@@ -10,7 +26,10 @@ use std::{
 use transparent::bundle::TxOut;
 use zcash_address::{ConversionError, ZcashAddress};
 use zcash_keys::address::{Address, UnifiedAddress};
-use zcash_primitives::transaction::fees::{FeeRule, zip317::P2PKH_STANDARD_OUTPUT_SIZE};
+use zcash_primitives::transaction::{
+    TxVersion,
+    fees::{FeeRule, zip317::P2PKH_STANDARD_OUTPUT_SIZE},
+};
 use zcash_protocol::{
     PoolType, ShieldedPool,
     consensus::{self, BlockHeight},
@@ -22,37 +41,23 @@ use zip321::TransactionRequest;
 use crate::{
     data_api::{
         InputSource, MaxSpendMode, ReceivedNotes, SimpleNoteRetention, TargetValue,
-        wallet::TargetHeight,
+        anchor_retention::PoolMigrationParams, wallet::TargetHeight,
     },
     fees::{ChangeError, ChangeStrategy, EphemeralBalance, TransactionBalance, sapling},
     proposal::{Proposal, ProposalError, ShieldedInputs},
-    wallet::{LockOwner, WalletTransparentOutput},
+    wallet::WalletTransparentOutput,
 };
+
+pub use crate::data_api::locking::{LockFilter, LockedInputPolicy};
 
 use super::ConfirmationsPolicy;
-
-#[cfg(feature = "transparent-inputs")]
-use {
-    crate::{
-        data_api::CoinbaseFilter,
-        fees::{ChangeValue, StandardFeeRule},
-        proposal::{Step, StepOutput, StepOutputIndex},
-    },
-    std::convert::Infallible,
-    transparent::{address::TransparentAddress, bundle::OutPoint},
-    zcash_primitives::transaction::fees::{
-        transparent as transparent_fees, transparent::InputSize, zip317::P2PKH_STANDARD_INPUT_SIZE,
-    },
-    zip321::Payment,
-};
 
 #[cfg(feature = "orchard")]
 use crate::{data_api::wallet::ironwood_active_at, fees::orchard as orchard_fees};
 
-use zcash_primitives::transaction::TxVersion;
-
 /// The type of errors that may be produced in input selection.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum InputSelectorError<DbErrT, SelectorErrT, ChangeErrT, N> {
     /// An error occurred accessing the underlying data store.
     DataSource(DbErrT),
@@ -204,6 +209,7 @@ pub trait InputSelector {
         wallet_db: &Self::InputSource,
         target_height: TargetHeight,
         anchor_height: BlockHeight,
+        zip318: &PoolMigrationParams,
         confirmations_policy: ConfirmationsPolicy,
         account: <Self::InputSource as InputSource>::AccountId,
         transaction_request: TransactionRequest,
@@ -261,6 +267,7 @@ pub trait ShieldingSelector {
         to_account: <Self::InputSource as InputSource>::AccountId,
         target_height: TargetHeight,
         anchor_height: BlockHeight,
+        zip318: &PoolMigrationParams,
         confirmations_policy: ConfirmationsPolicy,
         output_filter: CoinbaseFilter,
     ) -> Result<
@@ -343,6 +350,7 @@ pub trait ShieldingSelector {
 
 /// Errors that can occur as a consequence of greedy input selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GreedyInputSelectorError {
     /// An intermediate value overflowed or underflowed the valid monetary range.
     Balance(BalanceError),
@@ -485,6 +493,22 @@ pub struct SpendPolicy {
     #[cfg(feature = "transparent-inputs")]
     transparent: Option<TransparentSpendPolicy>,
     locked_input_policy: LockedInputPolicy,
+    note_selection: NoteSelection,
+}
+
+/// How an [`InputSelector`] chooses among eligible notes when funding a payment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoteSelection {
+    /// Accumulate the oldest eligible notes until the target value is covered.
+    #[default]
+    Accumulate,
+    /// Prefer funding from a SINGLE note — the oldest eligible note whose value alone covers the
+    /// target — falling back to accumulation when no such note exists.
+    ///
+    /// A ZIP 318 migration transfer spends exactly one note, so a canonical pool crossing is
+    /// achievable only under single-note funding; multi-note funding is not an error, but the
+    /// resulting proposal does not have the canonical shape.
+    PreferSingle,
 }
 
 impl Default for SpendPolicy {
@@ -508,6 +532,7 @@ impl SpendPolicy {
             #[cfg(feature = "transparent-inputs")]
             transparent: None,
             locked_input_policy: LockedInputPolicy::Exclude,
+            note_selection: NoteSelection::Accumulate,
         }
     }
 
@@ -544,63 +569,18 @@ impl SpendPolicy {
     pub fn locked_input_policy(&self) -> &LockedInputPolicy {
         &self.locked_input_policy
     }
-}
 
-/// Governs whether input selection may draw on locked outputs, and with what preference.
-///
-/// Locks are advisory. The default, [`Self::Exclude`], never selects a locked output. The
-/// overriding variants each carry the set of lock owners whose locks may be drawn upon; a locked
-/// output whose owner is not in that set is never selected, regardless of variant. This keeps an
-/// override scoped to a known reason (e.g. the wallet's own pool-migration PCZTs) and leaves every
-/// other flow's locks intact. Overriding here only *spends through* a lock during selection; it
-/// never releases the lock.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub enum LockedInputPolicy {
-    /// Never select locked outputs.
-    #[default]
-    Exclude,
-    /// Prefer unlocked outputs; draw on outputs locked by one of these owners only as needed to
-    /// reach the target value.
-    PreferUnlocked(NonEmptyBTreeSet<LockOwner>),
-    /// Prefer outputs locked by one of these owners; draw on unlocked outputs only as needed to
-    /// reach the target value.
-    PreferLocked(NonEmptyBTreeSet<LockOwner>),
-}
-
-impl LockedInputPolicy {
-    /// The set of lock owners whose locked outputs this policy admits (empty for `Exclude`).
-    pub fn overridable_owners(&self) -> &BTreeSet<LockOwner> {
-        static EMPTY: BTreeSet<LockOwner> = BTreeSet::new();
-        match self {
-            LockedInputPolicy::Exclude => &EMPTY,
-            LockedInputPolicy::PreferUnlocked(o) | LockedInputPolicy::PreferLocked(o) => o.as_set(),
-        }
+    /// Sets how the selector chooses among eligible notes (default:
+    /// [`NoteSelection::Accumulate`]).
+    pub fn with_note_selection(mut self, note_selection: NoteSelection) -> Self {
+        self.note_selection = note_selection;
+        self
     }
 
-    /// Whether locked (overridable) outputs are preferred ahead of unlocked ones.
-    pub fn prefers_locked(&self) -> bool {
-        matches!(self, LockedInputPolicy::PreferLocked(_))
+    /// Returns how the selector chooses among eligible notes.
+    pub fn note_selection(&self) -> NoteSelection {
+        self.note_selection
     }
-
-    /// Whether any locked outputs may be selected at all.
-    pub fn admits_locked(&self) -> bool {
-        !matches!(self, LockedInputPolicy::Exclude)
-    }
-}
-
-/// How a query filters candidate outputs by lock state.
-///
-/// Input selection for a proposal passes [`Self::Policy`], carrying the caller's owner-scoped
-/// [`LockedInputPolicy`]. Retrieval/decoding paths that must expose wallet contents regardless of
-/// locks (proposal decoding, low-level and test accessors) pass [`Self::Unfiltered`]. Keeping the
-/// two separate means a `SpendPolicy` can only ever request an owner-scoped override, never an
-/// unscoped "ignore all locks".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LockFilter<'a> {
-    /// Apply the given owner-scoped selection policy.
-    Policy(&'a LockedInputPolicy),
-    /// Ignore lock state entirely; every matching output is eligible.
-    Unfiltered,
 }
 
 /// The caller's choice of which coinbase transparent outputs a transparent spend may draw upon.
@@ -867,8 +847,6 @@ impl<DbT> GreedyInputSelector<DbT> {
 /// for general (non-shielding) transfers.
 #[cfg(feature = "transparent-inputs")]
 fn shielding_max_inputs(block_space_percent: u32) -> usize {
-    use zcash_protocol::constants::MAX_BLOCK_BYTES;
-
     (MAX_BLOCK_BYTES.saturating_mul(block_space_percent as usize) / 100) / P2PKH_STANDARD_INPUT_SIZE
 }
 
@@ -889,6 +867,7 @@ impl<DbT: InputSource> InputSelector for GreedyInputSelector<DbT> {
         wallet_db: &Self::InputSource,
         target_height: TargetHeight,
         anchor_height: BlockHeight,
+        zip318: &PoolMigrationParams,
         confirmations_policy: ConfirmationsPolicy,
         account: <DbT as InputSource>::AccountId,
         transaction_request: TransactionRequest,
@@ -1239,6 +1218,8 @@ impl<DbT: InputSource> InputSelector for GreedyInputSelector<DbT> {
                         .compute_balance::<_, DbT::NoteRef>(
                             params,
                             target_height,
+                            anchor_height,
+                            zip318,
                             &[] as &[WalletTransparentOutput<<DbT as InputSource>::AccountId>],
                             &tr1_transparent_outputs,
                             &sapling::EmptyBundleView,
@@ -1262,6 +1243,8 @@ impl<DbT: InputSource> InputSelector for GreedyInputSelector<DbT> {
                     let tr1_balance = change_strategy.compute_balance::<_, DbT::NoteRef>(
                         params,
                         target_height,
+                        anchor_height,
+                        zip318,
                         &[] as &[WalletTransparentOutput<<DbT as InputSource>::AccountId>],
                         &tr1_transparent_outputs,
                         &sapling::EmptyBundleView,
@@ -1326,6 +1309,8 @@ impl<DbT: InputSource> InputSelector for GreedyInputSelector<DbT> {
             let tr0_balance = change_strategy.compute_balance(
                 params,
                 target_height,
+                anchor_height,
+                zip318,
                 &transparent_inputs,
                 &transparent_outputs,
                 &(
@@ -1460,17 +1445,42 @@ impl<DbT: InputSource> InputSelector for GreedyInputSelector<DbT> {
             // in-flight proposal and spending it would recreate the conflict that locking exists
             // to prevent; the `PreferUnlocked`/`PreferLocked` overrides let a caller draw through
             // a lock it recognizes (e.g. its own pool-migration PCZTs).
-            shielded_inputs = wallet_db
-                .select_spendable_notes(
-                    account,
-                    TargetValue::AtLeast(amount_required),
-                    &pool_preference,
-                    target_height,
-                    confirmations_policy,
-                    &exclude,
-                    LockFilter::Policy(spend_policy.locked_input_policy()),
+            //
+            // Under `NoteSelection::PreferSingle`, the single oldest note covering the required
+            // amount alone is tried first; when no pool holds one, selection falls back to
+            // ordinary accumulation, which still funds the payment but cannot produce the
+            // single-input shape the caller preferred.
+            let single_note = match spend_policy.note_selection() {
+                NoteSelection::PreferSingle => Some(
+                    wallet_db
+                        .select_single_spendable_note(
+                            account,
+                            amount_required,
+                            &pool_preference,
+                            target_height,
+                            confirmations_policy,
+                            &exclude,
+                            LockFilter::Policy(spend_policy.locked_input_policy()),
+                        )
+                        .map_err(InputSelectorError::DataSource)?,
                 )
-                .map_err(InputSelectorError::DataSource)?;
+                .filter(|notes| !notes.is_empty()),
+                NoteSelection::Accumulate => None,
+            };
+            shielded_inputs = match single_note {
+                Some(single) => single,
+                None => wallet_db
+                    .select_spendable_notes(
+                        account,
+                        TargetValue::AtLeast(amount_required),
+                        &pool_preference,
+                        target_height,
+                        confirmations_policy,
+                        &exclude,
+                        LockFilter::Policy(spend_policy.locked_input_policy()),
+                    )
+                    .map_err(InputSelectorError::DataSource)?,
+            };
 
             let new_available = shielded_inputs.total_value()?;
             if new_available <= prior_available && !transparent_inputs_changed {
@@ -1957,7 +1967,7 @@ fn build_proposal<FeeRuleT: FeeRule + Clone, NoteRef>(
         .expect("removing payments from a TransactionRequest preserves validity");
 
         let mut steps = vec![];
-        steps.push(Step::from_parts(
+        let step0 = Step::from_parts(
             &[],
             tr0,
             payment_pools,
@@ -1969,11 +1979,12 @@ fn build_proposal<FeeRuleT: FeeRule + Clone, NoteRef>(
             false,
             #[cfg(feature = "orchard")]
             ironwood_active,
-        )?);
+        )?;
+        steps.push(step0);
 
         let tr1 =
             TransactionRequest::new(ephemeral_step.tr1_payments).expect("valid by construction");
-        steps.push(Step::from_parts(
+        let step1 = Step::from_parts(
             &steps,
             tr1,
             ephemeral_step.tr1_payment_pools,
@@ -1985,7 +1996,8 @@ fn build_proposal<FeeRuleT: FeeRule + Clone, NoteRef>(
             false,
             #[cfg(feature = "orchard")]
             ironwood_active,
-        )?);
+        )?;
+        steps.push(step1);
 
         return Proposal::multi_step(
             fee_rule.clone(),
@@ -2027,6 +2039,7 @@ impl<DbT: InputSource> ShieldingSelector for GreedyInputSelector<DbT> {
         to_account: <Self::InputSource as InputSource>::AccountId,
         target_height: TargetHeight,
         anchor_height: BlockHeight,
+        zip318: &PoolMigrationParams,
         confirmations_policy: ConfirmationsPolicy,
         output_filter: CoinbaseFilter,
     ) -> Result<
@@ -2055,6 +2068,8 @@ impl<DbT: InputSource> ShieldingSelector for GreedyInputSelector<DbT> {
             change_strategy,
             params,
             target_height,
+            anchor_height,
+            zip318,
             &mut transparent_inputs,
             &wallet_meta,
         )?;
@@ -2283,8 +2298,6 @@ fn gather_shielding_inputs<DbT, ChangeErrT>(
 where
     DbT: InputSource,
 {
-    use transparent::keys::TransparentKeyScope;
-
     // Gather the spendable UTXOs for every source address in a single query. This avoids issuing
     // one query per address (including for the many addresses that have no spendable outputs),
     // which is prohibitively expensive for wallets that hold large numbers of transparent
@@ -2414,6 +2427,8 @@ fn compute_shielding_balance_with_dust_retry<DbT, ChangeT, ParamsT>(
     change_strategy: &ChangeT,
     params: &ParamsT,
     target_height: TargetHeight,
+    anchor_height: BlockHeight,
+    zip318: &PoolMigrationParams,
     transparent_inputs: &mut Vec<WalletTransparentOutput<()>>,
     wallet_meta: &<ChangeT as ChangeStrategy>::AccountMetaT,
 ) -> Result<
@@ -2434,6 +2449,8 @@ where
         change_strategy,
         params,
         target_height,
+        anchor_height,
+        zip318,
         transparent_inputs,
         wallet_meta,
     );
@@ -2448,6 +2465,8 @@ where
                 change_strategy,
                 params,
                 target_height,
+                anchor_height,
+                zip318,
                 transparent_inputs,
                 wallet_meta,
             )
@@ -2472,6 +2491,8 @@ fn compute_shielding_balance<DbT, ChangeT, ParamsT>(
     change_strategy: &ChangeT,
     params: &ParamsT,
     target_height: TargetHeight,
+    anchor_height: BlockHeight,
+    zip318: &PoolMigrationParams,
     transparent_inputs: &[WalletTransparentOutput<()>],
     wallet_meta: &<ChangeT as ChangeStrategy>::AccountMetaT,
 ) -> Result<TransactionBalance, ChangeError<ChangeT::Error, Infallible>>
@@ -2496,6 +2517,8 @@ where
     change_strategy.compute_balance(
         params,
         target_height,
+        anchor_height,
+        zip318,
         transparent_inputs,
         &[] as &[TxOut],
         &sapling::EmptyBundleView,
@@ -2526,6 +2549,9 @@ mod tests {
 #[cfg(test)]
 mod spend_policy_tests {
     use super::*;
+    #[cfg(feature = "transparent-inputs")]
+    use crate::data_api::CoinbaseFilter;
+    use crate::wallet::LockOwner;
 
     // The default spend policy preserves the historical `ShieldedOnly` behavior: notes may be
     // selected from every shielded pool present in the build, and no transparent UTXOs are
@@ -2556,7 +2582,6 @@ mod spend_policy_tests {
     #[cfg(feature = "transparent-inputs")]
     #[test]
     fn coinbase_policy_maps_to_filter() {
-        use crate::data_api::CoinbaseFilter;
         assert_eq!(
             CoinbaseFilter::from(CoinbasePolicy::OnlyCoinbase),
             CoinbaseFilter::CoinbaseOnly
@@ -2578,25 +2603,6 @@ mod spend_policy_tests {
         let policy = policy.with_coinbase(CoinbasePolicy::OnlyCoinbase);
         assert_eq!(policy.coinbase(), CoinbasePolicy::OnlyCoinbase);
         assert!(matches!(policy.source(), TransparentSource::AnyAccountAddr));
-    }
-
-    // Each variant's accessors agree with the meaning of the variant: `Exclude` admits no
-    // owners at all, while `PreferUnlocked`/`PreferLocked` admit exactly the given owners and
-    // differ only in whether locked outputs are preferred.
-    #[test]
-    fn locked_input_policy_accessors() {
-        let owner = LockOwner::new([7u8; 32]);
-        let set = BTreeSet::from([owner]);
-        let owners = NonEmptyBTreeSet::from_set(set.clone()).unwrap();
-        assert_eq!(LockedInputPolicy::default(), LockedInputPolicy::Exclude);
-        assert!(LockedInputPolicy::Exclude.overridable_owners().is_empty());
-        assert!(!LockedInputPolicy::Exclude.admits_locked());
-        let pu = LockedInputPolicy::PreferUnlocked(owners.clone());
-        assert!(pu.admits_locked() && !pu.prefers_locked());
-        assert_eq!(pu.overridable_owners(), &set);
-        let pl = LockedInputPolicy::PreferLocked(owners.clone());
-        assert!(pl.admits_locked() && pl.prefers_locked());
-        assert_eq!(pl.overridable_owners(), &set);
     }
 
     // The default `SpendPolicy` excludes locked inputs, and `with_locked_input_policy` overrides

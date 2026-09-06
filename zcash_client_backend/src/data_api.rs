@@ -66,7 +66,7 @@ use nonempty::NonEmpty;
 use secrecy::SecretVec;
 use std::{
     collections::{HashMap, HashSet},
-    fmt::Debug,
+    fmt::{self, Debug},
     hash::Hash,
     io,
     num::{NonZeroU32, TryFromIntError},
@@ -96,21 +96,17 @@ use self::{
 };
 use crate::{
     data_api::{
-        error::{LockError, RewindError},
+        error::RewindError,
         wallet::{ConfirmationsPolicy, TargetHeight, input_selection::LockFilter},
     },
     decrypt::DecryptedOutput,
     proto::service::TreeState,
-    wallet::{
-        LockOwner, Note, NoteId, OutputRef, ReceivedNote, Recipient, WalletTransparentOutput,
-        WalletTx,
-    },
+    wallet::{Note, NoteId, ReceivedNote, Recipient, WalletTransparentOutput, WalletTx},
 };
 
 #[cfg(feature = "transparent-inputs")]
 use {
-    crate::fees::StandardFeeRule,
-    crate::wallet::TransparentAddressMetadata,
+    crate::{fees::StandardFeeRule, wallet::TransparentAddressMetadata},
     getset::{CopyGetters, Getters},
     std::time::SystemTime,
     transparent::{address::TransparentAddress, bundle::OutPoint, keys::TransparentKeyScope},
@@ -136,8 +132,14 @@ pub mod chain;
 pub mod defaults;
 pub mod error;
 pub mod ll;
+pub mod locking;
+pub use locking::OutputLockStore;
+#[cfg(feature = "test-dependencies")]
+pub use locking::ambassador_impl_OutputLockStore;
 pub mod scanning;
 pub mod wallet;
+#[cfg(feature = "orchard")]
+pub mod zip318;
 
 #[cfg(any(test, feature = "test-dependencies"))]
 pub mod testing;
@@ -1186,6 +1188,75 @@ impl<NoteRef> ReceivedNotes<NoteRef> {
             .ok_or(BalanceError::Overflow);
     }
 
+    /// Returns whether the collection contains no notes in any pool.
+    pub fn is_empty(&self) -> bool {
+        #[cfg(not(feature = "orchard"))]
+        return self.sapling.is_empty();
+
+        #[cfg(feature = "orchard")]
+        return self.sapling.is_empty() && self.orchard.is_empty() && self.ironwood.is_empty();
+    }
+
+    /// Consumes this collection, returning one holding only the OLDEST single note whose value
+    /// alone is at least `value`, drawn from the first pool in `sources` that holds one; the
+    /// result is empty when no single note qualifies. Age is the note's commitment tree
+    /// position, which is assigned in strict chain order.
+    ///
+    /// This is the best-effort reduction behind the default implementation of
+    /// [`InputSource::select_single_spendable_note`]: it can only choose among the notes it
+    /// holds, so a covering note the producing selection did not surface cannot be found here.
+    pub fn into_single_covering(mut self, value: Zatoshis, sources: &[ShieldedPool]) -> Self {
+        fn take_oldest_covering<NoteRef, N>(
+            notes: &mut Vec<ReceivedNote<NoteRef, N>>,
+            covers: impl Fn(&ReceivedNote<NoteRef, N>) -> bool,
+        ) -> Option<ReceivedNote<NoteRef, N>> {
+            let idx = notes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| covers(n))
+                .min_by_key(|(_, n)| n.note_commitment_tree_position())
+                .map(|(idx, _)| idx)?;
+            Some(notes.swap_remove(idx))
+        }
+
+        for pool in sources {
+            match pool {
+                ShieldedPool::Sapling => {
+                    if let Some(note) = take_oldest_covering(&mut self.sapling, |n| {
+                        n.note_value().is_ok_and(|v| v >= value)
+                    }) {
+                        return Self::new(
+                            vec![note],
+                            #[cfg(feature = "orchard")]
+                            vec![],
+                            #[cfg(feature = "orchard")]
+                            vec![],
+                        );
+                    }
+                }
+                #[cfg(feature = "orchard")]
+                ShieldedPool::Orchard => {
+                    if let Some(note) = take_oldest_covering(&mut self.orchard, |n| {
+                        n.note_value().is_ok_and(|v| v >= value)
+                    }) {
+                        return Self::new(vec![], vec![note], vec![]);
+                    }
+                }
+                #[cfg(feature = "orchard")]
+                ShieldedPool::Ironwood => {
+                    if let Some(note) = take_oldest_covering(&mut self.ironwood, |n| {
+                        n.note_value().is_ok_and(|v| v >= value)
+                    }) {
+                        return Self::new(vec![], vec![], vec![note]);
+                    }
+                }
+                #[cfg(not(feature = "orchard"))]
+                ShieldedPool::Orchard | ShieldedPool::Ironwood => {}
+            }
+        }
+        Self::empty()
+    }
+
     /// Consumes this [`ReceivedNotes`] value and produces a vector of
     /// [`ReceivedNote<NoteRef, Note>`] values.
     pub fn into_vec(
@@ -1727,6 +1798,23 @@ pub trait InputSource {
         lock_filter: LockFilter<'_>,
     ) -> Result<Option<ReceivedNote<Self::NoteRef, Note>>, Self::Error>;
 
+    /// Returns whether an anchor is COMPUTABLE at `height` for spends from the given pool: whether
+    /// this data source can produce the note commitment tree root, and witnesses to it, as of the
+    /// end of that block.
+    ///
+    /// A height inside the wallet's scanned range need not qualify: tree states are only
+    /// materialized at the heights the wallet chose to retain, and a wallet that scanned past
+    /// NU6.3 activation before boundary checkpointing was repaired is permanently missing the
+    /// anchor-retention boundaries whose blocks carried no shielded outputs. Such a hole cannot be
+    /// backfilled from local state, so a caller deciding whether to anchor at a retained boundary
+    /// should consult this before committing to it, and fall back rather than propose a
+    /// transaction that cannot be built.
+    fn anchor_computable(
+        &self,
+        protocol: ShieldedPool,
+        height: BlockHeight,
+    ) -> Result<bool, Self::Error>;
+
     /// Returns a list of spendable notes sufficient to cover the specified target value, if
     /// possible. Only spendable notes corresponding to the specified shielded protocol will
     /// be included. Locked outputs are selected according to `lock_filter` (see [`LockFilter`];
@@ -1742,6 +1830,43 @@ pub trait InputSource {
         exclude: &[Self::NoteRef],
         lock_filter: LockFilter<'_>,
     ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error>;
+
+    /// Returns the OLDEST single spendable note whose value alone is at least `value`, drawn
+    /// from the first pool in `sources` (in the given preference order) that holds one. The
+    /// returned collection contains at most one note; it is empty when no single eligible note
+    /// covers the value.
+    ///
+    /// This is the selection primitive behind
+    /// [`NoteSelection::PreferSingle`](crate::data_api::wallet::input_selection::NoteSelection):
+    /// a ZIP 318 migration transfer spends exactly one note, so a canonical pool crossing must
+    /// be funded from one.
+    ///
+    /// The default implementation is BEST-EFFORT: it reports a note only when
+    /// [`Self::select_spendable_notes`] happens to surface one that covers the value on its
+    /// own. An implementation backed by a queryable store should override it with a direct
+    /// query, so that a covering note is found whenever one exists.
+    #[allow(clippy::too_many_arguments)]
+    fn select_single_spendable_note(
+        &self,
+        account: Self::AccountId,
+        value: Zatoshis,
+        sources: &[ShieldedPool],
+        target_height: TargetHeight,
+        confirmations_policy: ConfirmationsPolicy,
+        exclude: &[Self::NoteRef],
+        lock_filter: LockFilter<'_>,
+    ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error> {
+        self.select_spendable_notes(
+            account,
+            TargetValue::AtLeast(value),
+            sources,
+            target_height,
+            confirmations_policy,
+            exclude,
+            lock_filter,
+        )
+        .map(|notes| notes.into_single_covering(value, sources))
+    }
 
     /// Returns the list of notes belonging to the wallet that are unspent as of the specified
     /// target height. Locked outputs are selected according to `lock_filter` (see [`LockFilter`];
@@ -2116,6 +2241,18 @@ pub trait WalletRead {
         anchor_retention::AnchorRetentionInterval::ZIP_318
     }
 
+    /// Returns the ZIP 318 pool-migration parameters in force for this wallet: the specified
+    /// values, with the anchor bucket grid taken from [`Self::anchor_retention_interval`].
+    ///
+    /// Every decision that depends on the grid must consult this rather than the network defaults,
+    /// so that a wallet retaining a non-standard interval is treated consistently: bucketing an
+    /// anchor and judging the resulting transaction a canonical crossing are the same question
+    /// asked twice, and they must be asked of the same grid. Overriding
+    /// [`Self::anchor_retention_interval`] is sufficient; this composes it.
+    fn pool_migration_params(&self) -> anchor_retention::PoolMigrationParams {
+        anchor_retention::PoolMigrationParams::new(self.anchor_retention_interval())
+    }
+
     /// Returns the block hash for the block at the given height, if the
     /// associated block data is available. Returns `Ok(None)` if the hash
     /// is not found in the database.
@@ -2394,15 +2531,6 @@ pub trait WalletRead {
 #[cfg(any(test, feature = "test-dependencies"))]
 #[cfg_attr(feature = "test-dependencies", delegatable_trait)]
 pub trait WalletTest: InputSource + WalletRead {
-    /// Returns the set of currently locked outputs for the given account.
-    ///
-    /// Locked outputs are excluded from note selection, and are tallied separately in balance
-    /// computations.
-    fn get_locked_outputs(
-        &self,
-        account: <Self as WalletRead>::AccountId,
-    ) -> Result<Vec<OutputRef>, <Self as WalletRead>::Error>;
-
     /// Returns a vector of transaction summaries.
     ///
     /// Currently test-only, as production use could return a very large number of results; either
@@ -3187,9 +3315,36 @@ pub struct AccountBirthday {
 }
 
 /// Errors that can occur in the construction of an [`AccountBirthday`] from a [`TreeState`].
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum BirthdayError {
+    /// The block height of the [`TreeState`] was out of range for a [`BlockHeight`].
     HeightInvalid(TryFromIntError),
+    /// The note commitment tree frontiers of the [`TreeState`] could not be decoded.
     Decode(io::Error),
+}
+
+impl fmt::Display for BirthdayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BirthdayError::HeightInvalid(e) => {
+                write!(f, "Invalid block height for account birthday: {e}")
+            }
+            BirthdayError::Decode(e) => write!(
+                f,
+                "Failed to decode the note commitment tree state for the account birthday: {e}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BirthdayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BirthdayError::HeightInvalid(e) => Some(e),
+            BirthdayError::Decode(e) => Some(e),
+        }
+    }
 }
 
 impl From<TryFromIntError> for BirthdayError {
@@ -3407,7 +3562,13 @@ impl AccountBirthday {
 /// [BIP 39]: https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
 /// [`bip0039`]: https://crates.io/crates/bip0039
 #[cfg_attr(feature = "test-dependencies", delegatable_trait)]
-pub trait WalletWrite: WalletRead {
+pub trait WalletWrite:
+    WalletRead
+    + OutputLockStore<
+        AccountId = <Self as WalletRead>::AccountId,
+        Error = <Self as WalletRead>::Error,
+    >
+{
     /// The type of identifiers used to look up transparent UTXOs.
     type UtxoRef;
 
@@ -3455,7 +3616,7 @@ pub trait WalletWrite: WalletRead {
         seed: &SecretVec<u8>,
         birthday: &AccountBirthday,
         key_source: Option<&str>,
-    ) -> Result<(Self::AccountId, UnifiedSpendingKey), Self::Error>;
+    ) -> Result<(<Self as WalletRead>::AccountId, UnifiedSpendingKey), <Self as WalletRead>::Error>;
 
     /// Tells the wallet to track a specific account index for a given seed.
     ///
@@ -3494,7 +3655,7 @@ pub trait WalletWrite: WalletRead {
         account_index: zip32::AccountId,
         birthday: &AccountBirthday,
         key_source: Option<&str>,
-    ) -> Result<(Self::Account, UnifiedSpendingKey), Self::Error>;
+    ) -> Result<(Self::Account, UnifiedSpendingKey), <Self as WalletRead>::Error>;
 
     /// Tells the wallet to track an account using a unified full viewing key.
     ///
@@ -3526,7 +3687,7 @@ pub trait WalletWrite: WalletRead {
         birthday: &AccountBirthday,
         purpose: AccountPurpose,
         key_source: Option<&str>,
-    ) -> Result<Self::Account, Self::Error>;
+    ) -> Result<Self::Account, <Self as WalletRead>::Error>;
 
     /// Tells the wallet to track an account using a unified incoming viewing key.
     ///
@@ -3578,7 +3739,36 @@ pub trait WalletWrite: WalletRead {
     ///
     /// [`OvkPolicy::Discard`]: crate::wallet::OvkPolicy::Discard
     /// [`OvkPolicy::Custom`]: crate::wallet::OvkPolicy::Custom
-    fn delete_account(&mut self, account: Self::AccountId) -> Result<(), Self::Error>;
+    fn delete_account(
+        &mut self,
+        account: <Self as WalletRead>::AccountId,
+    ) -> Result<(), <Self as WalletRead>::Error>;
+
+    /// Imports the given transparent address into the account as a watch-only address, without
+    /// any associated key material.
+    ///
+    /// The imported address will contribute to the balance of the account, but the wallet holds
+    /// neither the public key (P2PKH) nor the redeem script (P2SH) from which the address was
+    /// derived, so funds received by it cannot be spent — its outputs are excluded from spendable
+    /// input selection, and it must not be included in the addresses passed to
+    /// [`propose_shielding`]. Subsequently importing the corresponding key material with
+    /// [`import_standalone_transparent_pubkey`] or [`import_standalone_transparent_script`]
+    /// upgrades the address in place, after which the spending limitations of those methods
+    /// apply instead.
+    ///
+    /// [`import_standalone_transparent_pubkey`]: Self::import_standalone_transparent_pubkey
+    /// [`import_standalone_transparent_script`]: Self::import_standalone_transparent_script
+    /// [`propose_shielding`]: crate::data_api::wallet::propose_shielding
+    #[cfg(feature = "transparent-key-import")]
+    fn import_standalone_transparent_address(
+        &mut self,
+        _account: <Self as WalletRead>::AccountId,
+        _address: TransparentAddress,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        unimplemented!(
+            "WalletWrite::import_standalone_transparent_address must be overridden for wallets to use the `transparent-key-import` feature"
+        )
+    }
 
     /// Imports the given pubkey into the account without key derivation information, and adds the
     /// associated transparent p2pkh address.
@@ -3594,9 +3784,9 @@ pub trait WalletWrite: WalletRead {
     #[cfg(feature = "transparent-key-import")]
     fn import_standalone_transparent_pubkey(
         &mut self,
-        _account: Self::AccountId,
+        _account: <Self as WalletRead>::AccountId,
         _pubkey: secp256k1::PublicKey,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         unimplemented!(
             "WalletWrite::import_standalone_transparent_pubkey must be overridden for wallets to use the `transparent-key-import` feature"
         )
@@ -3615,9 +3805,9 @@ pub trait WalletWrite: WalletRead {
     #[cfg(feature = "transparent-key-import")]
     fn import_standalone_transparent_pubkeys(
         &mut self,
-        account: Self::AccountId,
+        account: <Self as WalletRead>::AccountId,
         pubkeys: &[secp256k1::PublicKey],
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         for pubkey in pubkeys {
             self.import_standalone_transparent_pubkey(account, *pubkey)?;
         }
@@ -3643,9 +3833,9 @@ pub trait WalletWrite: WalletRead {
     #[cfg(feature = "transparent-key-import")]
     fn import_standalone_transparent_script(
         &mut self,
-        _account: Self::AccountId,
+        _account: <Self as WalletRead>::AccountId,
         _script: zcash_script::script::Redeem,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         unimplemented!(
             "WalletWrite::import_standalone_transparent_script must be overridden for wallets to use the `transparent-key-import` feature"
         )
@@ -3658,9 +3848,9 @@ pub trait WalletWrite: WalletRead {
     /// account.
     fn get_next_available_address(
         &mut self,
-        account: Self::AccountId,
+        account: <Self as WalletRead>::AccountId,
         request: UnifiedAddressRequest,
-    ) -> Result<Option<(UnifiedAddress, DiversifierIndex)>, Self::Error>;
+    ) -> Result<Option<(UnifiedAddress, DiversifierIndex)>, <Self as WalletRead>::Error>;
 
     /// Generates, persists, and marks as exposed a diversified address for the specified account
     /// at the provided diversifier index.
@@ -3687,10 +3877,10 @@ pub trait WalletWrite: WalletRead {
     /// [`ReceiverRequirement::Require`]: zcash_keys::keys::ReceiverRequirement::Require
     fn get_address_for_index(
         &mut self,
-        account: Self::AccountId,
+        account: <Self as WalletRead>::AccountId,
         diversifier_index: DiversifierIndex,
         request: UnifiedAddressRequest,
-    ) -> Result<Option<UnifiedAddress>, Self::Error>;
+    ) -> Result<Option<UnifiedAddress>, <Self as WalletRead>::Error>;
 
     /// Generates and persists an address for an account at a specific diversifier index.
     ///
@@ -3709,7 +3899,10 @@ pub trait WalletWrite: WalletRead {
     /// before proceeding with scanning. It should be called at wallet startup prior to calling
     /// [`WalletRead::suggest_scan_ranges`] in order to provide the wallet with the information it
     /// needs to correctly prioritize scanning operations.
-    fn update_chain_tip(&mut self, tip_height: BlockHeight) -> Result<(), Self::Error>;
+    fn update_chain_tip(
+        &mut self,
+        tip_height: BlockHeight,
+    ) -> Result<(), <Self as WalletRead>::Error>;
 
     /// Drops the scan work queued below `height`, except where retained by
     /// `retain_with_priority`. Returns the number of queue entries removed or altered.
@@ -3743,7 +3936,7 @@ pub trait WalletWrite: WalletRead {
         &mut self,
         height: BlockHeight,
         retain_with_priority: Option<ScanPriority>,
-    ) -> Result<u64, Self::Error>;
+    ) -> Result<u64, <Self as WalletRead>::Error>;
 
     /// Updates the state of the wallet database by persisting the provided block information,
     /// along with the note commitments that were detected when scanning the block for transactions
@@ -3756,98 +3949,30 @@ pub trait WalletWrite: WalletRead {
     fn put_blocks(
         &mut self,
         from_state: &ChainState,
-        blocks: Vec<ScannedBlock<Self::AccountId>>,
-    ) -> Result<(), Self::Error>;
+        blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error>;
 
     /// Adds a transparent UTXO received by the wallet to the data store.
     fn put_received_transparent_utxo(
         &mut self,
-        output: &WalletTransparentOutput<Self::AccountId>,
-    ) -> Result<Self::UtxoRef, Self::Error>;
+        output: &WalletTransparentOutput<<Self as WalletRead>::AccountId>,
+    ) -> Result<Self::UtxoRef, <Self as WalletRead>::Error>;
 
     /// Caches a decrypted transaction in the persistent wallet store.
     fn store_decrypted_tx(
         &mut self,
-        received_tx: DecryptedTransaction<Transaction, Self::AccountId>,
-    ) -> Result<(), Self::Error>;
+        received_tx: DecryptedTransaction<Transaction, <Self as WalletRead>::AccountId>,
+    ) -> Result<(), <Self as WalletRead>::Error>;
 
     /// Sets the trust status of the given transaction to either trusted or untrusted.
     ///
     /// The outputs of a trusted transaction will be available for spending with
     /// [`ConfirmationsPolicy::trusted`] confirmations even if the output is not wallet-internal.
-    fn set_tx_trust(&mut self, txid: TxId, trusted: bool) -> Result<(), Self::Error>;
-
-    /// Locks the specified outputs on behalf of `owner` so that, by default, they are not
-    /// selected for spending at any height less than or equal to the given height.
-    ///
-    /// Locks are advisory. Input selection excludes locked outputs by default, but a caller may
-    /// deliberately draw on them by supplying an owner-scoped
-    /// [`LockedInputPolicy`](crate::data_api::wallet::input_selection::LockedInputPolicy) (via
-    /// [`SpendPolicy::with_locked_input_policy`](crate::data_api::wallet::input_selection::SpendPolicy::with_locked_input_policy)),
-    /// scoped to the lock owners it names; doing so spends through the lock during selection but
-    /// never releases it. A locked output can be released only via [`Self::unlock_output`] (by its
-    /// owner) or [`Self::clear_locked_outputs`].
-    ///
-    /// Returns the number of row updates performed on success (equal to the number of provided
-    /// references; a duplicated reference is counted per occurrence), or a [`LockError`] on
-    /// failure, wrapping either an error from the underlying storage backend or the first output
-    /// that could not be locked.
-    ///
-    /// A lock may be acquired when the output holds no lock, when its existing lock has expired
-    /// as of the chain tip, or when its existing lock is held by the *same* `owner`; in the
-    /// latter case the lock's expiry height is updated. Same-owner re-locking makes the
-    /// operation idempotent, so a caller that crashes between locking and persisting its
-    /// proposal can safely retry the flow under the same [`LockOwner`]. Acquisition fails only
-    /// when an unexpired lock is held by a different owner.
-    ///
-    /// Implementations of this method must either succeed completely, successfully locking each
-    /// provided output on success, or fail completely leaving all lock state unmodified if any
-    /// of the outputs is actively locked by a different owner.
-    ///
-    /// This is the mechanism by which overlapping proposals for the same account avoid selecting
-    /// the same inputs by default. Because note selection and locking cannot be performed as a
-    /// single atomic step above the storage layer, two callers may independently select an
-    /// overlapping set of outputs before either locks them (a time-of-check/time-of-use race); the
-    /// conflict is resolved here, at the storage layer, where the second caller's `lock_outputs`
-    /// fails with [`LockError::LockFailure`] naming the already-locked output. Callers that lock
-    /// via a proposal-creation function surface this as
-    /// [`ProposalError::InputsLocked`](crate::proposal::ProposalError::InputsLocked). The
-    /// losing caller has not partially locked anything and should treat the failure as "the
-    /// account is busy" and retry.
-    fn lock_outputs(
+    fn set_tx_trust(
         &mut self,
-        outputs: &[OutputRef],
-        owner: LockOwner,
-        lock_expiry_height: BlockHeight,
-    ) -> Result<usize, LockError<Self::Error>>;
-
-    /// Unlocks the specified output if it is locked by the given `owner`, making it once again
-    /// available for spending and balance computations.
-    ///
-    /// Returns `true` if a lock held by `owner` (whether or not it had already expired) was
-    /// removed from the output, and `false` otherwise: in particular, a lock held by a
-    /// different owner is left in place, so one flow cannot accidentally release another's
-    /// locks.
-    fn unlock_output(&mut self, output: &OutputRef, owner: LockOwner) -> Result<bool, Self::Error>;
-
-    /// Unlocks every currently-locked output belonging to the specified account, regardless of
-    /// lock expiry height.
-    ///
-    /// This is intended as a recovery mechanism for callers that have lost track of their
-    /// in-flight proposals or PCZTs (for example, because the application was terminated by the
-    /// operating system before the corresponding transactions could be built). By clearing all
-    /// locks for the account, the caller declares that it has no pending proposals holding those
-    /// outputs.
-    ///
-    /// # Warning
-    ///
-    /// This releases every lock for the account regardless of its owner, including locks held
-    /// by proposals that are still legitimately in flight; those proposals' inputs immediately
-    /// become selectable by new proposals, re-creating the conflict that locking exists to
-    /// prevent. Only call this when no in-flight proposal or PCZT for the account remains.
-    ///
-    /// Returns the number of outputs that were unlocked.
-    fn clear_locked_outputs(&mut self, account: Self::AccountId) -> Result<usize, Self::Error>;
+        txid: TxId,
+        trusted: bool,
+    ) -> Result<(), <Self as WalletRead>::Error>;
 
     /// Saves information about transactions constructed by the wallet to the persistent
     /// wallet store.
@@ -3861,10 +3986,15 @@ pub trait WalletWrite: WalletRead {
     /// stored transactions. Once spend records exist, the outputs are protected from
     /// double-selection by the spend tracking mechanism, so the explicit locks are no
     /// longer needed.
+    ///
+    /// Implementations must be idempotent: storing a transaction the wallet has already
+    /// recorded replaces that record rather than failing, so that a caller which stores a
+    /// transaction and then dies before transmitting it can store the same transaction again
+    /// when it resumes.
     fn store_transactions_to_be_sent(
         &mut self,
-        transactions: &[SentTransaction<Self::AccountId>],
-    ) -> Result<(), Self::Error>;
+        transactions: &[SentTransaction<<Self as WalletRead>::AccountId>],
+    ) -> Result<(), <Self as WalletRead>::Error>;
 
     /// Truncates the wallet database to at most the specified height.
     ///
@@ -3886,7 +4016,10 @@ pub trait WalletWrite: WalletRead {
     /// There may be restrictions on heights to which it is possible to truncate. Specifically, it
     /// will only be possible to truncate to heights at which is is possible to create a witness
     /// given the current state of the wallet's note commitment tree.
-    fn truncate_to_height(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Self::Error>;
+    fn truncate_to_height(
+        &mut self,
+        max_height: BlockHeight,
+    ) -> Result<BlockHeight, <Self as WalletRead>::Error>;
 
     /// Records the last block scanned for transparent transactions involving an address.
     #[cfg(feature = "transparent-inputs")]
@@ -3903,7 +4036,10 @@ pub trait WalletWrite: WalletRead {
     /// note commitment tree maintenance after the truncation.
     ///
     /// [`truncate_to_height`]: WalletWrite::truncate_to_height
-    fn truncate_to_chain_state(&mut self, chain_state: ChainState) -> Result<(), Self::Error>;
+    fn truncate_to_chain_state(
+        &mut self,
+        chain_state: ChainState,
+    ) -> Result<(), <Self as WalletRead>::Error>;
 
     /// Rewinds the wallet to the specified chain state, preserving wallet data which has been
     /// confirmed beyond the pruning depth, and lowering the birthday height of selected accounts
@@ -3944,8 +4080,8 @@ pub trait WalletWrite: WalletRead {
     fn rewind_to_chain_state(
         &mut self,
         chain_state: ChainState,
-        reset_account_birthdays: HashSet<Self::AccountId>,
-    ) -> Result<(), RewindError<Self::AccountId, Self::Error>>;
+        reset_account_birthdays: HashSet<<Self as WalletRead>::AccountId>,
+    ) -> Result<(), RewindError<<Self as WalletRead>::AccountId, <Self as WalletRead>::Error>>;
 
     /// Reserves the next `n` available ephemeral addresses for the given account.
     /// This cannot be undone, so as far as possible, errors associated with transaction
@@ -3963,9 +4099,10 @@ pub trait WalletWrite: WalletRead {
     #[cfg(feature = "transparent-inputs")]
     fn reserve_next_n_ephemeral_addresses(
         &mut self,
-        _account_id: Self::AccountId,
+        _account_id: <Self as WalletRead>::AccountId,
         _n: usize,
-    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, Self::Error> {
+    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, <Self as WalletRead>::Error>
+    {
         unimplemented!(
             "WalletWrite::reserve_next_n_ephemeral_addresses must be overridden for wallets to use the `transparent-inputs` feature"
         )
@@ -3994,9 +4131,10 @@ pub trait WalletWrite: WalletRead {
     #[cfg(feature = "transparent-inputs")]
     fn reserve_next_n_internal_addresses(
         &mut self,
-        _account_id: Self::AccountId,
+        _account_id: <Self as WalletRead>::AccountId,
         _n: usize,
-    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, Self::Error> {
+    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, <Self as WalletRead>::Error>
+    {
         unimplemented!(
             "WalletWrite::reserve_next_n_internal_addresses must be overridden for wallets to \
              create transactions that produce transparent change"
@@ -4014,7 +4152,7 @@ pub trait WalletWrite: WalletRead {
         &mut self,
         _txid: TxId,
         _status: TransactionStatus,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), <Self as WalletRead>::Error>;
 
     /// Schedules a UTXO check for the given address at a random time that has an expected value of
     /// `offset_seconds` from the current system time.
@@ -4026,7 +4164,7 @@ pub trait WalletWrite: WalletRead {
         &mut self,
         _address: &TransparentAddress,
         _offset_seconds: u32,
-    ) -> Result<Option<SystemTime>, Self::Error> {
+    ) -> Result<Option<SystemTime>, <Self as WalletRead>::Error> {
         unimplemented!(
             "WalletWrite::schedule_next_check must be overridden for wallets to use the `transparent-inputs` feature"
         )
@@ -4051,7 +4189,7 @@ pub trait WalletWrite: WalletRead {
     fn mark_transparent_addresses_exposed(
         &mut self,
         _exposures: &[(TransparentAddress, BlockHeight)],
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         unimplemented!(
             "WalletWrite::mark_transparent_addresses_exposed must be overridden for wallets to use the `transparent-inputs` feature"
         )
@@ -4069,7 +4207,7 @@ pub trait WalletWrite: WalletRead {
         &mut self,
         _request: TransactionsInvolvingAddress,
         _as_of_height: BlockHeight,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         unimplemented!(
             "WalletWrite::notify_address_checked must be overridden for wallets to use the `transparent-inputs` feature"
         )
@@ -4088,7 +4226,7 @@ pub trait WalletWrite: WalletRead {
         &mut self,
         _outpoint: OutPoint,
         _as_of_height: BlockHeight,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         unimplemented!(
             "WalletWrite::notify_output_verified_unspent must be overridden for wallets to use the `spend-index` feature"
         )
@@ -4575,6 +4713,15 @@ mod balance_tests {
 
 #[cfg(test)]
 mod tests {
+    use incrementalmerkletree::{
+        Address as TreeAddress, Hashable, Level, Marking, Position, Retention,
+    };
+    use shardtree::store::{Checkpoint, memory::MemoryShardStore};
+    use zcash_keys::{
+        address::{Address, UnifiedAddress},
+        keys::UnifiedAddressRequest,
+    };
+
     use super::*;
 
     #[cfg(feature = "orchard")]
@@ -4584,14 +4731,10 @@ mod tests {
     };
 
     use transparent::address::TransparentAddress;
-    use zcash_keys::address::{Address, UnifiedAddress};
     use zip32::DiversifierIndex;
 
     #[test]
     fn put_sapling_shards_flushes_through_the_interface() {
-        use incrementalmerkletree::{Address, Hashable, Level, Marking, Position};
-        use shardtree::store::Checkpoint;
-
         let mut db = MockWalletDb::new(zcash_protocol::consensus::Network::TestNetwork);
 
         // Build a shard-rooted subtree the same way `put_blocks` does, with a checkpoint on
@@ -4630,7 +4773,10 @@ mod tests {
         db.with_sapling_tree_mut(|tree| {
             assert!(
                 tree.store()
-                    .get_shard(Address::from_parts(Level::from(SAPLING_SHARD_HEIGHT), 0))
+                    .get_shard(TreeAddress::from_parts(
+                        Level::from(SAPLING_SHARD_HEIGHT),
+                        0
+                    ))
                     .map_err(ShardTreeError::Storage)?
                     .is_some()
             );
@@ -4681,9 +4827,6 @@ mod tests {
     where
         H: incrementalmerkletree::Hashable + Clone + PartialEq + core::fmt::Debug,
     {
-        use incrementalmerkletree::{Address, Level, Marking, Position};
-        use shardtree::store::{Checkpoint, memory::MemoryShardStore};
-
         let mut tree: ShardTree<
             MemoryShardStore<H, BlockHeight>,
             { SAPLING_SHARD_HEIGHT * 2 },
@@ -4724,7 +4867,10 @@ mod tests {
 
         assert!(
             tree.store()
-                .get_shard(Address::from_parts(Level::from(SAPLING_SHARD_HEIGHT), 0))
+                .get_shard(TreeAddress::from_parts(
+                    Level::from(SAPLING_SHARD_HEIGHT),
+                    0
+                ))
                 .expect("shard read succeeds")
                 .is_some()
         );
@@ -4772,8 +4918,6 @@ mod tests {
     #[cfg(feature = "orchard")]
     #[test]
     fn put_ironwood_shards_is_ignored_without_an_ironwood_tree() {
-        use shardtree::store::Checkpoint;
-
         // `MockWalletDb` does not track an Ironwood tree, so the default
         // `with_ironwood_tree_mut` reports no tree and the changes are ignored rather than
         // returning an error.
@@ -4950,8 +5094,6 @@ mod tests {
 
     #[test]
     fn find_account_for_unified_address_returns_account_when_receivers_map_to_same_account() {
-        use zcash_keys::keys::UnifiedAddressRequest;
-
         let ufvk = test_ufvk(1);
         let wallet = MockWalletDb::from_account_ufvks(
             zcash_protocol::consensus::Network::MainNetwork,
@@ -4972,8 +5114,6 @@ mod tests {
 
     #[test]
     fn find_account_for_unified_address_returns_none_when_no_receiver_matches() {
-        use zcash_keys::keys::UnifiedAddressRequest;
-
         let wallet = MockWalletDb::from_account_ufvks(
             zcash_protocol::consensus::Network::MainNetwork,
             [(1, test_ufvk(1))],
@@ -4995,8 +5135,6 @@ mod tests {
 
     #[test]
     fn find_account_for_sapling_address_resolves_via_uivk_algebra_when_not_previously_exposed() {
-        use zcash_keys::keys::UnifiedAddressRequest;
-
         // A bare Sapling address derivable from an account's UIVK must resolve even when the
         // wallet has never stored (and therefore never "exposed") that address.
         let ufvk = test_ufvk(1);
@@ -5044,8 +5182,6 @@ mod tests {
     #[cfg(feature = "orchard")]
     #[test]
     fn find_account_for_unified_address_errors_when_receivers_map_to_different_accounts() {
-        use zcash_keys::keys::UnifiedAddressRequest;
-
         let ufvk1 = test_ufvk(1);
         let ufvk2 = test_ufvk(2);
         let wallet = MockWalletDb::from_account_ufvks(

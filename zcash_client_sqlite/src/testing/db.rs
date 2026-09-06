@@ -42,6 +42,7 @@ use zcash_primitives::{
 };
 use zcash_protocol::{
     ShieldedPool, consensus, consensus::BlockHeight, local_consensus::LocalNetwork, memo::Memo,
+    value::Zatoshis,
 };
 use zip32::DiversifierIndex;
 
@@ -77,17 +78,18 @@ pub(crate) fn test_rng() -> ChaChaRng {
 #[delegate(InputSource, target = "wallet_db")]
 #[delegate(WalletRead, target = "wallet_db")]
 #[delegate(WalletTest, target = "wallet_db")]
+#[delegate(OutputLockStore, target = "wallet_db")]
 #[delegate(WalletWrite, target = "wallet_db")]
 #[delegate(WalletCommitmentTrees, target = "wallet_db")]
 pub struct TestDb {
     wallet_db: WalletDb<Connection, LocalNetwork, FixedClock, ChaChaRng>,
-    data_file: NamedTempFile,
+    data_file: Option<NamedTempFile>,
 }
 
 impl TestDb {
     fn from_parts(
         wallet_db: WalletDb<Connection, LocalNetwork, FixedClock, ChaChaRng>,
-        data_file: NamedTempFile,
+        data_file: Option<NamedTempFile>,
     ) -> Self {
         Self {
             wallet_db,
@@ -105,25 +107,27 @@ impl TestDb {
         &mut self.wallet_db
     }
 
-    // Used only by this crate's own `#[cfg(test)]` tests, not by the harness exposed under
-    // `test-dependencies`, so it is dead in a non-test `test-dependencies` build.
-    #[allow(dead_code)]
-    pub(crate) fn conn(&self) -> &Connection {
+    /// The wallet database's own SQLite connection, over which a sibling store (a
+    /// `pool_migration` store, say) is opened.
+    pub fn conn(&self) -> &Connection {
         &self.wallet_db.conn
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+    /// The wallet database's own SQLite connection, mutably. See [`Self::conn`].
+    pub fn conn_mut(&mut self) -> &mut Connection {
         &mut self.wallet_db.conn
     }
 
-    pub(crate) fn take_data_file(self) -> NamedTempFile {
+    pub(crate) fn take_data_file(self) -> Option<NamedTempFile> {
         self.data_file
     }
 
     #[allow(dead_code)]
     pub(crate) fn data_file_path(&self) -> &std::path::Path {
-        self.data_file.path()
+        self.data_file
+            .as_ref()
+            .expect("this test requires a file-backed TestDbFactory")
+            .path()
     }
 
     /// Dump the schema and contents of the given database table, in
@@ -139,7 +143,7 @@ impl TestDb {
     pub(crate) fn dump_table(&self, name: &'static str) {
         assert!(name.chars().all(|c| c.is_ascii_alphabetic() || c == '_'));
         unsafe {
-            run_sqlite3(self.data_file.path(), &format!(r#".dump "{name}""#));
+            run_sqlite3(self.data_file_path(), &format!(r#".dump "{name}""#));
         }
     }
 
@@ -153,7 +157,7 @@ impl TestDb {
     #[allow(dead_code)]
     #[cfg(feature = "unstable")]
     pub(crate) unsafe fn run_sqlite3(&self, command: &str) {
-        unsafe { run_sqlite3(self.data_file.path(), command) }
+        unsafe { run_sqlite3(self.data_file_path(), command) }
     }
 }
 
@@ -191,9 +195,23 @@ unsafe fn run_sqlite3<S: AsRef<OsStr>>(db_path: S, command: &str) {
 
 /// A [`DataStoreFactory`] that builds fresh in-memory [`TestDb`] wallets, optionally migrated only
 /// to a given set of migrations rather than all of them.
+///
+/// Tests that exercise reopening or multiple independent connections can opt into file-backed
+/// storage with [`Self::file_backed`].
 #[derive(Default)]
 pub struct TestDbFactory {
     target_migrations: Option<Vec<Uuid>>,
+    file_backed: bool,
+}
+
+impl TestDbFactory {
+    /// Constructs a factory for tests that require a database file.
+    pub fn file_backed() -> Self {
+        Self {
+            target_migrations: None,
+            file_backed: true,
+        }
+    }
 }
 
 impl DataStoreFactory for TestDbFactory {
@@ -209,9 +227,19 @@ impl DataStoreFactory for TestDbFactory {
         anchor_retention_interval: Option<AnchorRetentionInterval>,
         #[cfg(feature = "transparent-inputs")] gap_limits: Option<GapLimits>,
     ) -> Result<Self::DataStore, Self::Error> {
-        let data_file = NamedTempFile::new().unwrap();
-        let mut db_data =
-            WalletDb::for_path(data_file.path(), network, test_clock(), test_rng()).unwrap();
+        let (mut db_data, data_file) = if self.file_backed {
+            let data_file = NamedTempFile::new().unwrap();
+            let db_data =
+                WalletDb::for_path(data_file.path(), network, test_clock(), test_rng()).unwrap();
+            (db_data, Some(data_file))
+        } else {
+            let conn = Connection::open_in_memory().unwrap();
+            rusqlite::vtab::array::load_module(&conn).unwrap();
+            (
+                WalletDb::from_connection(conn, network, test_clock(), test_rng()),
+                None,
+            )
+        };
         if let Some(interval) = anchor_retention_interval {
             db_data = db_data.with_anchor_retention_interval(interval);
         }
@@ -235,9 +263,9 @@ impl DataStoreFactory for TestDbFactory {
 }
 
 impl Reset for TestDb {
-    type Handle = NamedTempFile;
+    type Handle = Option<NamedTempFile>;
 
-    fn reset<C>(st: &mut TestState<C, Self, LocalNetwork>) -> NamedTempFile {
+    fn reset<C>(st: &mut TestState<C, Self, LocalNetwork>) -> Self::Handle {
         let network = *st.network();
         let anchor_retention_interval = st.wallet().db().anchor_retention_interval;
         #[cfg(feature = "transparent-inputs")]
