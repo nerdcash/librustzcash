@@ -13,6 +13,21 @@ workspace.
 ### Added
 - `WalletWrite::import_account_uivk` is implemented for `WalletDb`, enabling
   import of incoming-viewing-key-only accounts.
+- `WalletDb::set_commitment_tree_write_back` disables the note-commitment tree
+  write-back cache. The cache is enabled by default.
+
+### Changed
+- Note-commitment tree updates performed through `WalletDb`'s Sapling, Orchard,
+  and Ironwood `with_*_tree_mut` callbacks accumulate shard and checkpoint
+  mutations in memory and flush them once per callback. Unchanged shards are
+  not rewritten. The flushed rows match the previous per-statement store,
+  including checkpoint conflicts, checkpoint iteration order, and subtree
+  discontinuity checks. A callback error rolls back the surrounding SQLite
+  transaction, so a cancelled batch leaves the tree unchanged.
+- `ShardStore` for `SqliteShardStore<&rusqlite::Transaction, H, SHARD_HEIGHT>`
+  requires `H: Clone`. The Sapling, Orchard, and Ironwood node types already
+  implement `Clone`. The write-back cache stores owned shards and returns
+  clones of them.
 
 ## [0.23.0] - 2026-10-21
 
