@@ -6142,6 +6142,7 @@ mod tests {
     }
 
     /// Diversifier index used when persisting an address through the fork's insertion API.
+    #[cfg(feature = "orchard")]
     const PUT_ADDRESS_DIVERSIFIER_INDEX: u32 = 0;
 
     #[cfg(feature = "orchard")]
