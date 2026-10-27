@@ -89,11 +89,11 @@ use std::{
 };
 
 use encoding::{
-    KeyScope, ReceiverFlags, account_kind_code, decode_diversifier_index_be,
-    encode_diversifier_index_be, memo_repr, parse_pool_code, pool_code,
+    account_kind_code, decode_diversifier_index_be, encode_diversifier_index_be, memo_repr,
+    parse_pool_code, pool_code, KeyScope, ReceiverFlags,
 };
 use incrementalmerkletree::{Marking, Retention};
-use rusqlite::{self, Connection, OptionalExtension, named_params, params};
+use rusqlite::{self, named_params, params, Connection, OptionalExtension};
 use secrecy::{ExposeSecret, SecretVec};
 use shardtree::{error::ShardTreeError, store::ShardStore};
 use tracing::warn;
@@ -105,20 +105,20 @@ use zcash_address::ZcashAddress;
 #[cfg(feature = "transparent-inputs")]
 use zcash_client_backend::data_api::TransparentAddressSyncInfo;
 use zcash_client_backend::{
-    DecryptedOutput,
     data_api::{
-        Account as _, AccountBalance, AccountBirthday, AccountPurpose, AccountSource, AddressInfo,
-        AddressSource, BlockMetadata, ChangeReceivers, Progress, Ratio, ReceivedTransactionOutput,
-        SAPLING_SHARD_HEIGHT, SentTransaction, SentTransactionOutput, TransactionDataRequest,
-        TransactionStatus, WalletSummary, Zip32Derivation,
         anchor_retention::AnchorRetentionInterval,
         chain::ChainState,
         defaults::address_receiver_matches_ua,
         error::{FindAccountForAddressError, RewindError},
         scanning::{ScanPriority, ScanRange},
         wallet::{ConfirmationsPolicy, TargetHeight},
+        Account as _, AccountBalance, AccountBirthday, AccountPurpose, AccountSource, AddressInfo,
+        AddressSource, BlockMetadata, ChangeReceivers, Progress, Ratio, ReceivedTransactionOutput,
+        SentTransaction, SentTransactionOutput, TransactionDataRequest, TransactionStatus,
+        WalletSummary, Zip32Derivation, SAPLING_SHARD_HEIGHT,
     },
     wallet::{Note, NoteId, Recipient, WalletTx},
+    DecryptedOutput,
 };
 use zcash_keys::{
     address::{Address, Receiver, UnifiedAddress},
@@ -130,30 +130,30 @@ use zcash_keys::{
 };
 use zcash_primitives::{
     block::BlockHash,
-    merkle_tree::{HashSer, read_commitment_tree},
-    transaction::{Transaction, TransactionData, fees::zip317},
+    merkle_tree::{read_commitment_tree, HashSer},
+    transaction::{fees::zip317, Transaction, TransactionData},
 };
 use zcash_protocol::{
-    PoolType, ShieldedPool, TxId,
     consensus::{self, BlockHeight, BranchId, NetworkUpgrade, Parameters, TxIndex},
     memo::{Memo, MemoBytes},
     value::{ZatBalance, Zatoshis},
+    PoolType, ShieldedPool, TxId,
 };
-use zip32::{DiversifierIndex, fingerprint::SeedFingerprint};
+use zip32::{fingerprint::SeedFingerprint, DiversifierIndex};
 
 use self::{
-    common::{TableConstants, default_tx_expiry_delta_sql, table_constants},
+    common::{default_tx_expiry_delta_sql, table_constants, TableConstants},
     scanning::{parse_priority_code, priority_code, replace_queue_entries},
 };
 use crate::{
-    AccountRef, AccountUuid, AddressRef, PRUNING_DEPTH, SqlTransaction, TransferType, TxRef,
-    WalletCommitmentTrees, WalletDb,
     error::{BackendError, SqliteClientError},
     util::Clock,
     wallet::{
-        commitment_tree::{SqliteShardStore, get_max_checkpointed_height},
+        commitment_tree::{get_max_checkpointed_height, SqliteShardStore},
         encoding::LEGACY_ADDRESS_INDEX_NULL,
     },
+    AccountRef, AccountUuid, AddressRef, SqlTransaction, TransferType, TxRef,
+    WalletCommitmentTrees, WalletDb, PRUNING_DEPTH,
 };
 
 #[cfg(feature = "transparent-inputs")]
@@ -163,18 +163,18 @@ use {
         bundle::{OutPoint, TxOut},
         keys::{IncomingViewingKey as _, NonHardenedChildIndex, TransparentKeyScope},
     },
-    ReceiverRequirement::*,
     rusqlite::types::Value,
     std::rc::Rc,
     zcash_client_backend::{data_api::DecryptedTransaction, wallet::WalletTransparentOutput},
+    ReceiverRequirement::*,
 };
 
 #[cfg(feature = "orchard")]
 use zcash_client_backend::data_api::{IRONWOOD_SHARD_HEIGHT, ORCHARD_SHARD_HEIGHT};
 
-use FindAccountForAddressError as E;
 #[cfg(feature = "transparent-key-import")]
 use zcash_script::{descriptor::sh, script::Evaluable};
+use FindAccountForAddressError as E;
 #[cfg(feature = "zcashd-compat")]
 use {
     crate::wallet::encoding::{decode_legacy_account_index, encode_legacy_account_index},
@@ -621,6 +621,10 @@ pub(crate) fn add_account<P: consensus::Parameters>(
         gap_limits,
         birthday.prior_chain_state(),
         std::iter::once(account_uuid).collect(),
+        // Account import builds no `WalletDb` handle, so it cannot see a caller's
+        // `set_commitment_tree_write_back` choice. The cache is the default and writes the
+        // same rows as the immediate store.
+        true,
     ) {
         Ok(()) => {}
         Err(RewindError::DataSource(e)) => return Err(e),
@@ -2697,7 +2701,7 @@ impl ProgressEstimator for SubtreeProgressEstimator {
     }
 }
 
-fn next_subtree_index<H: HashSer, const SHARD_HEIGHT: u8>(
+fn next_subtree_index<H: HashSer + Clone, const SHARD_HEIGHT: u8>(
     tx: &rusqlite::Transaction,
     table_prefix: &'static str,
 ) -> Result<u64, SqliteClientError> {
@@ -4267,6 +4271,7 @@ pub(crate) fn truncate_to_height<P: consensus::Parameters>(
     params: &P,
     #[cfg(feature = "transparent-inputs")] gap_limits: &GapLimits,
     max_height: BlockHeight,
+    commitment_tree_write_back: bool,
 ) -> Result<BlockHeight, SqliteClientError> {
     let truncation_height = select_truncation_height(conn, max_height)?;
     truncate_to_height_internal(
@@ -4276,6 +4281,7 @@ pub(crate) fn truncate_to_height<P: consensus::Parameters>(
         gap_limits,
         truncation_height,
         truncation_height,
+        commitment_tree_write_back,
     )
 }
 
@@ -4444,6 +4450,7 @@ pub(crate) fn truncate_to_height_internal<P: consensus::Parameters>(
     #[cfg(feature = "transparent-inputs")] gap_limits: &GapLimits,
     truncation_height: BlockHeight,
     rescan_floor: BlockHeight,
+    commitment_tree_write_back: bool,
 ) -> Result<BlockHeight, SqliteClientError> {
     let last_scanned_height = conn.query_row("SELECT MAX(height) FROM blocks", [], |row| {
         let h = row.get::<_, Option<u32>>(0)?;
@@ -4504,6 +4511,7 @@ pub(crate) fn truncate_to_height_internal<P: consensus::Parameters>(
             // Truncation removes checkpoints; it never establishes them, so no anchor retention
             // decision is made through this handle and the interval is immaterial.
             anchor_retention_interval: AnchorRetentionInterval::default(),
+            commitment_tree_write_back,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: *gap_limits,
         };
@@ -4738,6 +4746,7 @@ pub(crate) fn truncate_to_chain_state<P: consensus::Parameters, CL, R>(
                         &wdb.gap_limits,
                         h,
                         h,
+                        wdb.commitment_tree_write_back,
                     )
                     .map(|_| ());
                 } else {
@@ -4765,6 +4774,7 @@ pub(crate) fn truncate_to_chain_state<P: consensus::Parameters, CL, R>(
                         &wdb.gap_limits,
                         min_checkpoint_height,
                         min_checkpoint_height,
+                        wdb.commitment_tree_write_back,
                     )?;
                 } else {
                     // There are no checkpoints in either table; just continue.
@@ -4841,6 +4851,7 @@ pub(crate) fn truncate_to_chain_state<P: consensus::Parameters, CL, R>(
         &wdb.gap_limits,
         target_height,
         target_height,
+        wdb.commitment_tree_write_back,
     )?;
 
     assert_eq!(truncated_height, target_height);
@@ -4897,6 +4908,7 @@ pub(crate) fn rewind_to_chain_state<P: consensus::Parameters>(
     #[cfg(feature = "transparent-inputs")] gap_limits: &GapLimits,
     chain_state: &ChainState,
     reset_account_birthdays: HashSet<AccountUuid>,
+    commitment_tree_write_back: bool,
 ) -> Result<(), RewindError<AccountUuid, SqliteClientError>> {
     // Load every account's birthday so we can validate `reset_account_birthdays` against the
     // wallet's accounts and check whether at least one existing birthday is at or below the
@@ -5002,6 +5014,7 @@ pub(crate) fn rewind_to_chain_state<P: consensus::Parameters>(
             gap_limits,
             truncation_height,
             target_height,
+            commitment_tree_write_back,
         )
         .map_err(RewindError::DataSource)?;
     }
@@ -6318,13 +6331,13 @@ pub mod testing {
     use zcash_client_backend::data_api::testing::TransactionSummary;
     use zcash_primitives::transaction::TxId;
     use zcash_protocol::{
-        ShieldedPool,
         consensus::BlockHeight,
         value::{ZatBalance, Zatoshis},
+        ShieldedPool,
     };
 
-    use super::common::{TableConstants, table_constants};
-    use crate::{AccountUuid, error::SqliteClientError};
+    use super::common::{table_constants, TableConstants};
+    use crate::{error::SqliteClientError, AccountUuid};
 
     pub(crate) fn get_tx_history(
         conn: &rusqlite::Connection,
@@ -6398,25 +6411,25 @@ pub mod testing {
 mod tests {
     use std::{
         collections::HashSet,
-        num::{NonZeroU8, NonZeroU32},
+        num::{NonZeroU32, NonZeroU8},
     };
 
-    use rusqlite::{Connection, named_params};
+    use rusqlite::{named_params, Connection};
     use sapling::zip32::ExtendedSpendingKey;
     use secrecy::{ExposeSecret, Secret, SecretVec};
     use uuid::Uuid;
     use zcash_client_backend::{
         data_api::{
-            Account as _, AccountBirthday, AccountSource, TransactionDataRequest,
-            TransactionStatus, WalletRead, WalletTest, WalletWrite,
             chain::{ChainState, CommitmentTreeRoot},
             error::RewindError,
             testing::{
-                AddressType, DataStoreFactory, FakeCompactOutput, InitialChainState, TestBuilder,
-                TestState, pool::ShieldedPoolTester, sapling::SaplingPoolTester,
-                single_output_change_strategy,
+                pool::ShieldedPoolTester, sapling::SaplingPoolTester,
+                single_output_change_strategy, AddressType, DataStoreFactory, FakeCompactOutput,
+                InitialChainState, TestBuilder, TestState,
             },
-            wallet::{ConfirmationsPolicy, input_selection::GreedyInputSelector},
+            wallet::{input_selection::GreedyInputSelector, ConfirmationsPolicy},
+            Account as _, AccountBirthday, AccountSource, TransactionDataRequest,
+            TransactionStatus, WalletRead, WalletTest, WalletWrite,
         },
         fees::StandardFeeRule,
         wallet::OvkPolicy,
@@ -6427,25 +6440,25 @@ mod tests {
         transaction::builder::{BLOSSOM_DEFAULT_TX_EXPIRY_DELTA, NU7_DEFAULT_TX_EXPIRY_DELTA},
     };
     use zcash_protocol::{
-        TxId,
-        consensus::{BlockHeight, BranchId, MAIN_NETWORK, NetworkUpgrade, Parameters},
+        consensus::{BlockHeight, BranchId, NetworkUpgrade, Parameters, MAIN_NETWORK},
         local_consensus::LocalNetwork,
         value::{ZatBalance, Zatoshis},
         zip318::{Zip318Classification, Zip318TxKind},
+        TxId,
     };
     use zip321::{Payment, TransactionRequest};
 
     use crate::{
-        AccountUuid, PRUNING_DEPTH,
         error::SqliteClientError,
-        testing::{BlockCache, db::TestDbFactory},
+        testing::{db::TestDbFactory, BlockCache},
+        AccountUuid, PRUNING_DEPTH,
     };
 
     use super::{
-        KeyScope, ShieldedPool, TxQueryType, TxRef, account_birthday, chain_tip_height,
-        flag_previously_received_change, get_transaction, get_unknown_fee_spenders_of,
-        min_shared_checkpoint_height, parse_tx, put_zip318_classification, queue_tx_retrieval,
-        select_truncation_height,
+        account_birthday, chain_tip_height, flag_previously_received_change, get_transaction,
+        get_unknown_fee_spenders_of, min_shared_checkpoint_height, parse_tx,
+        put_zip318_classification, queue_tx_retrieval, select_truncation_height, KeyScope,
+        ShieldedPool, TxQueryType, TxRef,
     };
 
     use incrementalmerkletree::frontier::Frontier;

@@ -37,7 +37,7 @@ use incrementalmerkletree::Position;
 use nonempty::NonEmpty;
 use rand::Rng;
 use secrecy::{ExposeSecret, SecretVec};
-use shardtree::{ShardTree, error::ShardTreeError, store::ShardStore};
+use shardtree::{error::ShardTreeError, store::ShardStore, ShardTree};
 use std::{
     borrow::{Borrow, BorrowMut},
     cmp::{max, min},
@@ -56,26 +56,26 @@ use uuid::Uuid;
 use zcash_client_backend::data_api::TransparentAddressSyncInfo;
 
 use zcash_client_backend::{
-    TransferType,
     data_api::{
-        self, Account, AccountBirthday, AccountMeta, AccountPurpose, AccountSource, AddressInfo,
-        BlockMetadata, ChangeReceivers, DecryptedTransaction, InputSource, NoteFilter,
-        NullifierQuery, OutputLockStore, ReceivedNotes, ReceivedTransactionOutput,
-        SAPLING_SHARD_HEIGHT, ScannedBlock, SeedRelevance, SentTransaction, TargetValue,
-        TransactionDataRequest, WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite,
-        Zip32Derivation,
+        self,
         anchor_retention::{AnchorRetention, AnchorRetentionInterval},
         chain::{BlockSource, ChainState, CommitmentTreeRoot},
         error::{FindAccountForAddressError, LockError, RewindError},
         ll::{
-            self, LowLevelWalletRead, LowLevelWalletWrite, ReceivedSaplingOutput,
-            wallet::store_decrypted_tx,
+            self, wallet::store_decrypted_tx, LowLevelWalletRead, LowLevelWalletWrite,
+            ReceivedSaplingOutput,
         },
         scanning::{ScanPriority, ScanRange},
-        wallet::{ConfirmationsPolicy, TargetHeight, input_selection::LockFilter},
+        wallet::{input_selection::LockFilter, ConfirmationsPolicy, TargetHeight},
+        Account, AccountBirthday, AccountMeta, AccountPurpose, AccountSource, AddressInfo,
+        BlockMetadata, ChangeReceivers, DecryptedTransaction, InputSource, NoteFilter,
+        NullifierQuery, OutputLockStore, ReceivedNotes, ReceivedTransactionOutput, ScannedBlock,
+        SeedRelevance, SentTransaction, TargetValue, TransactionDataRequest, WalletCommitmentTrees,
+        WalletRead, WalletSummary, WalletWrite, Zip32Derivation, SAPLING_SHARD_HEIGHT,
     },
     proto::compact_formats::CompactBlock,
     wallet::{LockOwner, Note, NoteId, OutputRef, ReceivedNote, WalletTransparentOutput, WalletTx},
+    TransferType,
 };
 use zcash_keys::{
     address::UnifiedAddress,
@@ -89,30 +89,29 @@ use zcash_primitives::{
     transaction::{Transaction, TxId},
 };
 use zcash_protocol::{
-    ShieldedPool,
     consensus::{self, BlockHeight, TxIndex},
     memo::Memo,
     value::Zatoshis,
+    ShieldedPool,
 };
-use zip32::{DiversifierIndex, fingerprint::SeedFingerprint};
+use zip32::{fingerprint::SeedFingerprint, DiversifierIndex};
 
 use crate::{
     error::SqliteClientError,
     wallet::{chain_tip_height, commitment_tree::SqliteShardStore},
 };
 use wallet::{
-    SubtreeProgressEstimator,
     commitment_tree::{self, put_shard_roots},
-    common::{TableConstants, unspent_notes_meta},
+    common::{unspent_notes_meta, TableConstants},
     scanning::replace_queue_entries,
-    upsert_address,
+    upsert_address, SubtreeProgressEstimator,
 };
 
 #[cfg(feature = "orchard")]
 use zcash_client_backend::{
     data_api::{
-        IRONWOOD_SHARD_HEIGHT, ORCHARD_SHARD_HEIGHT, ll::ReceivedOrchardOutput,
-        zip318::classify_decrypted_tx,
+        ll::ReceivedOrchardOutput, zip318::classify_decrypted_tx, IRONWOOD_SHARD_HEIGHT,
+        ORCHARD_SHARD_HEIGHT,
     },
     decrypt_transaction,
 };
@@ -125,17 +124,17 @@ use {
         bundle::OutPoint,
         keys::{NonHardenedChildIndex, TransparentKeyScope},
     },
-    ReceiverRequirement::*,
     std::time::SystemTime,
     zcash_client_backend::{
         data_api::{
-            CoinbaseFilter, TransactionsInvolvingAddress, TransparentBalances,
-            ll::wallet::generate_transparent_gap_addresses,
+            ll::wallet::generate_transparent_gap_addresses, CoinbaseFilter,
+            TransactionsInvolvingAddress, TransparentBalances,
         },
         fees::StandardFeeRule,
         wallet::TransparentAddressMetadata,
     },
     zcash_keys::keys::transparent::gap_limits::{AddressStore, GapLimits},
+    ReceiverRequirement::*,
 };
 
 // `AddressCodec` is used only by `find_account_for_ephemeral_address`, which is
@@ -150,7 +149,7 @@ use zcash_keys::encoding::AddressCodec;
 use {
     crate::wallet::encoding::pool_code,
     rusqlite::named_params,
-    zcash_client_backend::data_api::{OutputOfSentTx, WalletTest, testing::TransactionSummary},
+    zcash_client_backend::data_api::{testing::TransactionSummary, OutputOfSentTx, WalletTest},
 };
 
 #[cfg(any(test, feature = "test-dependencies", feature = "transparent-inputs"))]
@@ -162,7 +161,7 @@ use zcash_protocol::PoolType;
 use rusqlite::hooks::{AuthAction, Authorization};
 #[cfg(feature = "unstable")]
 use {
-    crate::chain::{BlockMeta, fsblockdb_with_blocks},
+    crate::chain::{fsblockdb_with_blocks, BlockMeta},
     std::{fs, io, path::PathBuf},
 };
 
@@ -296,6 +295,9 @@ pub struct WalletDb<C, P, CL, R> {
     clock: CL,
     rng: R,
     anchor_retention_interval: AnchorRetentionInterval,
+    /// When set, each `with_*_tree_mut` callback accumulates note-commitment tree mutations in
+    /// memory and writes them back once. Not persisted. Defaults to `true`.
+    commitment_tree_write_back: bool,
     #[cfg(feature = "transparent-inputs")]
     gap_limits: GapLimits,
 }
@@ -584,6 +586,7 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
                 clock,
                 rng,
                 anchor_retention_interval: AnchorRetentionInterval::default(),
+                commitment_tree_write_back: true,
                 #[cfg(feature = "transparent-inputs")]
                 gap_limits: GapLimits::default(),
             })
@@ -618,6 +621,18 @@ impl<C, P, CL, R> WalletDb<C, P, CL, R> {
     pub fn set_anchor_retention_interval(&mut self, interval: AnchorRetentionInterval) {
         self.anchor_retention_interval = interval;
     }
+
+    /// Enables or disables the in-memory write-back cache for note-commitment trees.
+    ///
+    /// The cache is enabled by default. While it is enabled, each note-commitment tree callback
+    /// keeps shard and checkpoint mutations in memory and writes them to SQLite once, through the
+    /// same statements an immediate update would have used. The final tree rows match immediate
+    /// updates. Disabling the cache restores a statement per mutation, which is the comparison
+    /// point for measuring the cache. The setting applies to this handle and to handles derived
+    /// from it inside [`Self::transactionally`]; it is not stored in the database.
+    pub fn set_commitment_tree_write_back(&mut self, enabled: bool) {
+        self.commitment_tree_write_back = enabled;
+    }
 }
 
 #[cfg(feature = "transparent-inputs")]
@@ -651,6 +666,7 @@ impl<C: Borrow<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             clock,
             rng,
             anchor_retention_interval: AnchorRetentionInterval::default(),
+            commitment_tree_write_back: true,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: GapLimits::default(),
         }
@@ -703,6 +719,7 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             clock: &self.clock,
             rng: &mut self.rng,
             anchor_retention_interval: self.anchor_retention_interval,
+            commitment_tree_write_back: self.commitment_tree_write_back,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
@@ -761,6 +778,7 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             clock: &self.clock,
             rng: &mut self.rng,
             anchor_retention_interval: self.anchor_retention_interval,
+            commitment_tree_write_back: self.commitment_tree_write_back,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
@@ -2126,6 +2144,7 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
             &self.gap_limits,
             &chain_state,
             reset_account_birthdays,
+            self.commitment_tree_write_back,
         );
         if result.is_ok() {
             tx.commit()
@@ -2758,6 +2777,7 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             #[cfg(feature = "transparent-inputs")]
             &self.gap_limits,
             max_height,
+            self.commitment_tree_write_back,
         )
     }
 
@@ -2780,6 +2800,7 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             &self.gap_limits,
             &chain_state,
             reset_account_birthdays,
+            self.commitment_tree_write_back,
         )
     }
 
@@ -3526,10 +3547,26 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL, R> Wallet
             .borrow_mut()
             .transaction()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
+        let flush_report = new_flush_report();
         let result = {
             let mut shardtree = sapling_tree(&tx)?;
-            callback(&mut shardtree)?
-        };
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         tx.commit()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
@@ -3584,10 +3621,26 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL, R> Wallet
             .borrow_mut()
             .transaction()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
+        let flush_report = new_flush_report();
         let result = {
             let mut shardtree = orchard_tree(&tx)?;
-            callback(&mut shardtree)?
-        };
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         tx.commit()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
@@ -3668,15 +3721,44 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL, R> Wallet
             .borrow_mut()
             .transaction()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
+        let flush_report = new_flush_report();
         let result = {
             let mut shardtree = ironwood_tree(&tx)?;
-            callback(&mut shardtree)?
-        };
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         tx.commit()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
         Ok(Some(result))
     }
+}
+
+fn new_flush_report() -> std::rc::Rc<std::cell::RefCell<Result<(), commitment_tree::Error>>> {
+    std::rc::Rc::new(std::cell::RefCell::new(Ok(())))
+}
+
+fn take_flush_report(
+    report: std::rc::Rc<std::cell::RefCell<Result<(), commitment_tree::Error>>>,
+) -> Result<(), ShardTreeError<commitment_tree::Error>> {
+    std::rc::Rc::try_unwrap(report)
+        .unwrap_or_else(|_| panic!("commitment tree write-back report is still held by the tree"))
+        .into_inner()
+        .map_err(ShardTreeError::Storage)
 }
 
 impl<P: consensus::Parameters, CL, R> WalletCommitmentTrees
@@ -3691,8 +3773,26 @@ impl<P: consensus::Parameters, CL, R> WalletCommitmentTrees
             FnMut(&'a mut SaplingCommitmentTree<&'a rusqlite::Transaction<'a>>) -> Result<A, E>,
         E: From<ShardTreeError<commitment_tree::Error>>,
     {
-        let mut shardtree = sapling_tree(self.conn.0)?;
-        let result = callback(&mut shardtree)?;
+        let flush_report = new_flush_report();
+        let result = {
+            let mut shardtree = sapling_tree(self.conn.0)?;
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         Ok(result)
     }
@@ -3728,8 +3828,26 @@ impl<P: consensus::Parameters, CL, R> WalletCommitmentTrees
             FnMut(&'a mut OrchardCommitmentTree<&'a rusqlite::Transaction<'a>>) -> Result<A, E>,
         E: From<ShardTreeError<Self::Error>>,
     {
-        let mut shardtree = orchard_tree(self.conn.0)?;
-        let result = callback(&mut shardtree)?;
+        let flush_report = new_flush_report();
+        let result = {
+            let mut shardtree = orchard_tree(self.conn.0)?;
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         Ok(result)
     }
@@ -3787,8 +3905,26 @@ impl<P: consensus::Parameters, CL, R> WalletCommitmentTrees
             FnMut(&'a mut IronwoodCommitmentTree<&'a rusqlite::Transaction<'a>>) -> Result<A, E>,
         E: From<ShardTreeError<Self::Error>>,
     {
-        let mut shardtree = ironwood_tree(self.conn.0)?;
-        let result = callback(&mut shardtree)?;
+        let flush_report = new_flush_report();
+        let result = {
+            let mut shardtree = ironwood_tree(self.conn.0)?;
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         Ok(Some(result))
     }
@@ -4254,10 +4390,10 @@ mod tests {
     #[cfg(feature = "orchard")]
     use zcash_client_backend::data_api::error::FindAccountForAddressError;
     use zcash_client_backend::data_api::{
-        Account, AccountBirthday, AccountPurpose, AccountSource, SAPLING_SHARD_HEIGHT,
-        WalletCommitmentTrees, WalletRead, WalletTest, WalletWrite,
         chain::{ChainState, CommitmentTreeRoot},
         testing::{TestBuilder, TestState},
+        Account, AccountBirthday, AccountPurpose, AccountSource, WalletCommitmentTrees, WalletRead,
+        WalletTest, WalletWrite, SAPLING_SHARD_HEIGHT,
     };
     use zcash_keys::{
         address::{Address, UnifiedAddress},
@@ -4271,11 +4407,11 @@ mod tests {
     use zip32::DiversifierIndex;
 
     use crate::{
-        AccountUuid,
         error::SqliteClientError,
         testing::db::{TestDb, TestDbFactory},
         util::Clock as _,
         wallet::MIN_SHIELDED_DIVERSIFIER_OFFSET,
+        AccountUuid,
     };
 
     use incrementalmerkletree::Hashable as _;
@@ -4286,17 +4422,17 @@ mod tests {
         zcash_keys::keys::sapling,
         zcash_protocol::{consensus::NetworkConstants, value::Zatoshis},
     };
-    #[cfg(all(feature = "orchard", feature = "transparent-inputs"))]
-    use {
-        crate::{AccountRef, wallet::transparent},
-        ::transparent::keys::{NonHardenedChildIndex, TransparentKeyScope},
-    };
     #[cfg(feature = "transparent-inputs")]
     use {
-        crate::{GapLimits, testing::BlockCache, wallet::transparent::transaction_data_requests},
+        crate::{testing::BlockCache, wallet::transparent::transaction_data_requests, GapLimits},
         rusqlite::named_params,
         std::collections::BTreeSet,
         zcash_client_backend::data_api::TransactionDataRequest,
+    };
+    #[cfg(all(feature = "orchard", feature = "transparent-inputs"))]
+    use {
+        crate::{wallet::transparent, AccountRef},
+        ::transparent::keys::{NonHardenedChildIndex, TransparentKeyScope},
     };
 
     #[test]
@@ -5096,12 +5232,10 @@ mod tests {
             .get_account(account.id())
             .unwrap()
             .expect("the account was persisted");
-        assert!(
-            stored
-                .ufvk()
-                .expect("the account has a UFVK")
-                .is_equivalent_to(&ufvk)
-        );
+        assert!(stored
+            .ufvk()
+            .expect("the account has a UFVK")
+            .is_equivalent_to(&ufvk));
 
         // The account's default address was stored, and is a transparent-only Revision 2
         // Unified Address. Matching on `AllAvailableKeys` also pins the stored row's
@@ -5440,15 +5574,13 @@ mod tests {
             .unwrap();
 
         // The receiver for the default UA should be in the set.
-        assert!(
-            receivers.contains_key(
-                ufvk.default_address(UnifiedAddressRequest::AllAvailableKeys)
-                    .expect("A valid default address exists for the UFVK")
-                    .0
-                    .transparent()
-                    .unwrap()
-            )
-        );
+        assert!(receivers.contains_key(
+            ufvk.default_address(UnifiedAddressRequest::AllAvailableKeys)
+                .expect("A valid default address exists for the UFVK")
+                .0
+                .transparent()
+                .unwrap()
+        ));
 
         // The default t-addr should be in the set.
         assert!(receivers.contains_key(&taddr));
@@ -6002,12 +6134,11 @@ mod tests {
             loaded.uivk().encode(st.network()).unwrap(),
             uivk.encode(st.network()).unwrap()
         );
-        assert!(
-            !st.wallet()
-                .get_unified_full_viewing_keys()
-                .unwrap()
-                .contains_key(&account.id())
-        );
+        assert!(!st
+            .wallet()
+            .get_unified_full_viewing_keys()
+            .unwrap()
+            .contains_key(&account.id()));
     }
 
     /// Diversifier index used when persisting an address through the fork's insertion API.
