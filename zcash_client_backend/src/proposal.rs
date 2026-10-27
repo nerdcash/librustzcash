@@ -1146,7 +1146,7 @@ impl<NoteRef> Step<NoteRef> {
                 .is_some_and(|value| params.is_canonical_denomination(value))
             && self
                 .anchor_height()
-                .is_some_and(|anchor| params.anchor_bucket_interval().is_boundary(anchor))
+                .is_some_and(|anchor| params.anchor_grid().is_boundary(anchor))
             // ZIP 318 forbids a non-standard fee, which would partition the anonymity set as
             // surely as a non-standard shape. A `ChangeStrategy` may be built on any fee rule,
             // including a fixed non-standard one, so a structurally perfect crossing can still
@@ -1612,7 +1612,10 @@ mod tests {
     /// parameters from a wallet-shaped value, as production code does; there is deliberately no
     /// implementation of `PoolMigrationConstants` for a network type.
     fn zip318() -> PoolMigrationParams {
-        PoolMigrationParams::new(AnchorRetentionInterval::ZIP_318)
+        PoolMigrationParams::new(
+            zcash_protocol::zip318::BlockSpacing::UNIFORM,
+            AnchorRetentionInterval::ZIP_318,
+        )
     }
 
     fn shielded_change(pool: ShieldedPool, value: u64) -> ChangeValue {
@@ -1748,6 +1751,10 @@ mod tests {
         #[derive(Clone)]
         struct SmallCap;
         impl PoolMigrationConstants for SmallCap {
+            fn block_spacing(&self) -> zcash_protocol::zip318::BlockSpacing {
+                zcash_protocol::zip318::BlockSpacing::UNIFORM
+            }
+
             fn denomination_cap(&self) -> Zatoshis {
                 Zatoshis::const_from_u64(COIN)
             }
@@ -2033,8 +2040,8 @@ mod tests {
     ) -> Result<Step<u32>, ProposalError> {
         let sk: SpendingKey = Option::from(SpendingKey::from_bytes([0x2a; 32])).unwrap();
         let recipient = FullViewingKey::from(&sk).address_at(0u32, zip32::Scope::External);
-        let ua = UnifiedAddress::from_receivers(Some(recipient), None, None).unwrap();
-        let to = Address::Unified(ua).to_zcash_address(&Network::TestNetwork);
+        let ua = UnifiedAddress::from_receivers(Some(recipient), None, None, None, None).unwrap();
+        let to = Address::Unified(Box::new(ua)).to_zcash_address(&Network::TestNetwork);
 
         let request = TransactionRequest::new(vec![
             zip321::Payment::new(
@@ -2155,10 +2162,9 @@ mod tests {
         ])
     }
 
-    // The network upgrades from which the Orchard pool disables cross-address transfers. `Nu7` is
-    // excluded: it has no activation height on any network yet, so no bundle can be built for it.
+    // The network upgrades from which the Orchard pool disables cross-address transfers.
     fn arb_nu6_3_or_later_upgrade() -> impl Strategy<Value = NetworkUpgrade> {
-        prop::sample::select(vec![NetworkUpgrade::Nu6_3])
+        prop::sample::select(vec![NetworkUpgrade::Nu6_3, NetworkUpgrade::Nu7])
     }
 
     // Resolves the bundle version applicable to a pool at an upgrade's testnet activation height,

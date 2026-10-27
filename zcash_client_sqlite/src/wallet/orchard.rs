@@ -108,7 +108,7 @@ pub(crate) fn to_received_note<P: consensus::Parameters>(
         .zip(scope_code)
         .map(|(ufvk_str, scope_code)| {
             let ufvk = UnifiedFullViewingKey::decode(params, &ufvk_str)
-                .map_err(SqliteClientError::CorruptedData)?;
+                .map_err(|e| SqliteClientError::CorruptedData(e.to_string()))?;
 
             let spending_key_scope = zip32::Scope::try_from(KeyScope::decode(scope_code)?)
                 .map_err(|_| {
@@ -437,13 +437,15 @@ pub(crate) fn ensure_address<
     }
 }
 
-pub(crate) fn select_unspent_note_meta(
+pub(crate) fn select_unspent_note_meta<P: consensus::Parameters>(
     conn: &Connection,
+    params: &P,
     wallet_birthday: BlockHeight,
     anchor_height: BlockHeight,
 ) -> Result<Vec<UnspentNoteMeta>, SqliteClientError> {
     super::common::select_unspent_note_meta(
         conn,
+        params,
         ShieldedPool::Orchard,
         wallet_birthday,
         anchor_height,
@@ -775,6 +777,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn create_to_address_respects_recipient_expiry() {
+        testing::pool::create_to_address_respects_recipient_expiry::<OrchardPoolTester>()
+    }
+
+    #[test]
+    fn create_proposed_transactions_uses_nu7_default_expiry() {
+        testing::pool::create_proposed_transactions_uses_nu7_default_expiry::<OrchardPoolTester>()
+    }
+
+    #[cfg(feature = "pczt-tests")]
+    #[test]
+    fn create_pczt_uses_nu7_default_expiry() {
+        testing::pool::create_pczt_uses_nu7_default_expiry::<OrchardPoolTester>()
+    }
+
+    #[test]
     fn scan_full_block_detects_outputs() {
         testing::pool::scan_full_block_detects_outputs::<OrchardPoolTester>()
     }
@@ -813,6 +831,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn transfer_grows_across_pools_at_a_dust_shortfall() {
+        testing::pool::transfer_grows_across_pools_at_a_dust_shortfall::<
+            OrchardPoolTester,
+            SaplingPoolTester,
+        >()
+    }
+
+    #[test]
+    fn transfer_fails_across_pools_at_a_dust_shortfall() {
+        testing::pool::transfer_fails_across_pools_at_a_dust_shortfall::<
+            OrchardPoolTester,
+            SaplingPoolTester,
+        >()
+    }
+
+    #[test]
     fn send_max_fails_when_balance_is_consumed_by_fees() {
         testing::pool::send_max_fails_when_balance_is_consumed_by_fees::<OrchardPoolTester>()
     }
@@ -826,6 +860,12 @@ pub(crate) mod tests {
     #[test]
     fn send_max_proposal_fails_when_unconfirmed_funds_present() {
         testing::pool::send_max_proposal_fails_when_unconfirmed_funds_present::<OrchardPoolTester>()
+    }
+
+    #[test]
+    #[cfg(feature = "transparent-inputs")]
+    fn insufficient_funds_counts_transparent_inputs() {
+        testing::pool::insufficient_funds_counts_transparent_inputs::<OrchardPoolTester>()
     }
 
     #[test]
@@ -916,6 +956,11 @@ pub(crate) mod tests {
     #[test]
     fn account_deletion_with_internal_transfer() {
         testing::pool::account_deletion_with_internal_transfer::<OrchardPoolTester>()
+    }
+
+    #[test]
+    fn account_rename() {
+        testing::pool::account_rename::<OrchardPoolTester>()
     }
 
     #[test]
@@ -1521,7 +1566,14 @@ pub(crate) mod tests {
         // Decrypt the full transaction with the account's viewing keys.
         let mut ufvks = HashMap::new();
         ufvks.insert(account_id, account.ufvk().unwrap().clone());
-        let d_tx = decrypt_transaction(st.network(), None, None, &tx, &ufvks, &std::collections::HashMap::new());
+        let d_tx = decrypt_transaction(
+            st.network(),
+            None,
+            None,
+            &tx,
+            &ufvks,
+            &std::collections::HashMap::new(),
+        );
 
         // The wallet-owned Ironwood outputs are detected under the Ironwood domain (not
         // Orchard). Spending Ironwood funds to the account's own Orchard receiver produces both
@@ -1765,7 +1817,7 @@ pub(crate) mod tests {
             wallet::orchard::select_spendable_ironwood_notes,
         };
         use orchard::keys::{FullViewingKey, Scope, SpendAuthorizingKey};
-        use rand_core::OsRng;
+        use rand::{rand_core::UnwrapErr, rngs::SysRng};
         use transparent::builder::TransparentSigningSet;
 
         // A network on which Ironwood (NU6.3) is active from the Sapling activation height, so
@@ -1982,7 +2034,14 @@ pub(crate) mod tests {
             // shuffled and either may come first.
             let mut ufvks = HashMap::new();
             ufvks.insert(account_id, account.ufvk().unwrap().clone());
-            let d_tx = decrypt_transaction(st.network(), None, None, &tx, &ufvks, &std::collections::HashMap::new());
+            let d_tx = decrypt_transaction(
+                st.network(),
+                None,
+                None,
+                &tx,
+                &ufvks,
+                &std::collections::HashMap::new(),
+            );
             let change = d_tx
                 .ironwood_outputs()
                 .iter()
@@ -2304,7 +2363,12 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             let tx = builder
-                .mock_build(&TransparentSigningSet::new(), &[], &[orchard_sak], OsRng)
+                .mock_build(
+                    &TransparentSigningSet::new(),
+                    &[],
+                    &[orchard_sak],
+                    UnwrapErr(SysRng),
+                )
                 .unwrap()
                 .transaction()
                 .clone();

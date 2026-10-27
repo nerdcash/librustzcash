@@ -166,6 +166,10 @@ mod tests {
 
     use super::{DEPENDENCIES, MIGRATION_ID};
 
+    /// A transparent download height stored on an address row before this migration rebuilds
+    /// the table. The value is arbitrary; the test checks that the rebuild copies it.
+    const PRESERVED_TRANSPARENT_DOWNLOAD_HEIGHT: i64 = 42;
+
     #[test]
     fn migrate() {
         test_migrate(&[MIGRATION_ID]);
@@ -191,8 +195,8 @@ mod tests {
         let usk = UnifiedSpendingKey::from_seed(&network, &seed_bytes[..], zip32::AccountId::ZERO)
             .unwrap();
         let ufvk = usk.to_unified_full_viewing_key();
-        let ufvk_str = ufvk.encode(&network);
-        let uivk_str = ufvk.to_unified_incoming_viewing_key().encode(&network);
+        let ufvk_str = ufvk.encode(&network).unwrap();
+        let uivk_str = ufvk.to_unified_incoming_viewing_key().encode(&network).unwrap();
 
         db_data
             .conn
@@ -262,6 +266,18 @@ mod tests {
             )
             .unwrap();
 
+        // A download height recorded before the rebuild must survive it. The other rows
+        // leave the column unset, which stays NULL.
+        db_data
+            .conn
+            .execute(
+                "UPDATE addresses
+                 SET last_downloaded_transparent_block = :height
+                 WHERE address = 'addr_derived'",
+                named_params![":height": PRESERVED_TRANSPARENT_DOWNLOAD_HEIGHT],
+            )
+            .unwrap();
+
         // Run the standalone_address migration.
         WalletMigrator::new()
             .with_seed(Secret::new(seed_bytes))
@@ -279,6 +295,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 4);
+
+        let downloaded: Option<i64> = db_data
+            .conn
+            .query_row(
+                "SELECT last_downloaded_transparent_block FROM addresses WHERE address = 'addr_derived'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(downloaded, Some(PRESERVED_TRANSPARENT_DOWNLOAD_HEIGHT));
+
+        let unset: Option<i64> = db_data
+            .conn
+            .query_row(
+                "SELECT last_downloaded_transparent_block FROM addresses WHERE address = 'addr_shielded'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unset, None);
 
         // Verify an address-only import (both imported-material columns NULL) succeeds with
         // the new constraint.

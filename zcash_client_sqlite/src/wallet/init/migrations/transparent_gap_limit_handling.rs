@@ -1,7 +1,7 @@
 //! Add support for general transparent gap limit handling, and unify the `addresses` and
 //! `ephemeral_addresses` tables.
 
-use rand_core::RngCore;
+use rand_core::Rng;
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
@@ -36,7 +36,6 @@ use {
     ReceiverRequirement::*,
     transparent::keys::TransparentKeyScope,
     zcash_keys::{encoding::AddressCodec as _, keys::ReceiverRequirement},
-    zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA,
     zip32::DiversifierIndex,
 };
 
@@ -48,6 +47,11 @@ pub(super) const DEPENDENCIES: &[Uuid] = &[
     add_account_uuids::MIGRATION_ID,
     add_transparent_sync_tracking::MIGRATION_ID,
 ];
+
+/// The default transaction expiry delta, in blocks, that the wallet used when this migration was
+/// written. It is pinned so that the migration's effect does not change with later defaults.
+#[cfg(feature = "transparent-inputs")]
+const PRE_NU7_DEFAULT_TX_EXPIRY_DELTA: u32 = 40;
 
 pub(super) struct Migration<P, C, R> {
     pub(super) params: P,
@@ -167,7 +171,7 @@ pub(super) fn insert_initial_transparent_addrs<P: consensus::Parameters>(
     Ok(())
 }
 
-impl<P: consensus::Parameters, C: Clock, R: RngCore> RusqliteMigration for Migration<P, C, R> {
+impl<P: consensus::Parameters, C: Clock, R: Rng> RusqliteMigration for Migration<P, C, R> {
     type Error = WalletMigrationError;
 
     fn up(&self, conn: &Transaction) -> Result<(), WalletMigrationError> {
@@ -245,8 +249,7 @@ impl<P: consensus::Parameters, C: Clock, R: RngCore> RusqliteMigration for Migra
                     let transparent_external = diversifier_index
                         .and_then(|di| NonHardenedChildIndex::try_from(di).ok())
                         .and_then(|idx| {
-                            uivk.transparent()
-                                .as_ref()
+                            uivk.p2pkh()
                                 .and_then(|external_ivk| external_ivk.derive_address(idx).ok())
                                 .map(|t_addr| (idx, t_addr.encode(&self.params)))
                         });
@@ -359,7 +362,7 @@ impl<P: consensus::Parameters, C: Clock, R: RngCore> RusqliteMigration for Migra
             )?;
             let rows = ea_query
                 .query_and_then(
-                    named_params! {":expiry_delta": DEFAULT_TX_EXPIRY_DELTA },
+                    named_params! {":expiry_delta": PRE_NU7_DEFAULT_TX_EXPIRY_DELTA },
                     |row| {
                         let account_id = AccountRef(row.get("account_id")?);
                         let uivk = decode_uivk(&self.params, row.get("uivk")?)?;

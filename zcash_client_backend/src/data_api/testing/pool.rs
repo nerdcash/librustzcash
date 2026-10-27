@@ -8,22 +8,28 @@ use std::{
 
 use assert_matches::assert_matches;
 use incrementalmerkletree::{Hashable, Level, Position, frontier::Frontier};
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use secrecy::Secret;
 use shardtree::error::ShardTreeError;
 
 use transparent::address::TransparentAddress;
-use zcash_keys::{address::Address, keys::UnifiedSpendingKey};
+use zcash_keys::{
+    address::{Address, UnifiedAddress},
+    keys::{UnifiedAddressRequest, UnifiedSpendingKey},
+};
 use zcash_primitives::{
     block::BlockHash,
     transaction::{
         Transaction,
+        builder::{
+            BLOSSOM_DEFAULT_TX_EXPIRY_DELTA, NU7_DEFAULT_TX_EXPIRY_DELTA, default_tx_expiry_delta,
+        },
         fees::zip317::{FeeRule as Zip317FeeRule, MARGINAL_FEE, MINIMUM_FEE},
     },
 };
 use zcash_protocol::{
     ShieldedPool,
-    consensus::{self, BlockHeight, NetworkUpgrade, Parameters},
+    consensus::{self, BlockHeight, BranchId, NetworkUpgrade, Parameters},
     local_consensus::LocalNetwork,
     memo::{Memo, MemoBytes},
     value::Zatoshis,
@@ -38,7 +44,7 @@ use crate::{
         WalletSummary, WalletTest, WalletWrite,
         anchor_retention::AnchorRetentionInterval,
         chain::{self, ChainState, CommitmentTreeRoot, ScanSummary},
-        error::Error,
+        error::{AddressExpiryError, Error},
         testing::{
             AddressType, CacheInsertionResult, FakeCompactOutput, InitialChainState, TestBuilder,
             single_output_change_strategy,
@@ -64,7 +70,7 @@ use crate::data_api::wallet::input_selection::GreedyInputSelectorError;
 use crate::{
     data_api::BlockMetadata,
     scanning::{
-        Nullifiers, ScanningKeys,
+        ScanningKeys, SpendIdentifiers,
         full::{decrypt_block, scan_block},
     },
 };
@@ -78,7 +84,7 @@ use zcash_protocol::PoolType;
 #[cfg(feature = "orchard")]
 use {
     super::orchard::OrchardPoolTester,
-    crate::data_api::wallet::{input_selection::SpendPolicy, propose_transfer},
+    crate::data_api::wallet::propose_transfer,
     std::collections::BTreeMap,
     zcash_primitives::transaction::{TxVersion, builder::BundlePadding},
     zcash_protocol::zip318::{AnchorBucketInterval, MAX_RESIDUAL_VALUE},
@@ -87,7 +93,7 @@ use {
 #[cfg(not(feature = "orchard"))]
 use zcash_address::{
     ZcashAddress,
-    unified::{self, Encoding as _, Receiver},
+    unified::{self, Encoding as _, Receiver, Revision, Uitem},
 };
 
 // `ProposalError` also reaches this module through the `transparent-inputs` group below,
@@ -95,10 +101,17 @@ use zcash_address::{
 #[cfg(all(feature = "orchard", not(feature = "transparent-inputs")))]
 use crate::proposal::ProposalError;
 
+// `SpendPolicy` is used only by scenarios behind one of these two features.
+#[cfg(any(feature = "orchard", feature = "transparent-inputs"))]
+use crate::data_api::wallet::input_selection::SpendPolicy;
+
 #[cfg(feature = "transparent-inputs")]
 use {
     crate::{
-        data_api::{CoinbaseFilter, OutputOfSentTx, TransactionDataRequest, TransactionStatus},
+        data_api::{
+            CoinbaseFilter, OutputOfSentTx, TransactionDataRequest, TransactionStatus,
+            wallet::input_selection::TransparentSpendPolicy,
+        },
         fees::ChangeValue,
         proposal::{Proposal, ProposalError, StepOutput, StepOutputIndex},
         wallet::{Exposure, TransparentAddressSource, WalletTransparentOutput},
@@ -109,11 +122,8 @@ use {
         bundle::{OutPoint, TxOut},
         keys::{NonHardenedChildIndex, TransparentKeyScope},
     },
-    zcash_keys::keys::{UnifiedAddressRequest, transparent::gap_limits::GapLimits},
-    zcash_primitives::transaction::{
-        builder::DEFAULT_TX_EXPIRY_DELTA,
-        fees::{FeeRule, transparent::InputSize, zip317},
-    },
+    zcash_keys::keys::transparent::gap_limits::GapLimits,
+    zcash_primitives::transaction::fees::{FeeRule, transparent::InputSize, zip317},
     zcash_protocol::{
         TxId,
         value::{BalanceError, MAX_MONEY, ZatBalance},
@@ -124,7 +134,8 @@ use {
 use {
     crate::data_api::wallet::{SignerView, redact_pczt_for_batch_signer, redact_pczt_for_signer},
     pczt::roles::{combiner::Combiner, prover::Prover, signer::Signer},
-    rand_core::OsRng,
+    rand::rngs::SysRng,
+    rand_core::UnwrapErr,
     transparent::builder::TransparentSigningSet,
     zcash_primitives::transaction::builder::{BuildConfig, Builder},
     zcash_proofs::prover::LocalTxProver,
@@ -139,7 +150,7 @@ use {
 };
 
 pub mod dsl;
-use dsl::{TestDsl, TestNoteConfig};
+use dsl::{TestDsl, TestNoteConfig, TestScenario};
 
 pub mod locking;
 pub use locking::*;
@@ -177,7 +188,7 @@ pub trait ShieldedPoolTester {
     fn fvk_default_address(fvk: &Self::Fvk) -> Address;
     fn fvks_equal(a: &Self::Fvk, b: &Self::Fvk) -> bool;
 
-    fn random_fvk(mut rng: impl RngCore) -> Self::Fvk {
+    fn random_fvk(mut rng: impl Rng) -> Self::Fvk {
         let sk = {
             let mut sk_bytes = vec![0; 32];
             rng.fill_bytes(&mut sk_bytes);
@@ -186,7 +197,7 @@ pub trait ShieldedPoolTester {
 
         Self::sk_to_fvk(&sk)
     }
-    fn random_address(rng: impl RngCore) -> Address {
+    fn random_address(rng: impl Rng) -> Address {
         Self::fvk_default_address(&Self::random_fvk(rng))
     }
 
@@ -260,6 +271,17 @@ pub trait ShieldedPoolTester {
     ) -> Result<(), pczt::roles::signer::Error>;
 }
 
+/// The boundaries of `interval` on the chain that `network` describes.
+fn anchor_grid<P: consensus::Parameters>(
+    network: &P,
+    interval: zcash_protocol::zip318::AnchorBucketInterval,
+) -> zcash_protocol::zip318::AnchorGrid {
+    zcash_protocol::zip318::AnchorGrid::new(
+        interval,
+        zcash_protocol::zip318::BlockSpacing::for_network(network),
+    )
+}
+
 /// Tests sending funds within the given shielded pool in a single transaction.
 ///
 /// The test:
@@ -320,7 +342,14 @@ pub fn send_single_step_proposed_transfer<T: ShieldedPoolTester>(
     let ufvks = [(account.id(), account.usk().to_unified_full_viewing_key())]
         .into_iter()
         .collect();
-    let d_tx = decrypt_transaction(st.network(), None, Some(h), &tx, &ufvks, &std::collections::HashMap::new());
+    let d_tx = decrypt_transaction(
+        st.network(),
+        None,
+        Some(h),
+        &tx,
+        &ufvks,
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(T::decrypted_pool_outputs_count(&d_tx), 2);
 
     let mut found_tx_change_memo = false;
@@ -494,7 +523,7 @@ pub fn scan_full_block_detects_outputs<T: ShieldedPoolTester>(
         &header,
         vtx,
         &scanning_keys,
-        &Nullifiers::empty(),
+        &SpendIdentifiers::empty(),
         Some(&prior_block_metadata),
         |_addr| Ok::<_, Infallible>(None),
     )
@@ -506,7 +535,7 @@ pub fn scan_full_block_detects_outputs<T: ShieldedPoolTester>(
         &header,
         vtx,
         &scanning_keys,
-        &Nullifiers::empty(),
+        &SpendIdentifiers::empty(),
         Some(&prior_block_metadata),
     )
     .expect("scanning the block succeeds");
@@ -747,7 +776,14 @@ pub fn spend_max_spendable_single_step_proposed_transfer<T: ShieldedPoolTester>(
     let ufvks = [(account.id(), account.usk().to_unified_full_viewing_key())]
         .into_iter()
         .collect();
-    let d_tx = decrypt_transaction(st.network(), None, Some(h), &tx, &ufvks, &std::collections::HashMap::new());
+    let d_tx = decrypt_transaction(
+        st.network(),
+        None,
+        Some(h),
+        &tx,
+        &ufvks,
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(T::decrypted_pool_outputs_count(&d_tx), 1);
 
     let mut found_send_max_memo = false;
@@ -878,7 +914,14 @@ pub fn spend_everything_single_step_proposed_transfer<T: ShieldedPoolTester>(
     let ufvks = [(account.id(), account.usk().to_unified_full_viewing_key())]
         .into_iter()
         .collect();
-    let d_tx = decrypt_transaction(st.network(), None, Some(h), &tx, &ufvks, &std::collections::HashMap::new());
+    let d_tx = decrypt_transaction(
+        st.network(),
+        None,
+        Some(h),
+        &tx,
+        &ufvks,
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(T::decrypted_pool_outputs_count(&d_tx), 1);
 
     let mut found_send_max_memo = false;
@@ -1184,13 +1227,7 @@ pub fn send_max_spends_inputs_across_pools<P0: ShieldedPoolTester, P1: ShieldedP
     assert_eq!(input_notes.len(), 2);
     let input_pools = input_notes
         .iter()
-        .map(|n| match n.note() {
-            Note::Sapling(_) => ShieldedPool::Sapling,
-            Note::Orchard { pool, .. } => match pool {
-                ::orchard::ValuePool::Orchard => ShieldedPool::Orchard,
-                ::orchard::ValuePool::Ironwood => ShieldedPool::Ironwood,
-            },
-        })
+        .map(|n| n.note().pool())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         input_pools,
@@ -1203,6 +1240,173 @@ pub fn send_max_spends_inputs_across_pools<P0: ShieldedPoolTester, P1: ShieldedP
     let (h, _) = st.generate_next_block_including(txids[0]);
     st.scan_cached_blocks(h, 1);
     assert_eq!(st.get_total_balance(account.id()), Zatoshis::ZERO);
+}
+
+/// The value of the `P0` note of the across-pools dust shortfall scenario, which covers the
+/// payment alone.
+#[cfg(feature = "orchard")]
+const DUST_SHORTFALL_P0_NOTE_VALUE: Zatoshis = Zatoshis::const_from_u64(60_000);
+/// The payment of the across-pools dust shortfall scenario. The `P0` note alone would leave
+/// change of 3000 zatoshis, below the dust threshold of one marginal fee, so the `P1` note is
+/// drawn on as well: two bundles, each padded to two logical actions.
+#[cfg(feature = "orchard")]
+const DUST_SHORTFALL_PAYMENT: Zatoshis = Zatoshis::const_from_u64(47_000);
+/// A `P1` note that covers its bundle's share of the two-bundle fee, so that both notes
+/// together fund the payment.
+#[cfg(feature = "orchard")]
+const DUST_SHORTFALL_P1_NOTE_COVERING_FEE: Zatoshis = Zatoshis::const_from_u64(20_000);
+/// A `P1` note that falls short of its bundle's share of the two-bundle fee, so that both
+/// notes together fall 1000 zatoshis short of the payment plus that fee.
+#[cfg(feature = "orchard")]
+const DUST_SHORTFALL_P1_NOTE_BELOW_FEE: Zatoshis = Zatoshis::const_from_u64(6_000);
+
+/// The ZIP 317 fee of a transaction spending from two shielded pools, each bundle padded to
+/// two logical actions.
+#[cfg(feature = "orchard")]
+fn two_bundle_fee() -> Zatoshis {
+    const BUNDLES: u64 = 2;
+    const PADDED_ACTIONS_PER_BUNDLE: u64 = 2;
+    (MARGINAL_FEE * (BUNDLES * PADDED_ACTIONS_PER_BUNDLE)).unwrap()
+}
+
+/// The across-pools dust shortfall scenario: an account holding a `P0` note and a smaller `P1`
+/// note, and a transfer to a `P0` recipient of an amount the `P0` note covers alone, but whose
+/// change from that note alone would fall below the dust threshold.
+#[cfg(feature = "orchard")]
+struct DustShortfallScenario<P0: ShieldedPoolTester, Cache, Dsf: DataStoreFactory> {
+    st: TestDsl<dsl::TestScenario<P0, Cache, Dsf>>,
+    recipient: Address,
+    amount: Zatoshis,
+    /// The value of both notes.
+    total: Zatoshis,
+}
+
+/// Builds the across-pools dust shortfall scenario with a `P1` note of `p1_note_value`, both
+/// notes scanned into the wallet.
+#[cfg(feature = "orchard")]
+fn dust_shortfall_across_pools<P0, P1, Cache, Dsf>(
+    ds_factory: Dsf,
+    cache: Cache,
+    p1_note_value: Zatoshis,
+) -> DustShortfallScenario<P0, Cache, Dsf>
+where
+    P0: ShieldedPoolTester,
+    P1: ShieldedPoolTester,
+    Cache: TestCache,
+    Dsf: DataStoreFactory,
+{
+    let mut st = TestDsl::with_sapling_birthday_account(ds_factory, cache).build::<P0>();
+    let account = st.test_account().cloned().unwrap();
+
+    let p0_fvk = P0::test_account_fvk(&st);
+    let p1_fvk = P1::test_account_fvk(&st);
+    st.generate_next_block(
+        &p0_fvk,
+        AddressType::DefaultExternal,
+        DUST_SHORTFALL_P0_NOTE_VALUE,
+    );
+    st.generate_next_block(&p1_fvk, AddressType::DefaultExternal, p1_note_value);
+    st.scan_cached_blocks(account.birthday().height(), 2);
+
+    DustShortfallScenario {
+        st,
+        recipient: P0::sk_default_address(&P0::sk(&[0xf5; 32])),
+        amount: DUST_SHORTFALL_PAYMENT,
+        total: (DUST_SHORTFALL_P0_NOTE_VALUE + p1_note_value).unwrap(),
+    }
+}
+
+/// Tests that a transfer whose change from the preferred pool's note would be dust draws on
+/// a note in another pool instead of failing.
+///
+/// The test:
+/// - Builds the across-pools dust shortfall scenario with a `P1` note that covers the
+///   two-bundle fee.
+/// - Verifies that the proposal spends both notes, at the two-bundle fee, and that the
+///   change is the remainder of both.
+/// - Builds and mines the transaction, and verifies that the change is all that remains.
+#[cfg(feature = "orchard")]
+pub fn transfer_grows_across_pools_at_a_dust_shortfall<
+    P0: ShieldedPoolTester,
+    P1: ShieldedPoolTester,
+>(
+    ds_factory: impl DataStoreFactory,
+    cache: impl TestCache,
+) {
+    let DustShortfallScenario {
+        mut st,
+        recipient,
+        amount,
+        total,
+    } = dust_shortfall_across_pools::<P0, P1, _, _>(
+        ds_factory,
+        cache,
+        DUST_SHORTFALL_P1_NOTE_COVERING_FEE,
+    );
+
+    let expected_fee = two_bundle_fee();
+    let expected_change = (total - amount - expected_fee).unwrap();
+
+    let proposal = st.propose_transfer_to(&recipient, amount);
+
+    assert_eq!(proposal.steps().len(), 1);
+    let step = &proposal.steps().head;
+    assert_eq!(step.balance().fee_required(), expected_fee);
+    assert_matches!(
+        step.transaction_request().payments().get(&0),
+        Some(payment) if payment.amount() == Some(amount)
+    );
+    let input_pools = step
+        .shielded_inputs()
+        .expect("the proposal has shielded inputs")
+        .notes()
+        .iter()
+        .map(|n| n.note().pool())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        input_pools,
+        BTreeSet::from([P0::SHIELDED_PROTOCOL, P1::SHIELDED_PROTOCOL])
+    );
+    let change = step.balance().proposed_change();
+    assert_eq!(change.len(), 1);
+    assert_eq!(change[0].value(), expected_change);
+
+    let txids = st.create_proposed_expecting(&proposal, 1);
+    let (h, _) = st.generate_next_block_including(txids[0]);
+    st.scan_cached_blocks(h, 1);
+    assert_eq!(st.get_total_balance(st.get_account().id()), expected_change);
+}
+
+/// Tests that a transfer which draws on a second pool at a dust shortfall reports
+/// `InsufficientFunds` over both pools when the second note cannot cover the two-bundle fee.
+///
+/// The test:
+/// - Builds the across-pools dust shortfall scenario with a `P1` note too small for the
+///   two-bundle fee.
+/// - Verifies that the proposal fails with `InsufficientFunds`, requiring the amount plus
+///   the two-bundle fee and reporting the value of both notes as available.
+#[cfg(feature = "orchard")]
+pub fn transfer_fails_across_pools_at_a_dust_shortfall<
+    P0: ShieldedPoolTester,
+    P1: ShieldedPoolTester,
+>(
+    ds_factory: impl DataStoreFactory,
+    cache: impl TestCache,
+) {
+    let DustShortfallScenario {
+        mut st,
+        recipient,
+        amount,
+        total,
+    } = dust_shortfall_across_pools::<P0, P1, _, _>(
+        ds_factory,
+        cache,
+        DUST_SHORTFALL_P1_NOTE_BELOW_FEE,
+    );
+
+    let required = (amount + two_bundle_fee()).unwrap();
+
+    st.expect_insufficient_funds(&recipient, amount, total, required);
 }
 
 /// Tests that proposing a send-max transfer to a TEX recipient fails with a meaningful
@@ -1260,10 +1464,13 @@ pub fn send_max_delivers_via_sapling_when_orchard_is_unavailable<T: ShieldedPool
         Address::Sapling(addr) => addr.to_bytes(),
         _ => panic!("expected a Sapling address"),
     };
-    let ua = unified::Address::try_from_items(vec![
-        Receiver::Sapling(sapling_receiver),
-        Receiver::Orchard([0xab; 43]),
-    ])
+    let ua = unified::Address::try_from_items(
+        Revision::R0,
+        vec![
+            Uitem::Data(Receiver::Sapling(sapling_receiver)),
+            Uitem::Data(Receiver::Orchard([0xab; 43])),
+        ],
+    )
     .unwrap();
     let addy = ZcashAddress::try_from_encoded(&ua.encode(&st.network().network_type())).unwrap();
 
@@ -1317,7 +1524,11 @@ pub fn send_max_to_orchard_only_ua_fails_without_orchard<T: ShieldedPoolTester>(
 
     // Without the `orchard` feature, the Orchard receiver's contents are not parsed,
     // so arbitrary receiver bytes suffice.
-    let ua = unified::Address::try_from_items(vec![Receiver::Orchard([0xab; 43])]).unwrap();
+    let ua = unified::Address::try_from_items(
+        Revision::R0,
+        vec![Uitem::Data(Receiver::Orchard([0xab; 43]))],
+    )
+    .unwrap();
     let addy = ZcashAddress::try_from_encoded(&ua.encode(&st.network().network_type())).unwrap();
 
     let fee_rule = StandardFeeRule::Zip317;
@@ -1507,7 +1718,14 @@ pub fn send_max_spendable_proposal_succeeds_when_unconfirmed_funds_present<
     let ufvks = [(account.id(), account.usk().to_unified_full_viewing_key())]
         .into_iter()
         .collect();
-    let d_tx = decrypt_transaction(st.network(), None, Some(h), &tx, &ufvks, &std::collections::HashMap::new());
+    let d_tx = decrypt_transaction(
+        st.network(),
+        None,
+        Some(h),
+        &tx,
+        &ufvks,
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(T::decrypted_pool_outputs_count(&d_tx), 1);
 
     let mut found_send_max_memo = false;
@@ -2025,6 +2243,78 @@ pub fn spend_everything_multi_step_with_marginal_notes_proposed_transfer<
     assert_eq!(ending_balance, Zatoshis::ZERO); // ending balance should be zero
 }
 
+/// Tests that the `InsufficientFunds` error of a transfer permitted to spend the account's
+/// transparent outputs reports the value of those outputs as available, alongside the notes.
+///
+/// The test:
+/// - Adds a shielded note and a transparent UTXO to the account.
+/// - Proposes a transfer exceeding their combined value, permitting transparent spends.
+/// - Verifies that `available` is the sum of the note and the UTXO, and that `required` is
+///   the payment plus the fee for spending both.
+#[cfg(feature = "transparent-inputs")]
+pub fn insufficient_funds_counts_transparent_inputs<T: ShieldedPoolTester>(
+    dsf: impl DataStoreFactory,
+    cache: impl TestCache,
+) {
+    let mut st = TestDsl::with_sapling_birthday_account(dsf, cache).build::<T>();
+
+    let note_value = Zatoshis::const_from_u64(50_000);
+    let (h, _, _) = st.add_a_single_note_checking_balance(note_value);
+
+    let account = st.test_account().cloned().unwrap();
+    let uaddr = st
+        .wallet()
+        .get_last_generated_address_matching(account.id(), UnifiedAddressRequest::AllAvailableKeys)
+        .unwrap()
+        .unwrap();
+    let taddr = uaddr.transparent().unwrap();
+
+    let utxo_value = Zatoshis::const_from_u64(30_000);
+    let utxo = WalletTransparentOutput::from_parts(
+        OutPoint::fake(),
+        TxOut::new(utxo_value, taddr.script().into()),
+        Some(h),
+        Some(account.id()),
+        Some(TransparentKeyScope::EXTERNAL),
+        None,
+    )
+    .unwrap();
+    st.wallet_mut()
+        .put_received_transparent_utxo(&utxo)
+        .unwrap();
+
+    let to: Address = T::sk_default_address(&T::sk(&[0xf5; 32]));
+    let amount = Zatoshis::const_from_u64(100_000);
+    let request = TransactionRequest::new(vec![Payment::without_memo(
+        to.to_zcash_address(st.network()),
+        amount,
+    )])
+    .unwrap();
+
+    let input_selector = GreedyInputSelector::new();
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, T::SHIELDED_PROTOCOL);
+
+    // The transaction would spend the transparent input and the note, paying the recipient
+    // and a change output in the note's pool: one transparent logical action plus two
+    // shielded ones.
+    let expected_required = (amount + (MARGINAL_FEE * 3u64).unwrap()).unwrap();
+    let expected_available = (note_value + utxo_value).unwrap();
+
+    assert_matches!(
+        st.propose_transfer_with_policy(
+            account.id(),
+            &input_selector,
+            &change_strategy,
+            request,
+            ConfirmationsPolicy::MIN,
+            &SpendPolicy::default().with_transparent(TransparentSpendPolicy::any_account_addr()),
+        ),
+        Err(Error::InsufficientFunds { available, required })
+            if available == expected_available && required == expected_required
+    );
+}
+
 pub fn send_with_multiple_change_outputs<T: ShieldedPoolTester>(
     dsf: impl DataStoreFactory,
     cache: impl TestCache,
@@ -2088,7 +2378,14 @@ pub fn send_with_multiple_change_outputs<T: ShieldedPoolTester>(
     let ufvks = [(account.id(), account.usk().to_unified_full_viewing_key())]
         .into_iter()
         .collect();
-    let d_tx = decrypt_transaction(st.network(), None, Some(h), &tx, &ufvks, &std::collections::HashMap::new());
+    let d_tx = decrypt_transaction(
+        st.network(),
+        None,
+        Some(h),
+        &tx,
+        &ufvks,
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(T::decrypted_pool_outputs_count(&d_tx), 3);
 
     let mut found_tx_change_memo = false;
@@ -2583,7 +2880,14 @@ pub fn spend_all_funds_single_step_proposed_transfer<T: ShieldedPoolTester>(
     let ufvks = [(account.id(), account.usk().to_unified_full_viewing_key())]
         .into_iter()
         .collect();
-    let d_tx = decrypt_transaction(st.network(), None, Some(h), &tx, &ufvks, &std::collections::HashMap::new());
+    let d_tx = decrypt_transaction(
+        st.network(),
+        None,
+        Some(h),
+        &tx,
+        &ufvks,
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(T::decrypted_pool_outputs_count(&d_tx), 2);
 
     let mut found_tx_change_memo = false;
@@ -3513,6 +3817,60 @@ pub fn account_deletion_with_internal_transfer<T: ShieldedPoolTester, DSF>(
     assert!(summary.account_balances().contains_key(&account1));
 }
 
+/// Verifies that [`WalletWrite::set_account_name`] replaces the name of the given account,
+/// leaves the names of other accounts unchanged, and permits two accounts to share a name.
+///
+/// [`WalletWrite::set_account_name`]: crate::data_api::WalletWrite::set_account_name
+pub fn account_rename<T: ShieldedPoolTester, DSF>(ds_factory: DSF, cache: impl TestCache)
+where
+    DSF: DataStoreFactory,
+    <DSF as DataStoreFactory>::DataStore: Reset,
+{
+    /// The initial name of the first account.
+    const ACCOUNT1_NAME: &str = "account1";
+    /// The initial name of the second account.
+    const ACCOUNT2_NAME: &str = "account2";
+    /// The name that both accounts are renamed to.
+    const RENAMED_NAME: &str = "renamed";
+
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(ds_factory)
+        .with_block_cache(cache)
+        .build();
+
+    // Add two accounts to the wallet, derived from the same seed.
+    let seed = Secret::new([0u8; 32].to_vec());
+    let birthday = AccountBirthday::from_sapling_activation(st.network(), BlockHash([0; 32]));
+    let (account1, _) = st
+        .wallet_mut()
+        .create_account(ACCOUNT1_NAME, &seed, &birthday, None)
+        .unwrap();
+    let (account2, _) = st
+        .wallet_mut()
+        .create_account(ACCOUNT2_NAME, &seed, &birthday, None)
+        .unwrap();
+
+    // Renaming account 1 changes only its name.
+    assert_matches!(
+        st.wallet_mut().set_account_name(account1, RENAMED_NAME),
+        Ok(())
+    );
+    let renamed1 = st.wallet().get_account(account1).unwrap().unwrap();
+    let untouched2 = st.wallet().get_account(account2).unwrap().unwrap();
+    assert_eq!(renamed1.name(), Some(RENAMED_NAME));
+    assert_eq!(untouched2.name(), Some(ACCOUNT2_NAME));
+
+    // Account names are not required to be unique.
+    assert_matches!(
+        st.wallet_mut().set_account_name(account2, RENAMED_NAME),
+        Ok(())
+    );
+    let renamed1 = st.wallet().get_account(account1).unwrap().unwrap();
+    let renamed2 = st.wallet().get_account(account2).unwrap().unwrap();
+    assert_eq!(renamed1.name(), Some(RENAMED_NAME));
+    assert_eq!(renamed2.name(), Some(RENAMED_NAME));
+}
+
 pub fn external_address_change_spends_detected_in_restore_from_seed<T: ShieldedPoolTester, Dsf>(
     ds_factory: Dsf,
     cache: impl TestCache,
@@ -3819,10 +4177,10 @@ where
             .any(|req| req == &TransactionDataRequest::Enhancement(*spent_outpoint.txid()))
     );
 
-    // Now advance the chain by 40 blocks; even though a record for the transaction that created
+    // Now advance the chain by the pre-NU7 default expiry delta; even though a record for the transaction that created
     // `spent_outpoint` exists in the wallet database, the transaction can't be enhanced because
     // the outpoint was fake. Advancing the chain will cause the request for enhancement to expire.
-    for _ in 0..DEFAULT_TX_EXPIRY_DELTA {
+    for _ in 0..BLOSSOM_DEFAULT_TX_EXPIRY_DELTA {
         st.generate_next_block(
             &dfvk,
             AddressType::DefaultExternal,
@@ -3831,7 +4189,7 @@ where
     }
     st.scan_cached_blocks(
         scan_result.scanned_range().end,
-        usize::try_from(DEFAULT_TX_EXPIRY_DELTA).unwrap(),
+        usize::try_from(BLOSSOM_DEFAULT_TX_EXPIRY_DELTA).unwrap(),
     );
 
     // Simulate the situation where the enhancement request results in `TxidNotRecognized`
@@ -4154,7 +4512,9 @@ pub fn anchor_checkpoints_retained_across_deep_scan<
 
     // The first interval-aligned anchor height at or above the retention floor and strictly above
     // the received note, so the note's position precedes the anchor's checkpoint.
-    let mut anchor = u32::from(interval.boundary_at_or_above(BlockHeight::from(floor)));
+    let mut anchor = u32::from(
+        anchor_grid(st.network(), interval).boundary_at_or_above(BlockHeight::from(floor)),
+    );
     while anchor <= received {
         anchor += interval_blocks;
     }
@@ -4219,7 +4579,7 @@ pub fn anchor_checkpoints_retained_across_deep_scan<
     // Exactly the interval-aligned checkpoints at or above the retention floor are retained.
     let expected_anchors: BTreeSet<BlockHeight> = (floor..=tip)
         .map(BlockHeight::from)
-        .filter(|h| interval.is_boundary(*h))
+        .filter(|h| anchor_grid(st.network(), interval).is_boundary(*h))
         .collect();
     assert_eq!(
         retained, expected_anchors,
@@ -4297,7 +4657,7 @@ pub fn empty_boundary_blocks_are_checkpointed_and_retained<
     // The first two boundaries strictly above the received note, plus slack so neither boundary
     // is the final block of the batch.
     let first_boundary = {
-        let mut b = u32::from(interval.boundary_at_or_above(activation));
+        let mut b = u32::from(anchor_grid(st.network(), interval).boundary_at_or_above(activation));
         while b <= received {
             b += interval_blocks;
         }
@@ -4311,16 +4671,17 @@ pub fn empty_boundary_blocks_are_checkpointed_and_retained<
     // of its own.
     let not_our_fvk = T::sk_to_fvk(&T::sk(&[0xf5; 32]));
     for height in (received + 1)..=tip {
-        let generated = if interval.is_boundary(BlockHeight::from_u32(height)) {
-            st.generate_empty_block().0
-        } else {
-            st.generate_next_block(
-                &not_our_fvk,
-                AddressType::DefaultExternal,
-                Zatoshis::const_from_u64(10_000),
-            )
-            .0
-        };
+        let generated =
+            if anchor_grid(st.network(), interval).is_boundary(BlockHeight::from_u32(height)) {
+                st.generate_empty_block().0
+            } else {
+                st.generate_next_block(
+                    &not_our_fvk,
+                    AddressType::DefaultExternal,
+                    Zatoshis::const_from_u64(10_000),
+                )
+                .0
+            };
         assert_eq!(u32::from(generated), height, "cache height must track");
     }
     // One batch, covering both boundaries.
@@ -6294,7 +6655,7 @@ where
 
     // Generate some new random blocks
     for _ in 0..10 {
-        let output_count = st.rng_mut().gen_range(2..10);
+        let output_count = st.rng_mut().random_range(2..10);
         gen_random_block(&mut st, output_count);
     }
 
@@ -6789,9 +7150,9 @@ pub fn pczt_single_step<P0: ShieldedPoolTester, P1: ShieldedPoolTester, Dsf>(
         .circuit_version(),
     );
     let pczt_proven = Prover::new(pczt_updated)
-        .create_orchard_proof(orchard_pk)
+        .create_orchard_proof(UnwrapErr(SysRng), orchard_pk)
         .unwrap()
-        .create_sapling_proofs(&sapling_prover, &sapling_prover)
+        .create_sapling_proofs(UnwrapErr(SysRng), &sapling_prover, &sapling_prover)
         .unwrap()
         .finish();
 
@@ -7146,7 +7507,7 @@ fn build_transparent_coinbase_tx(
             &[],
             // unused internally
             &[],
-            OsRng,
+            UnwrapErr(SysRng),
             &LocalTxProver::bundled(),
             &LocalTxProver::bundled(),
             // unused internally
@@ -8493,7 +8854,7 @@ where
         .sign_orchard_with::<pczt::roles::low_level_signer::OrchardParseError, _>(|_, bundle, _| {
             for &index in &orchard_signable {
                 bundle.actions_mut()[index]
-                    .sign(original_sighash, &ask, OsRng)
+                    .sign(original_sighash, &ask, UnwrapErr(SysRng))
                     .unwrap();
             }
             Ok(())
@@ -8503,7 +8864,7 @@ where
             |_, bundle, _| {
                 for &index in &ironwood_signable {
                     bundle.actions_mut()[index]
-                        .sign(original_sighash, &ask, OsRng)
+                        .sign(original_sighash, &ask, UnwrapErr(SysRng))
                         .unwrap();
                 }
                 Ok(())
@@ -8601,9 +8962,9 @@ where
         .circuit_version(),
     );
     let proven = Prover::new(authorized)
-        .create_orchard_proof(orchard_pk)
+        .create_orchard_proof(UnwrapErr(SysRng), orchard_pk)
         .unwrap()
-        .create_ironwood_proof(orchard_pk)
+        .create_ironwood_proof(UnwrapErr(SysRng), orchard_pk)
         .unwrap()
         .finish();
 
@@ -9040,7 +9401,9 @@ pub fn canonical_crossing_is_bucketed_and_unpadded<Dsf: DataStoreFactory>(
     let interval_blocks = interval.block_count().get();
     // Deliberately OFF a boundary: the ordinary anchor must not be a grid boundary by accident,
     // or an assertion that a canonical crossing was bucketed would pass trivially.
-    let tip = u32::from(interval.boundary_at_or_above(received_height)) + 3 * interval_blocks + 5;
+    let tip = u32::from(anchor_grid(st.network(), interval).boundary_at_or_above(received_height))
+        + 3 * interval_blocks
+        + 5;
     let filler_count = tip - received;
 
     // Fillers pay a non-wallet key, so each block adds a commitment (and thus a checkpoint)
@@ -9086,12 +9449,15 @@ pub fn canonical_crossing_is_bucketed_and_unpadded<Dsf: DataStoreFactory>(
         .anchor_height()
         .expect("a shielded step binds an anchor");
     assert!(
-        interval.is_boundary(anchor),
+        anchor_grid(st.network(), interval).is_boundary(anchor),
         "a canonical crossing must anchor to a grid boundary, got {anchor:?}"
     );
     assert_eq!(step.input_count_in_pool(PoolType::ORCHARD), 1);
     assert_eq!(step.input_count_in_pool(PoolType::IRONWOOD), 0);
-    assert!(step.is_canonical_crossing(&st.wallet().pool_migration_params(), canonical_fee));
+    assert!(step.is_canonical_crossing(
+        &st.wallet().pool_migration_params(st.network()),
+        canonical_fee
+    ));
     assert_eq!(
         step.ironwood_action_count(
             step.ironwood_bundle_padding(),
@@ -9108,7 +9474,10 @@ pub fn canonical_crossing_is_bucketed_and_unpadded<Dsf: DataStoreFactory>(
     )
     .unwrap();
     let step = off_by_one.steps().first();
-    assert!(!step.is_canonical_crossing(&st.wallet().pool_migration_params(), canonical_fee));
+    assert!(!step.is_canonical_crossing(
+        &st.wallet().pool_migration_params(st.network()),
+        canonical_fee
+    ));
     assert_eq!(
         step.ironwood_action_count(
             step.ironwood_bundle_padding(),
@@ -9117,7 +9486,7 @@ pub fn canonical_crossing_is_bucketed_and_unpadded<Dsf: DataStoreFactory>(
         Ok(2)
     );
     assert!(
-        !interval.is_boundary(step.anchor_height().unwrap()),
+        !anchor_grid(st.network(), interval).is_boundary(step.anchor_height().unwrap()),
         "a non-canonical payment must not pay for a bucketed anchor"
     );
 
@@ -9196,9 +9565,10 @@ pub fn canonical_crossing_is_bucketed_and_unpadded<Dsf: DataStoreFactory>(
     let tx = st.get_tx_from_history(txids[0]).unwrap().unwrap();
     assert_eq!(
         tx.expiry_height(),
-        Some(zcash_protocol::zip318::expiry_height(BlockHeight::from(
-            canonical.min_target_height()
-        ))),
+        Some(zcash_protocol::zip318::expiry_height(
+            &zcash_protocol::zip318::BlockSpacing::for_network(st.network()),
+            BlockHeight::from(canonical.min_target_height())
+        )),
         "a canonical crossing must carry the ZIP 318 rolling expiry"
     );
     assert_eq!(
@@ -9254,11 +9624,13 @@ pub fn canonical_crossing_builds_at_empty_boundary_block<Dsf: DataStoreFactory>(
     // empty, while the other fillers pay a non-wallet key. The bucketed anchor the proposal picks
     // is a boundary, and every boundary in the range is an empty block, so the anchor necessarily
     // lands on one.
-    let tip = u32::from(interval.boundary_at_or_above(received_height)) + 3 * interval_blocks + 5;
+    let tip = u32::from(anchor_grid(st.network(), interval).boundary_at_or_above(received_height))
+        + 3 * interval_blocks
+        + 5;
     let not_our_fvk = OrchardPoolTester::sk_to_fvk(&OrchardPoolTester::sk(&[0xf5; 32]));
     let mut empty_heights = Vec::new();
     for height in (received + 1)..=tip {
-        if interval.is_boundary(BlockHeight::from_u32(height)) {
+        if anchor_grid(st.network(), interval).is_boundary(BlockHeight::from_u32(height)) {
             let (h, _) = st.generate_empty_block();
             empty_heights.push(h);
         } else {
@@ -9301,7 +9673,10 @@ pub fn canonical_crossing_builds_at_empty_boundary_block<Dsf: DataStoreFactory>(
         .anchor_height()
         .expect("a shielded step binds an anchor");
     assert!(
-        step.is_canonical_crossing(&st.wallet().pool_migration_params(), canonical_fee),
+        step.is_canonical_crossing(
+            &st.wallet().pool_migration_params(st.network()),
+            canonical_fee
+        ),
         "the payment must be recognized as a canonical crossing"
     );
     assert!(
@@ -9373,7 +9748,9 @@ pub fn multi_note_crossing_is_not_bucketed<Dsf: DataStoreFactory>(
     st.scan_cached_blocks(first_height + 1, 2);
 
     let interval_blocks = interval.block_count().get();
-    let tip = u32::from(interval.boundary_at_or_above(first_height)) + 3 * interval_blocks + 5;
+    let tip = u32::from(anchor_grid(st.network(), interval).boundary_at_or_above(first_height))
+        + 3 * interval_blocks
+        + 5;
     let not_our_fvk = OrchardPoolTester::sk_to_fvk(&OrchardPoolTester::sk(&[0xf5; 32]));
     let filler_count = tip - u32::from(first_height) - 2;
     for _ in 0..filler_count {
@@ -9403,7 +9780,7 @@ pub fn multi_note_crossing_is_not_bucketed<Dsf: DataStoreFactory>(
         .expect("three notes together can fund the payment");
 
     let step = proposal.steps().first();
-    let zip318 = st.wallet().pool_migration_params();
+    let zip318 = st.wallet().pool_migration_params(st.network());
     let canonical_fee = crate::fees::canonical_crossing_fee(
         st.network(),
         BlockHeight::from(proposal.min_target_height()),
@@ -9415,7 +9792,7 @@ pub fn multi_note_crossing_is_not_bucketed<Dsf: DataStoreFactory>(
     );
     assert!(!step.is_canonical_crossing(&zip318, canonical_fee));
     assert!(
-        !interval.is_boundary(step.anchor_height().unwrap()),
+        !anchor_grid(st.network(), interval).is_boundary(step.anchor_height().unwrap()),
         "a multi-input transaction must not pay for a bucketed anchor"
     );
     assert_eq!(
@@ -9478,7 +9855,9 @@ pub fn canonical_crossing_prefers_single_note<Dsf: DataStoreFactory>(
     st.scan_cached_blocks(first_height + 1, 2);
 
     let interval_blocks = interval.block_count().get();
-    let tip = u32::from(interval.boundary_at_or_above(first_height)) + 3 * interval_blocks + 5;
+    let tip = u32::from(anchor_grid(st.network(), interval).boundary_at_or_above(first_height))
+        + 3 * interval_blocks
+        + 5;
     let not_our_fvk = OrchardPoolTester::sk_to_fvk(&OrchardPoolTester::sk(&[0xf5; 32]));
     let filler_count = tip - u32::from(first_height) - 2;
     for _ in 0..filler_count {
@@ -9509,7 +9888,7 @@ pub fn canonical_crossing_prefers_single_note<Dsf: DataStoreFactory>(
     // The canonical payment takes the single-note shape, spending the LARGE note.
     let canonical = propose(&mut st, MAX_RESIDUAL_VALUE).expect("the wallet can fund this");
     let step = canonical.steps().first();
-    let zip318 = st.wallet().pool_migration_params();
+    let zip318 = st.wallet().pool_migration_params(st.network());
     let canonical_fee = crate::fees::canonical_crossing_fee(
         st.network(),
         BlockHeight::from(canonical.min_target_height()),
@@ -9600,7 +9979,9 @@ pub fn canonical_crossing_abandoned_without_anchor_checkpoint<Dsf, TC>(
         st.add_a_single_note_checking_balance(Zatoshis::const_from_u64(10_000_000));
     let received = u32::from(received_height);
     let interval_blocks = interval.block_count().get();
-    let tip = u32::from(interval.boundary_at_or_above(received_height)) + 3 * interval_blocks + 5;
+    let tip = u32::from(anchor_grid(st.network(), interval).boundary_at_or_above(received_height))
+        + 3 * interval_blocks
+        + 5;
     let not_our_fvk = OrchardPoolTester::sk_to_fvk(&OrchardPoolTester::sk(&[0xf5; 32]));
     let filler_count = tip - received;
     for _ in 0..filler_count {
@@ -9637,7 +10018,7 @@ pub fn canonical_crossing_abandoned_without_anchor_checkpoint<Dsf, TC>(
     // reimplementing the arithmetic.
     let canonical = propose(&mut st);
     let step = canonical.steps().first();
-    let zip318 = st.wallet().pool_migration_params();
+    let zip318 = st.wallet().pool_migration_params(st.network());
     let canonical_fee = crate::fees::canonical_crossing_fee(
         st.network(),
         BlockHeight::from(canonical.min_target_height()),
@@ -9733,7 +10114,9 @@ pub fn self_migration_keeps_spending_orchard<Dsf: DataStoreFactory>(
         st.scan_cached_blocks(from, count as usize);
     };
 
-    let tip = u32::from(interval.boundary_at_or_above(received_height)) + 3 * interval_blocks + 5;
+    let tip = u32::from(anchor_grid(st.network(), interval).boundary_at_or_above(received_height))
+        + 3 * interval_blocks
+        + 5;
     advance(
         &mut st,
         received_height + 1,
@@ -9743,7 +10126,7 @@ pub fn self_migration_keeps_spending_orchard<Dsf: DataStoreFactory>(
     let input_selector = GreedyInputSelector::new();
     let change_strategy =
         single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Orchard);
-    let zip318 = st.wallet().pool_migration_params();
+    let zip318 = st.wallet().pool_migration_params(st.network());
 
     // First crossing: funded from the original Orchard note.
     let request = TransactionRequest::new(vec![Payment::without_memo(
@@ -9823,4 +10206,364 @@ pub fn self_migration_keeps_spending_orchard<Dsf: DataStoreFactory>(
         step.is_canonical_crossing(&zip318, canonical_fee),
         "the second crossing must still be canonical"
     );
+}
+
+/// Tests that payment construction enforces the ZIP 316 Revision 2 address expiration
+/// rules: a payment to an address whose expiry height conflicts with the transaction's
+/// expiry height is refused, a payment to an address whose expiry time has passed is
+/// refused (for any recipient of a multi-recipient transaction), and a payment to an
+/// address with unexpired metadata succeeds.
+pub fn create_to_address_respects_recipient_expiry<T: ShieldedPoolTester>(
+    dsf: impl DataStoreFactory,
+    cache: impl TestCache,
+) {
+    let mut st = TestDsl::with_sapling_birthday_account(dsf, cache).build::<T>();
+
+    // Add funds to the wallet: one note for each payment expected to succeed. The
+    // payments expected to be refused are checked first, while every note is unspent.
+    st.add_notes_checking_balance([
+        [Zatoshis::const_from_u64(100_000)],
+        [Zatoshis::const_from_u64(100_000)],
+        [Zatoshis::const_from_u64(100_000)],
+    ]);
+
+    let account = st.test_account().cloned().unwrap();
+    let birthday = account.birthday().height();
+    let chain_tip = st.wallet().chain_height().unwrap().unwrap();
+
+    // Construct recipient addresses carrying expiry metadata from the account's own
+    // default address, so that every receiver is valid for the active pool set.
+    let (default_addr, _) = account
+        .usk()
+        .to_unified_full_viewing_key()
+        .default_address(UnifiedAddressRequest::AllAvailableKeys)
+        .unwrap();
+    let with_expiry = |expiry_height: Option<BlockHeight>, expiry_time: Option<u64>| {
+        UnifiedAddress::from_receivers(
+            #[cfg(feature = "orchard")]
+            default_addr.orchard().copied(),
+            default_addr.sapling().copied(),
+            default_addr.transparent().copied(),
+            expiry_height,
+            expiry_time,
+        )
+        .expect("the default address has at least one receiver")
+    };
+
+    let payment_value = Zatoshis::const_from_u64(20_000);
+    let change_strategy =
+        single_output_change_strategy(StandardFeeRule::Zip317, None, T::SHIELDED_PROTOCOL);
+    let input_selector = GreedyInputSelector::new();
+
+    // An address is expired only once the chain has advanced *past* its expiry height,
+    // so one expiring at exactly the chain tip is not yet expired. It is refused because
+    // the transaction's default expiry height lies beyond it.
+    let expired_by_height = with_expiry(Some(chain_tip), None);
+    let request = zip321::TransactionRequest::new(vec![Payment::without_memo(
+        Address::from(expired_by_height.clone()).to_zcash_address(st.network()),
+        payment_value,
+    )])
+    .unwrap();
+    let proposal = st
+        .propose_transfer(
+            account.id(),
+            &input_selector,
+            &change_strategy,
+            request,
+            ConfirmationsPolicy::MIN,
+        )
+        .unwrap();
+    assert_matches!(
+        st.create_proposed_transactions::<Infallible, _, Infallible, _>(
+            account.usk(),
+            OvkPolicy::Sender,
+            &proposal
+        ),
+        Err(Error::RecipientAddressExpiry {
+            payment_index: 0,
+            error: AddressExpiryError::ExpiryHeightConflict { .. },
+        })
+    );
+
+    // An expiry time before the current time makes the address expired; the constraint
+    // applies to every recipient of a multi-recipient transaction.
+    /// One second past the Unix epoch, long before the test clock's current time.
+    const EXPIRY_TIME_IN_PAST: u64 = 1;
+    let valid_far_future = with_expiry(
+        Some(birthday + 10_000),
+        Some(super::TEST_CLOCK_EPOCH_OFFSET.as_secs() + 10_000),
+    );
+    let expired_by_time = with_expiry(None, Some(EXPIRY_TIME_IN_PAST));
+    let request = zip321::TransactionRequest::new(vec![
+        Payment::without_memo(
+            Address::from(valid_far_future.clone()).to_zcash_address(st.network()),
+            payment_value,
+        ),
+        Payment::without_memo(
+            Address::from(expired_by_time.clone()).to_zcash_address(st.network()),
+            payment_value,
+        ),
+    ])
+    .unwrap();
+    let proposal = st
+        .propose_transfer(
+            account.id(),
+            &input_selector,
+            &change_strategy,
+            request,
+            ConfirmationsPolicy::MIN,
+        )
+        .unwrap();
+    assert_matches!(
+        st.create_proposed_transactions::<Infallible, _, Infallible, _>(
+            account.usk(),
+            OvkPolicy::Sender,
+            &proposal
+        ),
+        Err(Error::RecipientAddressExpiry {
+            payment_index: 1,
+            error: AddressExpiryError::TimeExpired { .. },
+        })
+    );
+
+    // A payment to an address with unexpired metadata succeeds.
+    let request = zip321::TransactionRequest::new(vec![Payment::without_memo(
+        Address::from(valid_far_future.clone()).to_zcash_address(st.network()),
+        payment_value,
+    )])
+    .unwrap();
+    let proposal = st
+        .propose_transfer(
+            account.id(),
+            &input_selector,
+            &change_strategy,
+            request,
+            ConfirmationsPolicy::MIN,
+        )
+        .unwrap();
+    assert_matches!(
+        st.create_proposed_transactions::<Infallible, _, Infallible, _>(
+            account.usk(),
+            OvkPolicy::Sender,
+            &proposal
+        ),
+        Ok(_)
+    );
+
+    // One block below the tip, the chain has advanced past the address's expiry height, so
+    // the address is expired and the payment is refused on that ground rather than for a
+    // transaction-expiry conflict.
+    let recipient = with_expiry(Some(chain_tip - 1), None);
+    let request = zip321::TransactionRequest::new(vec![Payment::without_memo(
+        Address::from(recipient).to_zcash_address(st.network()),
+        payment_value,
+    )])
+    .unwrap();
+    let proposal = st
+        .propose_transfer(
+            account.id(),
+            &input_selector,
+            &change_strategy,
+            request,
+            ConfirmationsPolicy::MIN,
+        )
+        .unwrap();
+    assert_matches!(
+        st.create_proposed_transactions::<Infallible, _, Infallible, _>(
+            account.usk(),
+            OvkPolicy::Sender,
+            &proposal
+        ),
+        Err(Error::RecipientAddressExpiry {
+            payment_index: 0,
+            error: AddressExpiryError::HeightExpired { .. },
+        })
+    );
+
+    // The transaction's expiry height may equal the address's expiry height; only a
+    // transaction expiry strictly greater than the address's is forbidden. The default
+    // transaction expiry is the target height plus the default expiry delta for the
+    // consensus branch in effect there, and the target height is the block after the chain tip.
+    let target_height = chain_tip + 1;
+    let default_expiry_height =
+        target_height + default_tx_expiry_delta(BranchId::for_height(st.network(), target_height));
+    let recipient = with_expiry(Some(default_expiry_height), None);
+    let request = zip321::TransactionRequest::new(vec![Payment::without_memo(
+        Address::from(recipient).to_zcash_address(st.network()),
+        payment_value,
+    )])
+    .unwrap();
+    let proposal = st
+        .propose_transfer(
+            account.id(),
+            &input_selector,
+            &change_strategy,
+            request,
+            ConfirmationsPolicy::MIN,
+        )
+        .unwrap();
+    assert_matches!(
+        st.create_proposed_transactions::<Infallible, _, Infallible, _>(
+            account.usk(),
+            OvkPolicy::Sender,
+            &proposal
+        ),
+        Ok(_)
+    );
+
+    // An address carrying only an expiry time is expired only once the current time is
+    // *after* it, so one expiring at exactly the current time is still valid.
+    let recipient = with_expiry(None, Some(super::TEST_CLOCK_EPOCH_OFFSET.as_secs()));
+    let request = zip321::TransactionRequest::new(vec![Payment::without_memo(
+        Address::from(recipient).to_zcash_address(st.network()),
+        payment_value,
+    )])
+    .unwrap();
+    let proposal = st
+        .propose_transfer(
+            account.id(),
+            &input_selector,
+            &change_strategy,
+            request,
+            ConfirmationsPolicy::MIN,
+        )
+        .unwrap();
+    assert_matches!(
+        st.create_proposed_transactions::<Infallible, _, Infallible, _>(
+            account.usk(),
+            OvkPolicy::Sender,
+            &proposal
+        ),
+        Ok(_)
+    );
+}
+
+/// The number of blocks between Sapling activation and NU7 activation on the network used by the
+/// NU7 default-expiry tests. It leaves room for the funding blocks below NU7 activation.
+const NU7_ACTIVATION_OFFSET: u32 = 10;
+
+/// Returns a test network on which every upgrade through NU6.3 activates at Sapling activation,
+/// and NU7 activates [`NU7_ACTIVATION_OFFSET`] blocks later.
+fn nu7_activating_network() -> LocalNetwork {
+    let activation = TestBuilder::<(), ()>::DEFAULT_NETWORK
+        .sapling
+        .expect("the default test network activates Sapling");
+    LocalNetwork {
+        nu6: Some(activation),
+        nu6_1: Some(activation),
+        nu6_2: Some(activation),
+        nu6_3: Some(activation),
+        nu7: Some(activation + NU7_ACTIVATION_OFFSET),
+        ..TestBuilder::<(), ()>::DEFAULT_NETWORK
+    }
+}
+
+/// Builds a wallet on [`nu7_activating_network`] that holds two spendable notes, with its chain
+/// tip two blocks below NU7 activation. The next transaction then targets the block before
+/// activation.
+fn nu7_default_expiry_scenario<T: ShieldedPoolTester, Cache: TestCache, Dsf: DataStoreFactory>(
+    dsf: Dsf,
+    cache: Cache,
+) -> (TestDsl<TestScenario<T, Cache, Dsf>>, BlockHeight) {
+    let network = nu7_activating_network();
+    let nu7_activation = network
+        .activation_height(NetworkUpgrade::Nu7)
+        .expect("the test network activates NU7");
+    let mut st = TestDsl::from(
+        TestBuilder::new()
+            .with_network(network)
+            .with_data_store_factory(dsf)
+            .with_block_cache(cache)
+            .with_account_from_sapling_activation(BlockHash([0; 32])),
+    )
+    .build::<T>();
+
+    st.add_notes_checking_balance([
+        [Zatoshis::const_from_u64(100_000)],
+        [Zatoshis::const_from_u64(100_000)],
+    ]);
+    let tip = st.wallet().chain_height().unwrap().unwrap();
+    let blocks_to_add = u32::from(nu7_activation) - 2 - u32::from(tip);
+    st.add_empty_blocks(usize::try_from(blocks_to_add).expect("block count fits in a usize"));
+    (st, nu7_activation)
+}
+
+/// Tests that a transaction that the wallet creates with no explicit expiry height expires after
+/// the default expiry delta for its target height: 40 blocks before NU7 activation, and 120 blocks
+/// from NU7 activation onward.
+pub fn create_proposed_transactions_uses_nu7_default_expiry<T: ShieldedPoolTester>(
+    dsf: impl DataStoreFactory,
+    cache: impl TestCache,
+) {
+    let (mut st, nu7_activation) = nu7_default_expiry_scenario::<T, _, _>(dsf, cache);
+    let recipient = T::fvk_default_address(&T::sk_to_fvk(&T::sk(&[0xf5; 32])));
+    let payment_value = Zatoshis::const_from_u64(20_000);
+
+    for (expected_target_height, expected_delta) in [
+        (nu7_activation - 1, BLOSSOM_DEFAULT_TX_EXPIRY_DELTA),
+        (nu7_activation, NU7_DEFAULT_TX_EXPIRY_DELTA),
+    ] {
+        let proposal = st.propose_transfer_to(&recipient, payment_value);
+        let target_height = BlockHeight::from(proposal.min_target_height());
+        assert_eq!(target_height, expected_target_height);
+
+        let txids = st.create_proposed_expecting(&proposal, 1);
+        let tx = st
+            .wallet()
+            .get_transaction(txids[0])
+            .unwrap()
+            .expect("the created transaction is stored");
+        assert_eq!(
+            tx.expiry_height(),
+            target_height + expected_delta,
+            "default expiry height for target height {target_height}",
+        );
+
+        st.add_empty_blocks(1);
+    }
+}
+
+/// Tests that a PCZT that the wallet creates with no explicit expiry height expires after the
+/// default expiry delta for its target height: 40 blocks before NU7 activation, and 120 blocks
+/// from NU7 activation onward.
+///
+/// The test network's heights lie in the ZIP 212 grace period, in which the wallet cannot create a
+/// PCZT with Sapling outputs. `T` must therefore not be the Sapling pool.
+#[cfg(feature = "pczt")]
+pub fn create_pczt_uses_nu7_default_expiry<T: ShieldedPoolTester, Dsf>(
+    dsf: Dsf,
+    cache: impl TestCache,
+) where
+    Dsf: DataStoreFactory,
+    <Dsf as DataStoreFactory>::AccountId: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let (mut st, nu7_activation) = nu7_default_expiry_scenario::<T, _, _>(dsf, cache);
+    let account_id = st.get_account().id();
+    let recipient = T::fvk_default_address(&T::sk_to_fvk(&T::sk(&[0xf5; 32])));
+    let payment_value = Zatoshis::const_from_u64(20_000);
+
+    for (expected_target_height, expected_delta) in [
+        (nu7_activation - 1, BLOSSOM_DEFAULT_TX_EXPIRY_DELTA),
+        (nu7_activation, NU7_DEFAULT_TX_EXPIRY_DELTA),
+    ] {
+        let proposal = st.propose_transfer_to(&recipient, payment_value);
+        let target_height = BlockHeight::from(proposal.min_target_height());
+        assert_eq!(target_height, expected_target_height);
+
+        let pczt = st
+            .create_pczt_from_proposal::<Infallible, _, Infallible>(
+                account_id,
+                OvkPolicy::Sender,
+                &proposal,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            *pczt.global().expiry_height(),
+            u32::from(target_height + expected_delta),
+            "default expiry height for target height {target_height}",
+        );
+
+        st.add_empty_blocks(1);
+    }
 }

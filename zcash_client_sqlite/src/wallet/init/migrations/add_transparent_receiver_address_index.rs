@@ -94,7 +94,7 @@ fn record_derives_receiver<P: consensus::Parameters>(
     let account_pubkey = |ufvk: &str| {
         UnifiedFullViewingKey::decode(params, ufvk)
             .ok()
-            .and_then(|k| k.transparent().cloned())
+            .and_then(|k| k.p2pkh().cloned())
     };
 
     let derived = match record.key_scope {
@@ -110,8 +110,7 @@ fn record_derives_receiver<P: consensus::Parameters>(
                 UnifiedIncomingViewingKey::decode(params, &record.uivk)
                     .ok()
                     .and_then(|k| {
-                        k.transparent()
-                            .as_ref()
+                        k.p2pkh()
                             .and_then(|ivk| ivk.derive_address(idx).ok())
                     })
             }),
@@ -324,7 +323,7 @@ mod tests {
     use secrecy::Secret;
     use tempfile::NamedTempFile;
     use zcash_keys::keys::UnifiedSpendingKey;
-    use zcash_protocol::consensus::Network;
+    use zcash_protocol::{consensus::Network};
 
     use crate::{
         WalletDb,
@@ -356,8 +355,8 @@ mod tests {
         )
         .unwrap();
         let ufvk = usk.to_unified_full_viewing_key();
-        let ufvk_str = ufvk.encode(&network);
-        let uivk_str = ufvk.to_unified_incoming_viewing_key().encode(&network);
+        let ufvk_str = ufvk.encode(&network).unwrap();
+        let uivk_str = ufvk.to_unified_incoming_viewing_key().encode(&network).unwrap();
 
         conn.execute(
             "INSERT INTO accounts (uuid, account_kind, hd_seed_fingerprint,
@@ -384,7 +383,7 @@ mod tests {
         )
         .unwrap();
         usk.to_unified_full_viewing_key()
-            .transparent()
+            .p2pkh()
             .unwrap()
             .derive_external_ivk()
             .unwrap()
@@ -609,7 +608,7 @@ mod tests {
         )
         .unwrap();
         usk.to_unified_full_viewing_key()
-            .transparent()
+            .p2pkh()
             .unwrap()
             .derive_ephemeral_ivk()
             .unwrap()

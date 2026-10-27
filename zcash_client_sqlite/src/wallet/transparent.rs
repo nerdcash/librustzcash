@@ -9,7 +9,7 @@ use std::{
 };
 
 use nonempty::NonEmpty;
-use rand::RngCore;
+use rand::Rng;
 use rand_distr::Distribution;
 use rusqlite::{Connection, OptionalExtension, Row, ToSql, named_params, types::Value};
 use tracing::{debug, warn};
@@ -41,8 +41,6 @@ use zcash_keys::{
         transparent::gap_limits::{GapLimits, generate_address_list},
     },
 };
-#[cfg(not(feature = "spend-index"))]
-use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
 use zcash_primitives::transaction::fees::{
     FeeRule,
     transparent::{InputSize, InputView},
@@ -59,6 +57,11 @@ use zip32::Scope;
 use {
     bip32::{PublicKey, PublicKeyBytes},
     zcash_script::script::Code,
+};
+#[cfg(not(feature = "spend-index"))]
+use {
+    zcash_primitives::transaction::builder::default_tx_expiry_delta,
+    zcash_protocol::consensus::BranchId,
 };
 
 use super::{
@@ -119,6 +122,39 @@ pub(crate) fn detect_spending_accounts<'a>(
     }
 
     Ok(acc)
+}
+
+/// Returns the outpoints of the wallet's transparent outputs that are not known to have been
+/// spent in a mined transaction, each mapped to the account that received it.
+///
+/// An output whose only recorded spend is by a transaction that has not been mined is included:
+/// such a transaction may yet be replaced or expire, so the wallet must keep watching the
+/// outpoint for a spend that does reach the chain.
+pub(crate) fn get_unspent_outpoints(
+    conn: &Connection,
+) -> Result<HashMap<OutPoint, AccountUuid>, SqliteClientError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT t.txid, tro.output_index, accounts.uuid
+         FROM transparent_received_outputs tro
+         JOIN transactions t ON t.id_tx = tro.transaction_id
+         JOIN accounts ON accounts.id = tro.account_id
+         WHERE tro.id NOT IN (
+             SELECT tros.transparent_received_output_id
+             FROM transparent_received_output_spends tros
+             JOIN transactions stx ON stx.id_tx = tros.transaction_id
+             WHERE stx.mined_height IS NOT NULL
+         )",
+    )?;
+
+    let rows = stmt.query_and_then([], |row| {
+        let txid: [u8; 32] = row.get("txid")?;
+        Ok::<_, SqliteClientError>((
+            OutPoint::new(txid, row.get("output_index")?),
+            AccountUuid(row.get("uuid")?),
+        ))
+    })?;
+
+    rows.collect()
 }
 
 /// Returns the `NonHardenedChildIndex` corresponding to a diversifier index
@@ -378,7 +414,7 @@ pub(crate) fn uivk_legacy_transparent_address<P: consensus::Parameters>(
     params: &P,
     uivk_str: &str,
 ) -> Result<Option<(TransparentAddress, NonHardenedChildIndex)>, SqliteClientError> {
-    let (network, uivk) = Uivk::decode(uivk_str)
+    let (network, _revision, uivk) = Uivk::decode(uivk_str)
         .map_err(|e| SqliteClientError::CorruptedData(format!("Unable to parse UIVK: {e}")))?;
 
     if params.network_type() != network {
@@ -1184,7 +1220,7 @@ fn to_unspent_transparent_output(
 /// # Usage requirements
 /// - The parent must provide `:target_height` as a named argument.
 /// - The parent is responsible for enclosing this condition in parentheses as appropriate.
-pub(crate) fn spent_utxos_clause() -> String {
+pub(crate) fn spent_utxos_clause<P: consensus::Parameters>(params: &P) -> String {
     format!(
         r#"
         SELECT txo_spends.transparent_received_output_id
@@ -1192,7 +1228,7 @@ pub(crate) fn spent_utxos_clause() -> String {
         JOIN transactions stx ON stx.id_tx = txo_spends.transaction_id
         WHERE {}
         "#,
-        super::common::tx_unexpired_condition("stx")
+        super::common::tx_unexpired_condition(params, "stx")
     )
 }
 
@@ -1307,8 +1343,9 @@ pub(crate) fn excluding_immature_coinbase_outputs(tx: &str) -> String {
 /// - `outpoint`: The identifier for the output to be retrieved.
 /// - `target_height`: The target height of a transaction under construction that will spend the
 ///   returned output. If this is `None`, no spendability checks are performed.
-pub(crate) fn get_wallet_transparent_output(
+pub(crate) fn get_wallet_transparent_output<P: consensus::Parameters>(
     conn: &rusqlite::Connection,
+    params: &P,
     outpoint: &OutPoint,
     target_height: Option<TargetHeight>,
 ) -> Result<Option<WalletTransparentOutput<AccountUuid>>, SqliteClientError> {
@@ -1338,8 +1375,8 @@ pub(crate) fn get_wallet_transparent_output(
                  AND ({}) -- exclude likely-spent wallet-internal ephemeral outputs
              )
          )",
-        tx_unexpired_condition("t"),
-        spent_utxos_clause(),
+        tx_unexpired_condition(params, "t"),
+        spent_utxos_clause(params),
         excluding_wallet_internal_ephemeral_outputs("u", "addresses", "t", "accounts"),
     ))?;
 
@@ -1372,7 +1409,8 @@ pub(crate) fn get_wallet_transparent_output(
 /// on a single address, a set of addresses, or an account; and can order by address+index
 /// (per-address determinism) or by value descending (value-bounded selection), optionally prefixed
 /// with a lock-tier preference key.
-fn spendable_transparent_outputs_query(
+fn spendable_transparent_outputs_query<P: consensus::Parameters>(
+    params: &P,
     address_predicate_sql: &str,
     lock_eligible_sql: &str,
     order_by_sql: &str,
@@ -1410,7 +1448,7 @@ fn spendable_transparent_outputs_query(
            -- key material exists with which a spend could be constructed
          ORDER BY {order_by_sql}",
         tx_unexpired_condition_minconf_0("t"),
-        spent_utxos_clause(),
+        spent_utxos_clause(params),
         excluding_wallet_internal_ephemeral_outputs("u", "addresses", "t", "accounts"),
         excluding_immature_coinbase_outputs("t"),
         foreign_scope = KeyScope::Foreign.encode(),
@@ -1498,6 +1536,7 @@ pub(crate) fn get_spendable_transparent_outputs_for_addresses<P: consensus::Para
     // This returns all matching outputs (no value target), so only the eligibility filter
     // (Part A) applies; no lock-tier ordering is imposed.
     let mut stmt_utxos = conn.prepare_cached(&spendable_transparent_outputs_query(
+        params,
         "addresses.cached_transparent_receiver_address IN rarray(:addresses)",
         &output_eligible_condition(lock_filter, "u"),
         "addresses.cached_transparent_receiver_address, u.output_index",
@@ -1614,6 +1653,7 @@ pub(crate) fn select_spendable_transparent_outputs<P: consensus::Parameters>(
     // `:coinbase_filter`, so that there is a single query text regardless of whether an
     // allow list is present.
     let mut stmt_utxos = conn.prepare_cached(&spendable_transparent_outputs_query(
+        params,
         "accounts.uuid = :account_uuid
          AND (
              :has_address_allow_list = 0
@@ -1744,7 +1784,7 @@ pub(crate) fn get_transparent_balances<P: consensus::Parameters>(
          AND u.id NOT IN ({}) -- and the output is unspent
          AND ({}) -- exclude likely-spent wallet-internal ephemeral outputs",
         tx_unexpired_condition_minconf_0("t"),
-        spent_utxos_clause(),
+        spent_utxos_clause(params),
         excluding_wallet_internal_ephemeral_outputs("u", "addresses", "t", "accounts"),
     ))?;
 
@@ -1804,7 +1844,7 @@ pub(crate) fn get_transparent_balances<P: consensus::Parameters>(
              )
              AND u.id NOT IN ({}) -- and the output is unspent
              AND ({}) -- exclude likely-spent wallet-internal ephemeral outputs",
-            spent_utxos_clause(),
+            spent_utxos_clause(params),
             excluding_wallet_internal_ephemeral_outputs("u", "addresses", "t", "accounts")
         ))?;
 
@@ -1833,9 +1873,10 @@ pub(crate) fn get_transparent_balances<P: consensus::Parameters>(
     Ok(result)
 }
 
-#[tracing::instrument(skip(conn, account_balances))]
-pub(crate) fn add_transparent_account_balances(
+#[tracing::instrument(skip(conn, params, account_balances))]
+pub(crate) fn add_transparent_account_balances<P: consensus::Parameters>(
     conn: &rusqlite::Connection,
+    params: &P,
     target_height: TargetHeight,
     confirmations_policy: ConfirmationsPolicy,
     account_balances: &mut HashMap<AccountUuid, AccountBalance>,
@@ -1862,7 +1903,7 @@ pub(crate) fn add_transparent_account_balances(
          AND ({}) -- exclude likely-spent wallet-internal ephemeral outputs
          GROUP BY accounts.uuid, lock_expiry_height, is_coinbase, is_mature",
         tx_unexpired_condition_minconf_0("t"),
-        spent_utxos_clause(),
+        spent_utxos_clause(params),
         excluding_wallet_internal_ephemeral_outputs("u", "addresses", "t", "accounts"),
     ))?;
 
@@ -1941,7 +1982,7 @@ pub(crate) fn add_transparent_account_balances(
              AND u.id NOT IN ({}) -- and the received txo is unspent
              AND ({}) -- exclude likely-spent wallet-internal ephemeral outputs
              GROUP BY accounts.uuid, lock_expiry_height, is_coinbase",
-            spent_utxos_clause(),
+            spent_utxos_clause(params),
             excluding_wallet_internal_ephemeral_outputs("u", "addresses", "t", "accounts"),
         ))?;
 
@@ -2130,8 +2171,15 @@ pub(crate) fn put_received_transparent_utxo<P: consensus::Parameters>(
     gap_limits: &GapLimits,
     output: &WalletTransparentOutput<AccountUuid>,
 ) -> Result<(AccountRef, AccountUuid, KeyScope, UtxoId), SqliteClientError> {
-    let observed_height = chain_tip_height(conn)?.ok_or(SqliteClientError::ChainHeightUnknown)?;
-    put_transparent_output(conn, params, gap_limits, output, observed_height, true)
+    let observed_height = mempool_height(conn)?.ok_or(SqliteClientError::ChainHeightUnknown)?;
+    put_transparent_output(
+        conn,
+        params,
+        gap_limits,
+        output,
+        BlockHeight::from(observed_height),
+        true,
+    )
 }
 
 /// An enumeration of the types of errors that can occur when scheduling an event to happen at a
@@ -2189,7 +2237,7 @@ impl From<TryFromIntError> for SchedulingError {
 
 /// Sample a random timestamp from an exponential distribution such that the expected value of the
 /// generated timestamp is `check_interval_seconds` after the provided `from_event` time.
-pub(crate) fn next_check_time<R: RngCore, D: DerefMut<Target = R>>(
+pub(crate) fn next_check_time<R: Rng, D: DerefMut<Target = R>>(
     mut rng: D,
     from_event: SystemTime,
     check_interval_seconds: u32,
@@ -2202,7 +2250,7 @@ pub(crate) fn next_check_time<R: RngCore, D: DerefMut<Target = R>>(
     Ok(from_event + Duration::new(event_delay, 0))
 }
 
-pub(crate) fn schedule_next_check<P: consensus::Parameters, C: Clock, R: RngCore>(
+pub(crate) fn schedule_next_check<P: consensus::Parameters, C: Clock, R: Rng>(
     conn: &rusqlite::Transaction,
     params: &P,
     clock: C,
@@ -2376,7 +2424,9 @@ pub(crate) fn transaction_data_requests<P: consensus::Parameters>(
                         .get::<_, Option<u32>>(1)?
                         .map(BlockHeight::from)
                         .unwrap_or(chain_tip_height);
-                    let max_end_height = block_range_start + DEFAULT_TX_EXPIRY_DELTA + 1;
+                    let max_end_height = block_range_start
+                        + default_tx_expiry_delta(BranchId::for_height(params, block_range_start))
+                        + 1;
                     Ok::<TransactionDataRequest, SqliteClientError>(
                         TransactionDataRequest::transactions_involving_address(
                             address,
@@ -2672,6 +2722,49 @@ pub(crate) fn find_account_uuid_for_transparent_address<P: consensus::Parameters
     Ok(None)
 }
 
+/// Returns every transparent receiver the wallet knows of, mapped to the account that controls
+/// it and the key scope under which it was derived.
+///
+/// This is the wallet-wide counterpart of [`find_account_uuid_for_transparent_address`] and
+/// searches the same locations: the `addresses` table, which holds the receivers of unified
+/// addresses, ephemeral receivers and imported standalone addresses; and the legacy transparent
+/// address (BIP 44 address index 0) of each account, which may have no `addresses` row. Where
+/// both name the same receiver, the `addresses` row takes precedence.
+pub(crate) fn get_receiver_accounts<P: consensus::Parameters>(
+    conn: &rusqlite::Connection,
+    params: &P,
+) -> Result<
+    HashMap<TransparentAddress, (AccountUuid, Option<TransparentKeyScope>)>,
+    SqliteClientError,
+> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT addresses.cached_transparent_receiver_address, accounts.uuid, addresses.key_scope
+         FROM addresses
+         JOIN accounts ON accounts.id = addresses.account_id
+         WHERE addresses.cached_transparent_receiver_address IS NOT NULL",
+    )?;
+
+    let mut receivers = stmt
+        .query_and_then([], |row| {
+            let address_str: String = row.get(0)?;
+            let address = TransparentAddress::decode(params, &address_str)?;
+            let account_id = AccountUuid(row.get(1)?);
+            let key_scope = KeyScope::decode(row.get(2)?)?;
+            Ok::<_, SqliteClientError>((address, (account_id, key_scope.as_transparent())))
+        })?
+        .collect::<Result<HashMap<_, _>, _>>()?;
+
+    for account_id in get_account_ids(conn)? {
+        if let Some((legacy_taddr, _)) = get_legacy_transparent_address(params, conn, account_id)? {
+            receivers
+                .entry(legacy_taddr)
+                .or_insert((account_id, KeyScope::EXTERNAL.as_transparent()));
+        }
+    }
+
+    Ok(receivers)
+}
+
 /// Add a transparent output relevant to this wallet to the database.
 ///
 /// `output_height` may be None if this is an ephemeral output from a
@@ -2827,7 +2920,9 @@ pub(crate) fn put_transparent_output<P: consensus::Parameters>(
         .query_row(sql_args, |row| row.get::<_, i64>(0).map(UtxoId))?;
 
     // If we have a record of the output already having been spent, then mark it as spent using the
-    // stored reference to the spending transaction.
+    // stored reference to the spending transaction. The spend may have been recorded by either
+    // route: against a transaction the wallet stores, or -- for a spend observed while scanning a
+    // block, whose spending transaction the wallet has no other reason to store -- by locator.
     let spending_tx_ref = conn
         .query_row(
             "SELECT ts.spending_transaction_id
@@ -2842,7 +2937,12 @@ pub(crate) fn put_transparent_output<P: consensus::Parameters>(
             ],
             |row| row.get::<_, i64>(0).map(TxRef),
         )
-        .optional()?;
+        .optional()?
+        .map(Ok)
+        .or_else(|| {
+            super::find_or_create_spending_tx_for_outpoint(conn, output.outpoint()).transpose()
+        })
+        .transpose()?;
 
     if let Some(spending_transaction_id) = spending_tx_ref {
         mark_transparent_utxo_spent(conn, spending_transaction_id, output.outpoint())?;
@@ -2897,14 +2997,16 @@ pub(crate) fn queue_transparent_spend_detection<P: consensus::Parameters>(
 mod tests {
     use secrecy::Secret;
     use transparent::{
+        address::TransparentAddress,
         bundle::{OutPoint, TxOut},
         keys::{NonHardenedChildIndex, TransparentKeyScope},
     };
     use zcash_client_backend::{
-        data_api::{Account as _, WalletRead, WalletWrite, testing::TestBuilder},
+        data_api::{Account as _, AddressSource, WalletRead, WalletWrite, testing::TestBuilder},
         wallet::{Exposure, TransparentAddressMetadata, WalletTransparentOutput},
     };
     use zcash_primitives::block::BlockHash;
+    use zip32::DiversifierIndex;
 
     use crate::{
         GapLimits, WalletDb,
@@ -2918,16 +3020,18 @@ mod tests {
         },
     };
     use rusqlite::named_params;
-    use zcash_keys::keys::{ReceiverRequirement, UnifiedAddressRequest};
+    use zcash_keys::{
+        address::{Address, UnifiedAddress},
+        encoding::AddressCodec,
+        keys::{ReceiverRequirement, UnifiedAddressRequest},
+    };
     use zcash_protocol::value::Zatoshis;
     #[cfg(feature = "transparent-key-import")]
     use {
         proptest::prelude::*,
-        secp256k1::{PublicKey, Secp256k1, SecretKey},
+        secp256k1::{PublicKey, SecretKey},
         std::collections::HashSet,
-        transparent::address::TransparentAddress,
         zcash_client_backend::data_api::{AccountBirthday, chain::ChainState},
-        zcash_keys::{address::Address, encoding::AddressCodec},
         zcash_protocol::consensus::{NetworkUpgrade, Parameters},
     };
 
@@ -2935,6 +3039,57 @@ mod tests {
     fn put_received_transparent_utxo() {
         zcash_client_backend::data_api::testing::transparent::put_received_transparent_utxo(
             TestDbFactory::default(),
+        );
+    }
+
+    #[test]
+    fn put_received_unmined_utxo_uses_mempool_height_expiry_delta() {
+        zcash_client_backend::data_api::testing::transparent::put_received_unmined_utxo_uses_mempool_height_expiry_delta(
+            TestDbFactory::default(),
+        );
+    }
+
+    #[test]
+    fn scan_full_block_persists_transparent_outputs() {
+        zcash_client_backend::data_api::testing::transparent::scan_full_block_persists_transparent_outputs(
+            TestDbFactory::default(),
+        );
+    }
+
+    #[test]
+    fn put_blocks_rolls_back_transparent_outputs() {
+        zcash_client_backend::data_api::testing::transparent::put_blocks_rolls_back_transparent_outputs(
+            TestDbFactory::default(),
+        );
+    }
+
+    #[test]
+    fn scan_full_block_detects_transparent_spend() {
+        zcash_client_backend::data_api::testing::transparent::scan_full_block_detects_transparent_spend(
+            TestDbFactory::default(),
+        );
+    }
+
+    #[test]
+    fn scan_full_block_detects_out_of_order_transparent_spend() {
+        zcash_client_backend::data_api::testing::transparent::scan_full_block_detects_out_of_order_transparent_spend(
+            TestDbFactory::default(),
+        );
+    }
+
+    #[test]
+    fn scan_detects_transparent_spend() {
+        zcash_client_backend::data_api::testing::transparent::scan_detects_transparent_spend(
+            TestDbFactory::default(),
+            BlockCache::new(),
+        );
+    }
+
+    #[test]
+    fn scan_detects_out_of_order_transparent_spend() {
+        zcash_client_backend::data_api::testing::transparent::scan_detects_out_of_order_transparent_spend(
+            TestDbFactory::default(),
+            BlockCache::new(),
         );
     }
 
@@ -3140,6 +3295,121 @@ mod tests {
         );
     }
 
+    /// `v_tx_outputs` must emit the `diversifier_index_be` of the receiving address for
+    /// outputs received by the wallet, as its documentation has promised since the column
+    /// was introduced. The outer merge projection previously dropped it, so the documented
+    /// column did not exist in the view's output at all. See zcash/librustzcash#2863.
+    #[test]
+    fn v_tx_outputs_exposes_diversifier_index() {
+        use transparent::bundle::{OutPoint, TxOut};
+        use zcash_client_backend::{
+            data_api::WalletRead as _,
+            wallet::{Recipient, WalletTransparentOutput},
+        };
+        use zcash_keys::{encoding::AddressCodec as _, keys::UnifiedAddressRequest};
+        use zcash_protocol::value::Zatoshis;
+
+        use crate::{TxRef, wallet::put_sent_output};
+
+        let mut st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        let account_id = st.test_account().unwrap().id();
+        let birthday = st.test_account().unwrap().birthday().height();
+        let params = st.wallet().db().params;
+        let taddr = *st
+            .wallet()
+            .get_last_generated_address_matching(
+                account_id,
+                UnifiedAddressRequest::AllAvailableKeys,
+            )
+            .unwrap()
+            .unwrap()
+            .transparent()
+            .unwrap();
+        let taddr_str = taddr.encode(&params);
+
+        let mined_at = birthday + 100;
+        st.wallet_mut().update_chain_tip(mined_at + 10).unwrap();
+
+        let outpoint = OutPoint::fake();
+        let value = Zatoshis::const_from_u64(100_000);
+        let utxo = WalletTransparentOutput::from_parts(
+            outpoint.clone(),
+            TxOut::new(value, taddr.script().into()),
+            Some(mined_at),
+            Some(account_id),
+            Some(TransparentKeyScope::EXTERNAL),
+            None,
+        )
+        .unwrap();
+        st.wallet_mut()
+            .put_received_transparent_utxo(&utxo)
+            .unwrap();
+
+        let expected: Vec<u8> = st
+            .wallet()
+            .conn()
+            .query_row(
+                "SELECT diversifier_index_be FROM addresses
+                 WHERE cached_transparent_receiver_address = :addr",
+                rusqlite::named_params! { ":addr": taddr_str },
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let div_idx = |conn: &rusqlite::Connection| -> Option<Vec<u8>> {
+            conn.query_row(
+                "SELECT diversifier_index_be FROM v_tx_outputs WHERE txid = :txid",
+                rusqlite::named_params! { ":txid": outpoint.hash().to_vec() },
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            div_idx(st.wallet().conn()),
+            Some(expected.clone()),
+            "a received output must carry the diversifier index of its receiving address",
+        );
+
+        // Recording the send side of the same output must not displace the index: the
+        // received arm's non-NULL value survives the merge.
+        let id_tx: i64 = st
+            .wallet()
+            .conn()
+            .query_row(
+                "SELECT id_tx FROM transactions WHERE txid = :txid",
+                rusqlite::named_params! { ":txid": outpoint.hash().to_vec() },
+                |row| row.get(0),
+            )
+            .unwrap();
+        let conn_tx = st.wallet_mut().conn_mut().transaction().unwrap();
+        put_sent_output(
+            &conn_tx,
+            &params,
+            account_id,
+            TxRef(id_tx),
+            outpoint.n() as usize,
+            &Recipient::InternalTransparent {
+                receiving_account: account_id,
+                recipient_address: taddr,
+            },
+            value,
+            None,
+        )
+        .unwrap();
+        conn_tx.commit().unwrap();
+
+        assert_eq!(
+            div_idx(st.wallet().conn()),
+            Some(expected),
+            "the receiving address's diversifier index must survive the sent/received merge",
+        );
+    }
+
     #[test]
     fn transparent_balance_across_shielding() {
         zcash_client_backend::data_api::testing::transparent::transparent_balance_across_shielding(
@@ -3280,6 +3550,140 @@ mod tests {
             TestDbFactory::default(),
             BlockCache::new(),
             GapLimits::default(),
+        );
+    }
+
+    /// Every unified address that gap-limit generation stores keeps the transparent receiver
+    /// cached for its row, and the row's receiver flags record that receiver.
+    #[test]
+    fn store_address_range_retains_transparent_receiver() {
+        let st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+        let network = *st.network();
+
+        let mut stmt = st
+            .wallet()
+            .db()
+            .conn
+            .prepare(
+                "SELECT address, cached_transparent_receiver_address, receiver_flags
+                 FROM addresses
+                 WHERE key_scope = :external_scope
+                   AND transparent_child_index IS NOT NULL",
+            )
+            .unwrap();
+        let rows: Vec<(String, Option<String>, i64)> = stmt
+            .query_map(
+                named_params! { ":external_scope": KeyScope::EXTERNAL.encode() },
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        // The account has shielded keys, so every gap-limit row is a unified address.
+        assert!(!rows.is_empty());
+        for (address, cached_taddr, flags) in rows {
+            let ua = UnifiedAddress::decode(&network, &address).unwrap();
+            assert!(ua.has_orchard() || ua.has_sapling());
+            assert_eq!(
+                ua.transparent().map(|taddr| taddr.encode(&network)),
+                cached_taddr,
+                "address {address} omits its cached transparent receiver"
+            );
+            assert!(
+                ReceiverFlags::from_bits_retain(flags).contains(ReceiverFlags::P2PKH),
+                "receiver flags of {address} omit P2PKH"
+            );
+        }
+    }
+
+    /// `list_addresses` reports the transparent receiver that the wallet tracks at the index of
+    /// an exposed unified address that omits it, as a transparent address of its own.
+    #[test]
+    fn list_addresses_reports_tracked_transparent_receiver() {
+        let mut st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+        let account_uuid = st.test_account().unwrap().id();
+        let network = *st.network();
+
+        // The unexposed external rows that gap-limit generation stored, each with a cached
+        // transparent receiver.
+        let mut stmt = st
+            .wallet()
+            .db()
+            .conn
+            .prepare(
+                "SELECT transparent_child_index FROM addresses
+                 WHERE key_scope = :external_scope
+                   AND exposed_at_height IS NULL
+                   AND transparent_child_index IS NOT NULL
+                 ORDER BY transparent_child_index",
+            )
+            .unwrap();
+        let unexposed: Vec<u32> = stmt
+            .query_map(
+                named_params! { ":external_scope": KeyScope::EXTERNAL.encode() },
+                |r| r.get(0),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        drop(stmt);
+
+        // Expose a shielded-only address at one of those indices.
+        let shielded_only = UnifiedAddressRequest::unsafe_custom(
+            ReceiverRequirement::Allow,
+            ReceiverRequirement::Allow,
+            ReceiverRequirement::Omit,
+        );
+        let (index, ua) = unexposed
+            .into_iter()
+            .find_map(|i| {
+                st.wallet_mut()
+                    .get_address_for_index(account_uuid, DiversifierIndex::from(i), shielded_only)
+                    .unwrap()
+                    .map(|ua| (DiversifierIndex::from(i), ua))
+            })
+            .expect("some unexposed index is a valid Sapling diversifier index");
+        assert!(!ua.has_transparent());
+
+        let cached_taddr: String = st
+            .wallet()
+            .db()
+            .conn
+            .query_row(
+                "SELECT cached_transparent_receiver_address FROM addresses
+                 WHERE key_scope = :external_scope AND diversifier_index_be = :di_be",
+                named_params! {
+                    ":external_scope": KeyScope::EXTERNAL.encode(),
+                    ":di_be": encode_diversifier_index_be(index),
+                },
+                |r| r.get(0),
+            )
+            .unwrap();
+        let taddr = TransparentAddress::decode(&network, &cached_taddr).unwrap();
+
+        let listed = st.wallet().list_addresses(account_uuid).unwrap();
+        let at_index: Vec<_> = listed
+            .iter()
+            .filter(|info| {
+                matches!(
+                    info.source(),
+                    AddressSource::Derived { diversifier_index, .. } if diversifier_index == index
+                )
+            })
+            .collect();
+        assert_eq!(at_index.len(), 2);
+        assert_eq!(at_index[0].address(), &Address::from(ua));
+        assert_eq!(at_index[1].address(), &Address::Transparent(taddr));
+        assert_eq!(
+            at_index[1].source().transparent_key_scope(),
+            Some(&TransparentKeyScope::EXTERNAL)
         );
     }
 
@@ -3813,7 +4217,7 @@ mod tests {
             ProptestConfig::with_cases(16),
             |(
                 sk in any::<[u8; 32]>()
-                    .prop_filter_map("valid secp256k1 secret key", |b| SecretKey::from_slice(&b).ok()),
+                    .prop_filter_map("valid secp256k1 secret key", |b| SecretKey::from_secret_bytes(b).ok()),
                 // Above the account's default external gap (10) so store_address_range actually
                 // inserts our receiver rather than skipping an already-derived index.
                 child_index in 16u32..0x8000_0000u32,
@@ -3827,7 +4231,7 @@ mod tests {
                 let network = *st.network();
 
                 // A real pubkey and the transparent receiver it hashes to.
-                let pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
+                let pubkey = PublicKey::from_secret_key(&sk);
                 let taddr = TransparentAddress::from_pubkey(&pubkey);
                 let taddr_enc = taddr.encode(&network);
                 let child = NonHardenedChildIndex::from_index(child_index).unwrap();
@@ -3883,7 +4287,7 @@ mod tests {
         proptest!(
             ProptestConfig::with_cases(16),
             |(sk in any::<[u8; 32]>()
-                .prop_filter_map("valid secp256k1 secret key", |b| SecretKey::from_slice(&b).ok()))| {
+                .prop_filter_map("valid secp256k1 secret key", |b| SecretKey::from_secret_bytes(b).ok()))| {
                 let st = TestBuilder::new()
                     .with_data_store_factory(TestDbFactory::default())
                     .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -3892,7 +4296,7 @@ mod tests {
                 let account_uuid = st.test_account().unwrap().id();
                 let network = *st.network();
 
-                let pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
+                let pubkey = PublicKey::from_secret_key(&sk);
                 let taddr_enc = TransparentAddress::from_pubkey(&pubkey).encode(&network);
 
                 let tx = st.wallet().db().conn.unchecked_transaction().unwrap();
@@ -3942,10 +4346,7 @@ mod tests {
             .build();
 
         let network = *st.network();
-        let pubkey = PublicKey::from_secret_key(
-            &Secp256k1::new(),
-            &SecretKey::from_slice(&[0x11; 32]).unwrap(),
-        );
+        let pubkey = PublicKey::from_secret_key(&SecretKey::from_secret_bytes([0x11; 32]).unwrap());
 
         // A uuid that matches no account in the wallet.
         let unknown = crate::AccountUuid::from_uuid(uuid::Uuid::from_bytes([0xff; 16]));
@@ -3969,7 +4370,7 @@ mod tests {
             ProptestConfig::with_cases(12),
             |(sks in proptest::collection::vec(
                 any::<[u8; 32]>()
-                    .prop_filter_map("valid secp256k1 secret key", |b| SecretKey::from_slice(&b).ok()),
+                    .prop_filter_map("valid secp256k1 secret key", |b| SecretKey::from_secret_bytes(b).ok()),
                 1..8usize,
             ))| {
                 let st = TestBuilder::new()
@@ -3979,10 +4380,9 @@ mod tests {
 
                 let account_uuid = st.test_account().unwrap().id();
                 let network = *st.network();
-                let secp = Secp256k1::new();
 
                 let pubkeys: Vec<PublicKey> =
-                    sks.iter().map(|sk| PublicKey::from_secret_key(&secp, sk)).collect();
+                    sks.iter().map(PublicKey::from_secret_key).collect();
                 let distinct: HashSet<String> = pubkeys
                     .iter()
                     .map(|pk| TransparentAddress::from_pubkey(pk).encode(&network))
@@ -4037,10 +4437,7 @@ mod tests {
             .build();
 
         let network = *st.network();
-        let pubkey = PublicKey::from_secret_key(
-            &Secp256k1::new(),
-            &SecretKey::from_slice(&[0x22; 32]).unwrap(),
-        );
+        let pubkey = PublicKey::from_secret_key(&SecretKey::from_secret_bytes([0x22; 32]).unwrap());
         let unknown = crate::AccountUuid::from_uuid(uuid::Uuid::from_bytes([0xfe; 16]));
 
         let tx = st.wallet().db().conn.unchecked_transaction().unwrap();
@@ -4316,7 +4713,10 @@ mod tests {
         };
         use zcash_keys::keys::UnifiedAddressRequest;
         use zcash_primitives::block::BlockHash;
-        use zcash_protocol::{consensus::BlockHeight, value::Zatoshis};
+        use zcash_protocol::{
+            consensus::{self, BlockHeight},
+            value::Zatoshis,
+        };
 
         use crate::{
             AccountUuid,
@@ -4555,11 +4955,12 @@ mod tests {
         }
 
         /// The funding account the wallet reports for the scenario's transparent output.
-        fn reported_funding_account(
+        fn reported_funding_account<P: consensus::Parameters>(
             conn: &rusqlite::Connection,
+            params: &P,
             outpoint: &OutPoint,
         ) -> Option<AccountUuid> {
-            get_wallet_transparent_output(conn, outpoint, None)
+            get_wallet_transparent_output(conn, params, outpoint, None)
                 .unwrap()
                 .expect("the seeded transparent output is retrievable")
                 .funding_account()
@@ -4591,7 +4992,7 @@ mod tests {
             );
 
             assert_eq!(
-                reported_funding_account(&st.wallet().db().conn, &scenario.outpoint),
+                reported_funding_account(&st.wallet().db().conn, st.network(), &scenario.outpoint),
                 Some(scenario.account_a_uuid),
                 "the bug: an output funded entirely from Ironwood reports no funding account, \
                  because the funding-account query counts no Ironwood value",
@@ -4629,7 +5030,8 @@ mod tests {
                 MIXED_POOL_SAPLING_INPUT_ZATS,
             );
 
-            let reported = reported_funding_account(&st.wallet().db().conn, &scenario.outpoint);
+            let reported =
+                reported_funding_account(&st.wallet().db().conn, st.network(), &scenario.outpoint);
             assert_ne!(
                 reported,
                 Some(scenario.account_b_uuid),

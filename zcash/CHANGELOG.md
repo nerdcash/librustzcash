@@ -8,8 +8,8 @@ and this library adheres to Rust's notion of
 ## [Unreleased]
 
 ### Changed
-- MSRV is now 1.88
-- Migrated to `zcash_primitives 0.30.0`.
+- MSRV is now 1.89
+- Migrated to `zcash_primitives 0.31.0-pre.1`.
 
 ### Fixed
 - Updated to crate versions that fix an Orchard soundness vulnerability
