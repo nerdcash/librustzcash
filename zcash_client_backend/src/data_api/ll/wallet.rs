@@ -10,26 +10,26 @@ use rayon::{
 };
 use tracing::{debug, info, trace, warn};
 
-use incrementalmerkletree::{Hashable, Marking, Position, Retention, frontier::Frontier};
-use shardtree::{LocatedPrunableTree, ShardTree, error::ShardTreeError, store::ShardStore};
+use incrementalmerkletree::{frontier::Frontier, Hashable, Marking, Position, Retention};
+use shardtree::{error::ShardTreeError, store::ShardStore, LocatedPrunableTree, ShardTree};
 use transparent::{address::TransparentAddress, bundle::OutPoint};
 use zcash_keys::{address::Receiver, encoding::AddressCodec as _};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
-    PoolType, ShieldedPool,
     consensus::{self, BlockHeight},
     value::{BalanceError, Zatoshis},
+    PoolType, ShieldedPool,
 };
 use zcash_script::solver::ScriptKind;
 
 use crate::{
-    TransferType,
     data_api::{
-        DecryptedTransaction, SAPLING_SHARD_HEIGHT, ScannedBlock, TransactionStatus,
-        WalletCommitmentTrees, anchor_retention::AnchorRetention, chain::ChainState,
-        ll::ReceivedShieldedOutput,
+        anchor_retention::AnchorRetention, chain::ChainState, ll::ReceivedShieldedOutput,
+        DecryptedTransaction, ScannedBlock, TransactionStatus, WalletCommitmentTrees,
+        SAPLING_SHARD_HEIGHT,
     },
     wallet::{Recipient, WalletTransparentOutput},
+    TransferType,
 };
 
 use super::{LowLevelWalletRead, LowLevelWalletWrite, TxMeta};
@@ -43,11 +43,11 @@ use {
     std::collections::HashSet,
     transparent::keys::TransparentKeyScope,
     zcash_keys::keys::{
+        transparent::gap_limits::{
+            generate_gap_addresses, AddressStore, GapAddressesError, GapLimits,
+        },
         ReceiverRequirement::*,
         UnifiedAddressRequest,
-        transparent::gap_limits::{
-            AddressStore, GapAddressesError, GapLimits, generate_gap_addresses,
-        },
     },
 };
 
@@ -197,13 +197,13 @@ pub trait PutBlocksDbT<SE, TE, AR>:
 
 #[cfg(feature = "transparent-inputs")]
 impl<
-    T: LowLevelWalletWrite<Error = SE>
-        + WalletCommitmentTrees<Error = TE>
-        + AddressStore<Error = SE, AccountRef = AR>,
-    SE,
-    TE,
-    AR,
-> PutBlocksDbT<SE, TE, AR> for T
+        T: LowLevelWalletWrite<Error = SE>
+            + WalletCommitmentTrees<Error = TE>
+            + AddressStore<Error = SE, AccountRef = AR>,
+        SE,
+        TE,
+        AR,
+    > PutBlocksDbT<SE, TE, AR> for T
 {
 }
 
@@ -668,33 +668,43 @@ where
     DbT: PutBlocksDbT<SE, TE, <DbT as LowLevelWalletRead>::AccountRef>,
     DbT::TxRef: Eq + Hash,
 {
-    let rows = put_blocks_rows(
-        wallet_db,
-        #[cfg(feature = "transparent-inputs")]
-        gap_limits,
-        from_state,
-        blocks,
-    )?;
+    let rows = {
+        let _span = tracing::info_span!("put_blocks_rows").entered();
+        put_blocks_rows(
+            wallet_db,
+            #[cfg(feature = "transparent-inputs")]
+            gap_limits,
+            from_state,
+            blocks,
+        )?
+    };
 
-    let mut sapling_commitments = rows.sapling_commitments;
+    let sapling_commitments = rows.sapling_commitments;
     #[cfg(feature = "orchard")]
-    let mut orchard_commitments = rows.orchard_commitments;
+    let orchard_commitments = rows.orchard_commitments;
     #[cfg(feature = "orchard")]
-    let mut ironwood_commitments = rows.ironwood_commitments;
+    let ironwood_commitments = rows.ironwood_commitments;
     let note_positions = rows.note_positions;
     let last_scanned_height = rows.last_scanned_height;
 
     // We will have a start position and a last scanned height in all cases where
     // `blocks` is non-empty.
     if let Some(last_scanned_height) = last_scanned_height {
-        // Create subtrees from the note commitments in parallel.
-        const CHUNK_SIZE: usize = 1024;
+        let _build = tracing::info_span!("put_blocks_build_subtrees").entered();
+        // `insert_tree` rewrites the frontier shard and prunes checkpoints after every subtree.
+        // A shard holds 2^16 leaves, so 1024-leaf chunks repeat that work many times for the
+        // same final rows. 32768 leaves still splits a multi-shard batch across cores, and a
+        // single shard is rewritten only a couple of times.
+        const CHUNK_SIZE: usize = 32768;
+        let mut sapling_commitments = sapling_commitments;
         let sapling_subtrees = build_subtrees::<_, SAPLING_SHARD_HEIGHT>(
             Position::from(from_state.final_sapling_tree().tree_size()),
             &mut sapling_commitments,
             CHUNK_SIZE,
         );
 
+        #[cfg(feature = "orchard")]
+        let mut orchard_commitments = orchard_commitments;
         #[cfg(feature = "orchard")]
         let orchard_subtrees = build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
             Position::from(from_state.final_orchard_tree().tree_size()),
@@ -704,6 +714,8 @@ where
 
         // The Ironwood note commitment tree is Orchard-shaped and so uses the Orchard shard
         // height, but is a distinct pool with its own tree.
+        #[cfg(feature = "orchard")]
+        let mut ironwood_commitments = ironwood_commitments;
         #[cfg(feature = "orchard")]
         let ironwood_subtrees = build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
             Position::from(from_state.final_ironwood_tree().tree_size()),
@@ -759,6 +771,9 @@ where
             )
         };
 
+        drop(_build);
+
+        let _trees = tracing::info_span!("put_blocks_update_trees").entered();
         // Update the Sapling note commitment tree with all newly read note commitments
         {
             let mut sapling_subtrees = sapling_subtrees.into_iter();
@@ -829,6 +844,9 @@ where
             })?;
         }
 
+        drop(_trees);
+
+        let _notify = tracing::info_span!("put_blocks_notify").entered();
         wallet_db
             .notify_scan_complete(
                 Range {
@@ -838,6 +856,7 @@ where
                 &note_positions,
             )
             .map_err(PutBlocksError::Storage)?;
+        drop(_notify);
     }
 
     Ok(())
@@ -877,12 +896,12 @@ where
 
 #[cfg(feature = "transparent-inputs")]
 impl<
-    T: LowLevelWalletWrite
-        + AddressStore<
-            Error = <T as LowLevelWalletRead>::Error,
-            AccountRef = <T as LowLevelWalletRead>::AccountRef,
-        >,
-> StoreDecryptedTxDbT for T
+        T: LowLevelWalletWrite
+            + AddressStore<
+                Error = <T as LowLevelWalletRead>::Error,
+                AccountRef = <T as LowLevelWalletRead>::AccountRef,
+            >,
+    > StoreDecryptedTxDbT for T
 where
     <T as LowLevelWalletRead>::Error: From<GapError<T>>,
 {
@@ -1891,7 +1910,7 @@ mod tests {
     #[cfg(feature = "orchard")]
     use super::batch_ensure_heights;
     use super::{
-        SPEND_MAP_RETENTION_BLOCKS, should_retain_anchor, should_track_spends, spend_tracking_floor,
+        should_retain_anchor, should_track_spends, spend_tracking_floor, SPEND_MAP_RETENTION_BLOCKS,
     };
     use crate::data_api::anchor_retention::{AnchorRetention, AnchorRetentionInterval};
 

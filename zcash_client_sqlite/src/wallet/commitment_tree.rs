@@ -3111,4 +3111,91 @@ mod tests {
             &dump_wallet_trees(cached.wallet().conn()),
         );
     }
+
+    /// One `insert_tree` per shard must persist the same rows as one `insert_tree` per leaf.
+    ///
+    /// `put_blocks` builds note-commitment subtrees in parallel and inserts each one. Pruning
+    /// runs at the end of every insert, so a small chunk rewrites the frontier shard once per
+    /// chunk. A chunk the size of a shard does that once. The flushed rows have to match.
+    #[test]
+    fn shard_sized_chunks_match_per_leaf_insert() {
+        use incrementalmerkletree::frontier::Frontier;
+        use zcash_client_backend::data_api::ll::wallet::{build_subtrees, update_tree};
+
+        fn apply(chunk: usize) -> String {
+            let (_file, conn) = migrated_tree_file();
+            let store = SqliteShardStore::<_, String, 3>::from_connection(
+                conn,
+                SaplingPoolTester::TABLES_PREFIX,
+            )
+            .unwrap();
+            let mut tree = ShardTree::<_, 6, 3>::new(store, 4);
+            let mut leaves = (1..=40u32)
+                .map(|i| {
+                    Some((
+                        format!("leaf-{i}"),
+                        Retention::Checkpoint {
+                            id: BlockHeight::from(i),
+                            marking: if i % 4 == 0 {
+                                Marking::Marked
+                            } else {
+                                Marking::None
+                            },
+                        },
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let subtrees = build_subtrees::<String, 3>(Position::from(0), &mut leaves, chunk);
+            update_tree(
+                "chunk",
+                &Frontier::<String, 6>::empty(),
+                BlockHeight::from(0),
+                &mut tree,
+                None,
+                subtrees.into_iter(),
+                std::iter::empty(),
+            )
+            .unwrap();
+            dump_wallet_trees(&tree.store().conn)
+        }
+
+        let per_leaf = apply(1);
+        assert_same_dump(&per_leaf, &apply(2));
+        assert_same_dump(&per_leaf, &apply(8));
+        assert_same_dump(&per_leaf, &apply(64));
+
+        let (_file, conn) = migrated_tree_file();
+        let store = SqliteShardStore::<_, String, 3>::from_connection(
+            conn,
+            SaplingPoolTester::TABLES_PREFIX,
+        )
+        .unwrap();
+        let mut tree = ShardTree::<_, 6, 3>::new(store, 4);
+        let leaves = (1..=40u32)
+            .map(|i| {
+                (
+                    format!("leaf-{i}"),
+                    Retention::Checkpoint {
+                        id: BlockHeight::from(i),
+                        marking: if i % 4 == 0 {
+                            Marking::Marked
+                        } else {
+                            Marking::None
+                        },
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        tree.insert_frontier(
+            Frontier::<String, 6>::empty(),
+            Retention::Checkpoint {
+                id: BlockHeight::from(0),
+                marking: Marking::Reference,
+            },
+        )
+        .unwrap();
+        tree.batch_insert(Position::from(0), leaves.into_iter())
+            .unwrap();
+        assert_same_dump(&per_leaf, &dump_wallet_trees(&tree.store().conn));
+    }
 }
