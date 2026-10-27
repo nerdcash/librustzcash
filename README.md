@@ -40,6 +40,7 @@ graph TB
             eip681
             equihash
             f4jumble
+            payment_uri
             zcash_encoding
         end
     end
@@ -92,13 +93,12 @@ graph TB
 
     zcash_client_backend --> zip321
 
-    zcash_transparent --> zcash_address
-    %% zcash_keys --> zcash_address
+    zcash_keys --> zcash_address
     %% zcash_client_backend --> zcash_address
     %% zcash_client_sqlite --> zcash_address
     zip321 --> zcash_address
 
-    %% zcash_transparent --> zcash_protocol
+    zcash_transparent --> zcash_protocol
     %% zcash_keys --> zcash_protocol
     %% zcash_client_sqlite --> zcash_protocol
     %% zcash_primitives --> zcash_protocol
@@ -119,6 +119,7 @@ graph TB
 
     zcash_primitives --> equihash
     zcash_address --> f4jumble
+    payment_uri --> eip681
 
     %% zcash_client_backend --> orchard
     %% pczt --> orchard
@@ -161,6 +162,7 @@ graph TB
     click equihash "https://docs.rs/equihash/" _blank
     click f4jumble "https://docs.rs/f4jumble/" _blank
     click orchard "https://docs.rs/orchard/" _blank
+    click payment_uri "https://docs.rs/payment_uri/" _blank
     click pczt "https://docs.rs/pczt/" _blank
     click sapling-crypto "https://docs.rs/sapling-crypto/" _blank
     click zcash_address "https://docs.rs/zcash_address/" _blank
@@ -232,6 +234,7 @@ graph TB
 
 #### Utilities & Common Dependencies
 
+* `payment_uri`: Parsing and validation for cross-chain payment request URIs
 * `f4jumble`: Encoding for Unified addresses
 * `zcash_encoding`: Bitcoin-derived transaction encoding utilities for Zcash
 * `equihash`: Proof-of-work protocol implementation

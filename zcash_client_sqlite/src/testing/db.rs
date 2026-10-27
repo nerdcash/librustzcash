@@ -6,6 +6,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaChaRng;
 use rusqlite::Connection;
 use std::num::NonZeroU32;
+use std::ops::Range;
 use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
@@ -34,7 +35,9 @@ use zcash_client_backend::{
 };
 use zcash_keys::{
     address::UnifiedAddress,
-    keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
+    keys::{
+        UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedIncomingViewingKey, UnifiedSpendingKey,
+    },
 };
 use zcash_primitives::{
     block::BlockHash,
@@ -54,8 +57,11 @@ use crate::{
 #[cfg(feature = "transparent-inputs")]
 use {
     crate::TransparentAddressMetadata,
-    ::transparent::{address::TransparentAddress, bundle::OutPoint, keys::NonHardenedChildIndex},
-    core::ops::Range,
+    ::transparent::{
+        address::TransparentAddress,
+        bundle::OutPoint,
+        keys::{NonHardenedChildIndex, TransparentKeyScope},
+    },
     zcash_client_backend::fees::StandardFeeRule,
     zcash_keys::keys::transparent::gap_limits::GapLimits,
 };

@@ -8,9 +8,9 @@ use core::str::FromStr;
 use std::error::Error;
 
 use bech32::{Bech32, Bech32m, Checksum, Hrp, primitives::decode::CheckedHrpstring};
-use zcash_protocol::consensus::{NetworkConstants, NetworkType};
-use zcash_protocol::constants::{mainnet, regtest, testnet};
+use zcash_protocol::consensus::NetworkType;
 
+use crate::constants::{self, mainnet, regtest, testnet};
 use crate::kind::unified::Encoding;
 use crate::{AddressKind, ZcashAddress, kind::*};
 
@@ -58,7 +58,7 @@ impl FromStr for ZcashAddress {
 
         // Try decoding as a unified address
         match unified::Address::decode(s) {
-            Ok((net, data)) => {
+            Ok((net, _revision, data)) => {
                 return Ok(ZcashAddress {
                     net,
                     kind: AddressKind::Unified(data),
@@ -166,14 +166,22 @@ fn encode_b58(prefix: [u8; 2], data: &[u8]) -> String {
 impl fmt::Display for ZcashAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let encoded = match &self.kind {
-            AddressKind::Sprout(data) => encode_b58(self.net.b58_sprout_address_prefix(), data),
+            AddressKind::Sprout(data) => {
+                encode_b58(constants::b58_sprout_address_prefix(self.net), data)
+            }
             AddressKind::Sapling(data) => {
-                encode_bech32::<Bech32>(self.net.hrp_sapling_payment_address(), data)
+                encode_bech32::<Bech32>(constants::hrp_sapling_payment_address(self.net), data)
             }
             AddressKind::Unified(addr) => addr.encode(&self.net),
-            AddressKind::P2pkh(data) => encode_b58(self.net.b58_pubkey_address_prefix(), data),
-            AddressKind::P2sh(data) => encode_b58(self.net.b58_script_address_prefix(), data),
-            AddressKind::Tex(data) => encode_bech32::<Bech32m>(self.net.hrp_tex_address(), data),
+            AddressKind::P2pkh(data) => {
+                encode_b58(constants::b58_pubkey_address_prefix(self.net), data)
+            }
+            AddressKind::P2sh(data) => {
+                encode_b58(constants::b58_script_address_prefix(self.net), data)
+            }
+            AddressKind::Tex(data) => {
+                encode_bech32::<Bech32m>(constants::hrp_tex_address(self.net), data)
+            }
         };
         write!(f, "{encoded}")
     }
@@ -243,27 +251,36 @@ mod tests {
             "u1qpatys4zruk99pg59gcscrt7y6akvl9vrhcfyhm9yxvxz7h87q6n8cgrzzpe9zru68uq39uhmlpp5uefxu0su5uqyqfe5zp3tycn0ecl",
             ZcashAddress {
                 net: NetworkType::Main,
-                kind: AddressKind::Unified(unified::Address(vec![
-                    unified::address::Receiver::Sapling([0; 43]),
-                ])),
+                kind: AddressKind::Unified(unified::Address {
+                    revision: unified::Revision::R0,
+                    items: vec![unified::Uitem::Data(unified::address::Receiver::Sapling(
+                        [0; 43],
+                    ))],
+                }),
             },
         );
         encoding(
             "utest10c5kutapazdnf8ztl3pu43nkfsjx89fy3uuff8tsmxm6s86j37pe7uz94z5jhkl49pqe8yz75rlsaygexk6jpaxwx0esjr8wm5ut7d5s",
             ZcashAddress {
                 net: NetworkType::Test,
-                kind: AddressKind::Unified(unified::Address(vec![
-                    unified::address::Receiver::Sapling([0; 43]),
-                ])),
+                kind: AddressKind::Unified(unified::Address {
+                    revision: unified::Revision::R0,
+                    items: vec![unified::Uitem::Data(unified::address::Receiver::Sapling(
+                        [0; 43],
+                    ))],
+                }),
             },
         );
         encoding(
             "uregtest15xk7vj4grjkay6mnfl93dhsflc2yeunhxwdh38rul0rq3dfhzzxgm5szjuvtqdha4t4p2q02ks0jgzrhjkrav70z9xlvq0plpcjkd5z3",
             ZcashAddress {
                 net: NetworkType::Regtest,
-                kind: AddressKind::Unified(unified::Address(vec![
-                    unified::address::Receiver::Sapling([0; 43]),
-                ])),
+                kind: AddressKind::Unified(unified::Address {
+                    revision: unified::Revision::R0,
+                    items: vec![unified::Uitem::Data(unified::address::Receiver::Sapling(
+                        [0; 43],
+                    ))],
+                }),
             },
         );
 

@@ -3,8 +3,8 @@
 //! - Sets the appropriate bits in `Global.tx_modifiable` to 0.
 //! - Updates the various bsk values using the rcv information from spends and outputs.
 
-use rand_core::OsRng;
-use zcash_primitives::transaction::{sighash::SignableInput, txid::TxIdDigester};
+use rand_core::{CryptoRng, Rng};
+use zcash_primitives::transaction::sighash::SignableInput;
 
 use crate::{
     ExtractError, ParsedPczt, Pczt,
@@ -12,7 +12,7 @@ use crate::{
         FLAG_SHIELDED_MODIFIABLE, FLAG_TRANSPARENT_INPUTS_MODIFIABLE,
         FLAG_TRANSPARENT_OUTPUTS_MODIFIABLE,
     },
-    sighash,
+    precompute_sighash_data, sighash,
 };
 
 pub struct IoFinalizer {
@@ -26,7 +26,9 @@ impl IoFinalizer {
     }
 
     /// Finalizes the IO of the PCZT.
-    pub fn finalize_io(self) -> Result<Pczt, Error> {
+    ///
+    /// `rng` provides the randomness for the signatures of any dummy shielded spends.
+    pub fn finalize_io<R: Rng + CryptoRng>(self, mut rng: R) -> Result<Pczt, Error> {
         let Self { pczt } = self;
 
         let has_orchard_actions = !pczt.orchard.actions.is_empty();
@@ -73,15 +75,15 @@ impl IoFinalizer {
                 | FLAG_TRANSPARENT_OUTPUTS_MODIFIABLE
                 | FLAG_SHIELDED_MODIFIABLE);
         }
-        let txid_parts = tx_data.digest(TxIdDigester);
-        let shielded_sighash = sighash(&tx_data, &SignableInput::Shielded, &txid_parts);
+        let sighash_data = precompute_sighash_data(&global, tx_data)?;
+        let shielded_sighash = sighash(&sighash_data, &SignableInput::Shielded);
 
         // The Sapling bundle is always finalized: unlike the Orchard-protocol
         // Transaction Extractor, the Sapling one requires `bsk` to be set even when
         // the bundle is empty.
         sapling
             .bundle
-            .finalize_io(shielded_sighash, OsRng)
+            .finalize_io(shielded_sighash, &mut rng)
             .map_err(Error::SaplingFinalize)?;
         // An empty Orchard-protocol bundle carries no value commitment information
         // and contributes nothing to the transaction; leave its `bsk` unset so that
@@ -90,13 +92,13 @@ impl IoFinalizer {
         if has_orchard_actions {
             orchard
                 .bundle
-                .finalize_io(shielded_sighash, OsRng)
+                .finalize_io(shielded_sighash, &mut rng)
                 .map_err(Error::OrchardFinalize)?;
         }
         if has_ironwood_actions {
             ironwood
                 .bundle
-                .finalize_io(shielded_sighash, OsRng)
+                .finalize_io(shielded_sighash, &mut rng)
                 .map_err(Error::IronwoodFinalize)?;
         }
 
