@@ -1850,6 +1850,7 @@ pub fn batch_ensure_heights(
 ///
 /// Positions are `start_position` plus the commitment's offset. A duplicate height keeps the
 /// later position, matching `LocatedPrunableTree::from_iter`.
+#[cfg(any(test, feature = "orchard"))]
 fn commitment_checkpoint_positions<H>(
     start_position: Position,
     commitments: &[Option<(H, Retention<BlockHeight>)>],

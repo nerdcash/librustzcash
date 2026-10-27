@@ -3154,6 +3154,7 @@ mod tests {
                 &mut tree,
                 None,
                 subtrees.into_iter(),
+                #[cfg(feature = "orchard")]
                 std::iter::empty(),
             )
             .unwrap();
