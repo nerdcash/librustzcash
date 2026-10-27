@@ -37,7 +37,7 @@ use incrementalmerkletree::Position;
 use nonempty::NonEmpty;
 use rand::Rng;
 use secrecy::{ExposeSecret, SecretVec};
-use shardtree::{error::ShardTreeError, store::ShardStore, ShardTree};
+use shardtree::{ShardTree, error::ShardTreeError, store::ShardStore};
 use std::{
     borrow::{Borrow, BorrowMut},
     cmp::{max, min},
@@ -56,26 +56,26 @@ use uuid::Uuid;
 use zcash_client_backend::data_api::TransparentAddressSyncInfo;
 
 use zcash_client_backend::{
+    TransferType,
     data_api::{
-        self,
+        self, Account, AccountBirthday, AccountMeta, AccountPurpose, AccountSource, AddressInfo,
+        BlockMetadata, ChangeReceivers, DecryptedTransaction, InputSource, NoteFilter,
+        NullifierQuery, OutputLockStore, ReceivedNotes, ReceivedTransactionOutput,
+        SAPLING_SHARD_HEIGHT, ScannedBlock, SeedRelevance, SentTransaction, TargetValue,
+        TransactionDataRequest, WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite,
+        Zip32Derivation,
         anchor_retention::{AnchorRetention, AnchorRetentionInterval},
         chain::{BlockSource, ChainState, CommitmentTreeRoot},
         error::{FindAccountForAddressError, LockError, RewindError},
         ll::{
-            self, wallet::store_decrypted_tx, LowLevelWalletRead, LowLevelWalletWrite,
-            ReceivedSaplingOutput,
+            self, LowLevelWalletRead, LowLevelWalletWrite, ReceivedSaplingOutput,
+            wallet::store_decrypted_tx,
         },
         scanning::{ScanPriority, ScanRange},
-        wallet::{input_selection::LockFilter, ConfirmationsPolicy, TargetHeight},
-        Account, AccountBirthday, AccountMeta, AccountPurpose, AccountSource, AddressInfo,
-        BlockMetadata, ChangeReceivers, DecryptedTransaction, InputSource, NoteFilter,
-        NullifierQuery, OutputLockStore, ReceivedNotes, ReceivedTransactionOutput, ScannedBlock,
-        SeedRelevance, SentTransaction, TargetValue, TransactionDataRequest, WalletCommitmentTrees,
-        WalletRead, WalletSummary, WalletWrite, Zip32Derivation, SAPLING_SHARD_HEIGHT,
+        wallet::{ConfirmationsPolicy, TargetHeight, input_selection::LockFilter},
     },
     proto::compact_formats::CompactBlock,
     wallet::{LockOwner, Note, NoteId, OutputRef, ReceivedNote, WalletTransparentOutput, WalletTx},
-    TransferType,
 };
 use zcash_keys::{
     address::UnifiedAddress,
@@ -89,29 +89,30 @@ use zcash_primitives::{
     transaction::{Transaction, TxId},
 };
 use zcash_protocol::{
+    ShieldedPool,
     consensus::{self, BlockHeight, TxIndex},
     memo::Memo,
     value::Zatoshis,
-    ShieldedPool,
 };
-use zip32::{fingerprint::SeedFingerprint, DiversifierIndex};
+use zip32::{DiversifierIndex, fingerprint::SeedFingerprint};
 
 use crate::{
     error::SqliteClientError,
     wallet::{chain_tip_height, commitment_tree::SqliteShardStore},
 };
 use wallet::{
+    SubtreeProgressEstimator,
     commitment_tree::{self, put_shard_roots},
-    common::{unspent_notes_meta, TableConstants},
+    common::{TableConstants, unspent_notes_meta},
     scanning::replace_queue_entries,
-    upsert_address, SubtreeProgressEstimator,
+    upsert_address,
 };
 
 #[cfg(feature = "orchard")]
 use zcash_client_backend::{
     data_api::{
-        ll::ReceivedOrchardOutput, zip318::classify_decrypted_tx, IRONWOOD_SHARD_HEIGHT,
-        ORCHARD_SHARD_HEIGHT,
+        IRONWOOD_SHARD_HEIGHT, ORCHARD_SHARD_HEIGHT, ll::ReceivedOrchardOutput,
+        zip318::classify_decrypted_tx,
     },
     decrypt_transaction,
 };
@@ -124,17 +125,17 @@ use {
         bundle::OutPoint,
         keys::{NonHardenedChildIndex, TransparentKeyScope},
     },
+    ReceiverRequirement::*,
     std::time::SystemTime,
     zcash_client_backend::{
         data_api::{
-            ll::wallet::generate_transparent_gap_addresses, CoinbaseFilter,
-            TransactionsInvolvingAddress, TransparentBalances,
+            CoinbaseFilter, TransactionsInvolvingAddress, TransparentBalances,
+            ll::wallet::generate_transparent_gap_addresses,
         },
         fees::StandardFeeRule,
         wallet::TransparentAddressMetadata,
     },
     zcash_keys::keys::transparent::gap_limits::{AddressStore, GapLimits},
-    ReceiverRequirement::*,
 };
 
 // `AddressCodec` is used only by `find_account_for_ephemeral_address`, which is
@@ -149,7 +150,7 @@ use zcash_keys::encoding::AddressCodec;
 use {
     crate::wallet::encoding::pool_code,
     rusqlite::named_params,
-    zcash_client_backend::data_api::{testing::TransactionSummary, OutputOfSentTx, WalletTest},
+    zcash_client_backend::data_api::{OutputOfSentTx, WalletTest, testing::TransactionSummary},
 };
 
 #[cfg(any(test, feature = "test-dependencies", feature = "transparent-inputs"))]
@@ -161,7 +162,7 @@ use zcash_protocol::PoolType;
 use rusqlite::hooks::{AuthAction, Authorization};
 #[cfg(feature = "unstable")]
 use {
-    crate::chain::{fsblockdb_with_blocks, BlockMeta},
+    crate::chain::{BlockMeta, fsblockdb_with_blocks},
     std::{fs, io, path::PathBuf},
 };
 
@@ -4390,10 +4391,10 @@ mod tests {
     #[cfg(feature = "orchard")]
     use zcash_client_backend::data_api::error::FindAccountForAddressError;
     use zcash_client_backend::data_api::{
+        Account, AccountBirthday, AccountPurpose, AccountSource, SAPLING_SHARD_HEIGHT,
+        WalletCommitmentTrees, WalletRead, WalletTest, WalletWrite,
         chain::{ChainState, CommitmentTreeRoot},
         testing::{TestBuilder, TestState},
-        Account, AccountBirthday, AccountPurpose, AccountSource, WalletCommitmentTrees, WalletRead,
-        WalletTest, WalletWrite, SAPLING_SHARD_HEIGHT,
     };
     use zcash_keys::{
         address::{Address, UnifiedAddress},
@@ -4407,11 +4408,11 @@ mod tests {
     use zip32::DiversifierIndex;
 
     use crate::{
+        AccountUuid,
         error::SqliteClientError,
         testing::db::{TestDb, TestDbFactory},
         util::Clock as _,
         wallet::MIN_SHIELDED_DIVERSIFIER_OFFSET,
-        AccountUuid,
     };
 
     use incrementalmerkletree::Hashable as _;
@@ -4422,17 +4423,17 @@ mod tests {
         zcash_keys::keys::sapling,
         zcash_protocol::{consensus::NetworkConstants, value::Zatoshis},
     };
+    #[cfg(all(feature = "orchard", feature = "transparent-inputs"))]
+    use {
+        crate::{AccountRef, wallet::transparent},
+        ::transparent::keys::{NonHardenedChildIndex, TransparentKeyScope},
+    };
     #[cfg(feature = "transparent-inputs")]
     use {
-        crate::{testing::BlockCache, wallet::transparent::transaction_data_requests, GapLimits},
+        crate::{GapLimits, testing::BlockCache, wallet::transparent::transaction_data_requests},
         rusqlite::named_params,
         std::collections::BTreeSet,
         zcash_client_backend::data_api::TransactionDataRequest,
-    };
-    #[cfg(all(feature = "orchard", feature = "transparent-inputs"))]
-    use {
-        crate::{wallet::transparent, AccountRef},
-        ::transparent::keys::{NonHardenedChildIndex, TransparentKeyScope},
     };
 
     #[test]
@@ -5232,10 +5233,12 @@ mod tests {
             .get_account(account.id())
             .unwrap()
             .expect("the account was persisted");
-        assert!(stored
-            .ufvk()
-            .expect("the account has a UFVK")
-            .is_equivalent_to(&ufvk));
+        assert!(
+            stored
+                .ufvk()
+                .expect("the account has a UFVK")
+                .is_equivalent_to(&ufvk)
+        );
 
         // The account's default address was stored, and is a transparent-only Revision 2
         // Unified Address. Matching on `AllAvailableKeys` also pins the stored row's
@@ -5574,13 +5577,15 @@ mod tests {
             .unwrap();
 
         // The receiver for the default UA should be in the set.
-        assert!(receivers.contains_key(
-            ufvk.default_address(UnifiedAddressRequest::AllAvailableKeys)
-                .expect("A valid default address exists for the UFVK")
-                .0
-                .transparent()
-                .unwrap()
-        ));
+        assert!(
+            receivers.contains_key(
+                ufvk.default_address(UnifiedAddressRequest::AllAvailableKeys)
+                    .expect("A valid default address exists for the UFVK")
+                    .0
+                    .transparent()
+                    .unwrap()
+            )
+        );
 
         // The default t-addr should be in the set.
         assert!(receivers.contains_key(&taddr));
@@ -6134,11 +6139,12 @@ mod tests {
             loaded.uivk().encode(st.network()).unwrap(),
             uivk.encode(st.network()).unwrap()
         );
-        assert!(!st
-            .wallet()
-            .get_unified_full_viewing_keys()
-            .unwrap()
-            .contains_key(&account.id()));
+        assert!(
+            !st.wallet()
+                .get_unified_full_viewing_keys()
+                .unwrap()
+                .contains_key(&account.id())
+        );
     }
 
     /// Diversifier index used when persisting an address through the fork's insertion API.

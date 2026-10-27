@@ -89,11 +89,11 @@ use std::{
 };
 
 use encoding::{
-    account_kind_code, decode_diversifier_index_be, encode_diversifier_index_be, memo_repr,
-    parse_pool_code, pool_code, KeyScope, ReceiverFlags,
+    KeyScope, ReceiverFlags, account_kind_code, decode_diversifier_index_be,
+    encode_diversifier_index_be, memo_repr, parse_pool_code, pool_code,
 };
 use incrementalmerkletree::{Marking, Retention};
-use rusqlite::{self, named_params, params, Connection, OptionalExtension};
+use rusqlite::{self, Connection, OptionalExtension, named_params, params};
 use secrecy::{ExposeSecret, SecretVec};
 use shardtree::{error::ShardTreeError, store::ShardStore};
 use tracing::warn;
@@ -105,20 +105,20 @@ use zcash_address::ZcashAddress;
 #[cfg(feature = "transparent-inputs")]
 use zcash_client_backend::data_api::TransparentAddressSyncInfo;
 use zcash_client_backend::{
+    DecryptedOutput,
     data_api::{
+        Account as _, AccountBalance, AccountBirthday, AccountPurpose, AccountSource, AddressInfo,
+        AddressSource, BlockMetadata, ChangeReceivers, Progress, Ratio, ReceivedTransactionOutput,
+        SAPLING_SHARD_HEIGHT, SentTransaction, SentTransactionOutput, TransactionDataRequest,
+        TransactionStatus, WalletSummary, Zip32Derivation,
         anchor_retention::AnchorRetentionInterval,
         chain::ChainState,
         defaults::address_receiver_matches_ua,
         error::{FindAccountForAddressError, RewindError},
         scanning::{ScanPriority, ScanRange},
         wallet::{ConfirmationsPolicy, TargetHeight},
-        Account as _, AccountBalance, AccountBirthday, AccountPurpose, AccountSource, AddressInfo,
-        AddressSource, BlockMetadata, ChangeReceivers, Progress, Ratio, ReceivedTransactionOutput,
-        SentTransaction, SentTransactionOutput, TransactionDataRequest, TransactionStatus,
-        WalletSummary, Zip32Derivation, SAPLING_SHARD_HEIGHT,
     },
     wallet::{Note, NoteId, Recipient, WalletTx},
-    DecryptedOutput,
 };
 use zcash_keys::{
     address::{Address, Receiver, UnifiedAddress},
@@ -130,30 +130,30 @@ use zcash_keys::{
 };
 use zcash_primitives::{
     block::BlockHash,
-    merkle_tree::{read_commitment_tree, HashSer},
-    transaction::{fees::zip317, Transaction, TransactionData},
+    merkle_tree::{HashSer, read_commitment_tree},
+    transaction::{Transaction, TransactionData, fees::zip317},
 };
 use zcash_protocol::{
+    PoolType, ShieldedPool, TxId,
     consensus::{self, BlockHeight, BranchId, NetworkUpgrade, Parameters, TxIndex},
     memo::{Memo, MemoBytes},
     value::{ZatBalance, Zatoshis},
-    PoolType, ShieldedPool, TxId,
 };
-use zip32::{fingerprint::SeedFingerprint, DiversifierIndex};
+use zip32::{DiversifierIndex, fingerprint::SeedFingerprint};
 
 use self::{
-    common::{default_tx_expiry_delta_sql, table_constants, TableConstants},
+    common::{TableConstants, default_tx_expiry_delta_sql, table_constants},
     scanning::{parse_priority_code, priority_code, replace_queue_entries},
 };
 use crate::{
+    AccountRef, AccountUuid, AddressRef, PRUNING_DEPTH, SqlTransaction, TransferType, TxRef,
+    WalletCommitmentTrees, WalletDb,
     error::{BackendError, SqliteClientError},
     util::Clock,
     wallet::{
-        commitment_tree::{get_max_checkpointed_height, SqliteShardStore},
+        commitment_tree::{SqliteShardStore, get_max_checkpointed_height},
         encoding::LEGACY_ADDRESS_INDEX_NULL,
     },
-    AccountRef, AccountUuid, AddressRef, SqlTransaction, TransferType, TxRef,
-    WalletCommitmentTrees, WalletDb, PRUNING_DEPTH,
 };
 
 #[cfg(feature = "transparent-inputs")]
@@ -163,18 +163,18 @@ use {
         bundle::{OutPoint, TxOut},
         keys::{IncomingViewingKey as _, NonHardenedChildIndex, TransparentKeyScope},
     },
+    ReceiverRequirement::*,
     rusqlite::types::Value,
     std::rc::Rc,
     zcash_client_backend::{data_api::DecryptedTransaction, wallet::WalletTransparentOutput},
-    ReceiverRequirement::*,
 };
 
 #[cfg(feature = "orchard")]
 use zcash_client_backend::data_api::{IRONWOOD_SHARD_HEIGHT, ORCHARD_SHARD_HEIGHT};
 
+use FindAccountForAddressError as E;
 #[cfg(feature = "transparent-key-import")]
 use zcash_script::{descriptor::sh, script::Evaluable};
-use FindAccountForAddressError as E;
 #[cfg(feature = "zcashd-compat")]
 use {
     crate::wallet::encoding::{decode_legacy_account_index, encode_legacy_account_index},
@@ -6331,13 +6331,13 @@ pub mod testing {
     use zcash_client_backend::data_api::testing::TransactionSummary;
     use zcash_primitives::transaction::TxId;
     use zcash_protocol::{
+        ShieldedPool,
         consensus::BlockHeight,
         value::{ZatBalance, Zatoshis},
-        ShieldedPool,
     };
 
-    use super::common::{table_constants, TableConstants};
-    use crate::{error::SqliteClientError, AccountUuid};
+    use super::common::{TableConstants, table_constants};
+    use crate::{AccountUuid, error::SqliteClientError};
 
     pub(crate) fn get_tx_history(
         conn: &rusqlite::Connection,
@@ -6411,25 +6411,25 @@ pub mod testing {
 mod tests {
     use std::{
         collections::HashSet,
-        num::{NonZeroU32, NonZeroU8},
+        num::{NonZeroU8, NonZeroU32},
     };
 
-    use rusqlite::{named_params, Connection};
+    use rusqlite::{Connection, named_params};
     use sapling::zip32::ExtendedSpendingKey;
     use secrecy::{ExposeSecret, Secret, SecretVec};
     use uuid::Uuid;
     use zcash_client_backend::{
         data_api::{
+            Account as _, AccountBirthday, AccountSource, TransactionDataRequest,
+            TransactionStatus, WalletRead, WalletTest, WalletWrite,
             chain::{ChainState, CommitmentTreeRoot},
             error::RewindError,
             testing::{
-                pool::ShieldedPoolTester, sapling::SaplingPoolTester,
-                single_output_change_strategy, AddressType, DataStoreFactory, FakeCompactOutput,
-                InitialChainState, TestBuilder, TestState,
+                AddressType, DataStoreFactory, FakeCompactOutput, InitialChainState, TestBuilder,
+                TestState, pool::ShieldedPoolTester, sapling::SaplingPoolTester,
+                single_output_change_strategy,
             },
-            wallet::{input_selection::GreedyInputSelector, ConfirmationsPolicy},
-            Account as _, AccountBirthday, AccountSource, TransactionDataRequest,
-            TransactionStatus, WalletRead, WalletTest, WalletWrite,
+            wallet::{ConfirmationsPolicy, input_selection::GreedyInputSelector},
         },
         fees::StandardFeeRule,
         wallet::OvkPolicy,
@@ -6440,25 +6440,25 @@ mod tests {
         transaction::builder::{BLOSSOM_DEFAULT_TX_EXPIRY_DELTA, NU7_DEFAULT_TX_EXPIRY_DELTA},
     };
     use zcash_protocol::{
-        consensus::{BlockHeight, BranchId, NetworkUpgrade, Parameters, MAIN_NETWORK},
+        TxId,
+        consensus::{BlockHeight, BranchId, MAIN_NETWORK, NetworkUpgrade, Parameters},
         local_consensus::LocalNetwork,
         value::{ZatBalance, Zatoshis},
         zip318::{Zip318Classification, Zip318TxKind},
-        TxId,
     };
     use zip321::{Payment, TransactionRequest};
 
     use crate::{
-        error::SqliteClientError,
-        testing::{db::TestDbFactory, BlockCache},
         AccountUuid, PRUNING_DEPTH,
+        error::SqliteClientError,
+        testing::{BlockCache, db::TestDbFactory},
     };
 
     use super::{
-        account_birthday, chain_tip_height, flag_previously_received_change, get_transaction,
-        get_unknown_fee_spenders_of, min_shared_checkpoint_height, parse_tx,
-        put_zip318_classification, queue_tx_retrieval, select_truncation_height, KeyScope,
-        ShieldedPool, TxQueryType, TxRef,
+        KeyScope, ShieldedPool, TxQueryType, TxRef, account_birthday, chain_tip_height,
+        flag_previously_received_change, get_transaction, get_unknown_fee_spenders_of,
+        min_shared_checkpoint_height, parse_tx, put_zip318_classification, queue_tx_retrieval,
+        select_truncation_height,
     };
 
     use incrementalmerkletree::frontier::Frontier;

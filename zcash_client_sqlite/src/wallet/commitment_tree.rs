@@ -1,6 +1,6 @@
 //! SQLite-backed implementation of [`ShardStore`] for note commitment trees.
 
-use rusqlite::{self, named_params, OptionalExtension};
+use rusqlite::{self, OptionalExtension, named_params};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
@@ -15,9 +15,9 @@ use std::{
 
 use incrementalmerkletree::{Address, Hashable, Level, Position, Retention};
 use shardtree::{
+    LocatedPrunableTree, LocatedTree, PrunableTree, RetentionFlags,
     error::{QueryError, ShardTreeError},
     store::{Checkpoint, ShardStore, TreeState},
-    LocatedPrunableTree, LocatedTree, PrunableTree, RetentionFlags,
 };
 
 use zcash_client_backend::{
@@ -26,21 +26,21 @@ use zcash_client_backend::{
 };
 use zcash_primitives::merkle_tree::HashSer;
 use zcash_protocol::{
-    consensus::{self, BlockHeight},
     ShieldedPool,
+    consensus::{self, BlockHeight},
 };
 
 use crate::{error::SqliteClientError, sapling_tree};
 
 #[cfg(feature = "orchard")]
 use {
-    crate::{ironwood_tree, orchard_tree, IRONWOOD_TABLES_PREFIX, ORCHARD_TABLES_PREFIX},
+    crate::{IRONWOOD_TABLES_PREFIX, ORCHARD_TABLES_PREFIX, ironwood_tree, orchard_tree},
     incrementalmerkletree::Marking,
-    shardtree::{store::memory::MemoryShardStore, ShardTree},
+    shardtree::{ShardTree, store::memory::MemoryShardStore},
     zcash_client_backend::data_api::ORCHARD_SHARD_HEIGHT,
 };
 
-use super::common::{table_constants, TableConstants};
+use super::common::{TableConstants, table_constants};
 
 /// Errors that can appear in SQLite-back [`ShardStore`] implementation operations.
 #[derive(Debug)]
@@ -2152,22 +2152,22 @@ mod tests {
         check_append, check_checkpoint_rewind, check_remove_mark, check_rewind_remove_mark,
         check_root_hashes, check_witness_consistency, check_witnesses,
     };
-    use shardtree::{error::ShardTreeError, store::ShardStore, ShardTree};
+    use shardtree::{ShardTree, error::ShardTreeError, store::ShardStore};
     use zcash_client_backend::data_api::{
+        WalletCommitmentTrees,
         chain::CommitmentTreeRoot,
         testing::{pool::ShieldedPoolTester, sapling::SaplingPoolTester},
-        WalletCommitmentTrees,
     };
     use zcash_protocol::consensus::{BlockHeight, Network};
 
     use super::SqliteShardStore;
     use crate::{
+        WalletDb,
         testing::{
             db::{test_clock, test_rng},
             pool::ShieldedPoolPersistence,
         },
         wallet::init::WalletMigrator,
-        WalletDb,
     };
     // Used only by the orchard-gated `HistoricalWitnessGenerator` type alias below.
     use std::collections::BTreeSet;
@@ -2891,9 +2891,10 @@ mod tests {
     where
         S: ShardStore<H = String, CheckpointId = BlockHeight>,
     {
-        assert!(tree
-            .remove_mark(Position::from(3), Some(&BlockHeight::from(40)))
-            .unwrap());
+        assert!(
+            tree.remove_mark(Position::from(3), Some(&BlockHeight::from(40)))
+                .unwrap()
+        );
         assert!(tree.truncate_to_checkpoint(&BlockHeight::from(20)).unwrap());
         for i in 41..=50u32 {
             tree.append(
@@ -2996,8 +2997,8 @@ mod tests {
     /// A tree callback that fails after mutating the cache does not commit those mutations.
     #[test]
     fn write_back_callback_error_rolls_back() {
-        use crate::testing::{db::TestDbFactory, BlockCache};
-        use zcash_client_backend::data_api::{testing::TestBuilder, WalletCommitmentTrees};
+        use crate::testing::{BlockCache, db::TestDbFactory};
+        use zcash_client_backend::data_api::{WalletCommitmentTrees, testing::TestBuilder};
         use zcash_primitives::block::BlockHash;
 
         let mut st = TestBuilder::new()
@@ -3027,13 +3028,13 @@ mod tests {
     /// commitment trees, notes, witnesses, and checkpoints as the immediate store.
     #[test]
     fn write_back_matches_immediate_wallet_scan() {
-        use crate::testing::{db::TestDb, db::TestDbFactory, BlockCache};
+        use crate::testing::{BlockCache, db::TestDb, db::TestDbFactory};
         use zcash_client_backend::data_api::{
-            testing::{
-                pool::ShieldedPoolTester, sapling::SaplingPoolTester, AddressType, TestBuilder,
-                TestState,
-            },
             WalletWrite,
+            testing::{
+                AddressType, TestBuilder, TestState, pool::ShieldedPoolTester,
+                sapling::SaplingPoolTester,
+            },
         };
         use zcash_primitives::block::BlockHash;
         use zcash_protocol::{local_consensus::LocalNetwork, value::Zatoshis};
