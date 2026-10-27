@@ -13,6 +13,8 @@ permissions:
 jobs:
   trigger:
     name: Trigger
+    # The fork token cannot dispatch workflows in zcash/rust-ecosystem.
+    if: github.repository == 'zcash/librustzcash'
     runs-on: ubuntu-latest
     steps:
       - name: Trigger aggregation in zcash/rust-ecosystem
