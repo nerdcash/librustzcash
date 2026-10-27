@@ -668,36 +668,66 @@ where
     DbT: PutBlocksDbT<SE, TE, <DbT as LowLevelWalletRead>::AccountRef>,
     DbT::TxRef: Eq + Hash,
 {
-    let rows = put_blocks_rows(
-        wallet_db,
-        #[cfg(feature = "transparent-inputs")]
-        gap_limits,
-        from_state,
-        blocks,
-    )?;
+    let rows = {
+        let _span = tracing::info_span!("put_blocks_rows").entered();
+        put_blocks_rows(
+            wallet_db,
+            #[cfg(feature = "transparent-inputs")]
+            gap_limits,
+            from_state,
+            blocks,
+        )?
+    };
 
-    let mut sapling_commitments = rows.sapling_commitments;
+    let sapling_commitments = rows.sapling_commitments;
     #[cfg(feature = "orchard")]
-    let mut orchard_commitments = rows.orchard_commitments;
+    let orchard_commitments = rows.orchard_commitments;
     #[cfg(feature = "orchard")]
-    let mut ironwood_commitments = rows.ironwood_commitments;
+    let ironwood_commitments = rows.ironwood_commitments;
     let note_positions = rows.note_positions;
     let last_scanned_height = rows.last_scanned_height;
 
     // We will have a start position and a last scanned height in all cases where
     // `blocks` is non-empty.
     if let Some(last_scanned_height) = last_scanned_height {
-        // Create subtrees from the note commitments in parallel.
-        const CHUNK_SIZE: usize = 1024;
+        let _build = tracing::info_span!("put_blocks_build_subtrees").entered();
+        // Chunks are hashed in parallel. A shard holds 2^16 leaves, so this size keeps a
+        // multi-shard batch split across cores. Checkpoints this batch would prune are removed
+        // before the build, and `update_tree` unites the chunks into one shard write and prune.
+        const CHUNK_SIZE: usize = 32768;
+        let mut sapling_commitments = sapling_commitments;
+        let sapling_start = Position::from(from_state.final_sapling_tree().tree_size());
+        // Captured before elision so cross-pool alignment still sees every scanned checkpoint.
+        #[cfg(feature = "orchard")]
+        let sapling_checkpoint_positions =
+            commitment_checkpoint_positions(sapling_start, &sapling_commitments);
+        elide_pruned_checkpoints(
+            &mut sapling_commitments,
+            anchor_retention,
+            PRUNING_DEPTH as usize,
+        );
         let sapling_subtrees = build_subtrees::<_, SAPLING_SHARD_HEIGHT>(
-            Position::from(from_state.final_sapling_tree().tree_size()),
+            sapling_start,
             &mut sapling_commitments,
             CHUNK_SIZE,
         );
 
         #[cfg(feature = "orchard")]
+        let mut orchard_commitments = orchard_commitments;
+        #[cfg(feature = "orchard")]
+        let orchard_start = Position::from(from_state.final_orchard_tree().tree_size());
+        #[cfg(feature = "orchard")]
+        let orchard_checkpoint_positions =
+            commitment_checkpoint_positions(orchard_start, &orchard_commitments);
+        #[cfg(feature = "orchard")]
+        elide_pruned_checkpoints(
+            &mut orchard_commitments,
+            anchor_retention,
+            PRUNING_DEPTH as usize,
+        );
+        #[cfg(feature = "orchard")]
         let orchard_subtrees = build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
-            Position::from(from_state.final_orchard_tree().tree_size()),
+            orchard_start,
             &mut orchard_commitments,
             CHUNK_SIZE,
         );
@@ -705,8 +735,21 @@ where
         // The Ironwood note commitment tree is Orchard-shaped and so uses the Orchard shard
         // height, but is a distinct pool with its own tree.
         #[cfg(feature = "orchard")]
+        let mut ironwood_commitments = ironwood_commitments;
+        #[cfg(feature = "orchard")]
+        let ironwood_start = Position::from(from_state.final_ironwood_tree().tree_size());
+        #[cfg(feature = "orchard")]
+        let ironwood_checkpoint_positions =
+            commitment_checkpoint_positions(ironwood_start, &ironwood_commitments);
+        #[cfg(feature = "orchard")]
+        elide_pruned_checkpoints(
+            &mut ironwood_commitments,
+            anchor_retention,
+            PRUNING_DEPTH as usize,
+        );
+        #[cfg(feature = "orchard")]
         let ironwood_subtrees = build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
-            Position::from(from_state.final_ironwood_tree().tree_size()),
+            ironwood_start,
             &mut ironwood_commitments,
             CHUNK_SIZE,
         );
@@ -728,10 +771,6 @@ where
             missing_orchard_checkpoints,
             missing_ironwood_checkpoints,
         ) = {
-            let sapling_checkpoint_positions = checkpoint_positions(&sapling_subtrees);
-            let orchard_checkpoint_positions = checkpoint_positions(&orchard_subtrees);
-            let ironwood_checkpoint_positions = checkpoint_positions(&ironwood_subtrees);
-
             let [ensure_sapling, ensure_orchard, ensure_ironwood] = batch_ensure_heights(
                 &sapling_checkpoint_positions.keys().copied().collect(),
                 &orchard_checkpoint_positions.keys().copied().collect(),
@@ -759,6 +798,9 @@ where
             )
         };
 
+        drop(_build);
+
+        let _trees = tracing::info_span!("put_blocks_update_trees").entered();
         // Update the Sapling note commitment tree with all newly read note commitments
         {
             let mut sapling_subtrees = sapling_subtrees.into_iter();
@@ -829,6 +871,9 @@ where
             })?;
         }
 
+        drop(_trees);
+
+        let _notify = tracing::info_span!("put_blocks_notify").entered();
         wallet_db
             .notify_scan_complete(
                 Range {
@@ -838,6 +883,7 @@ where
                 &note_positions,
             )
             .map_err(PutBlocksError::Storage)?;
+        drop(_notify);
     }
 
     Ok(())
@@ -1800,6 +1846,117 @@ pub fn batch_ensure_heights(
     ensure
 }
 
+/// Block heights and note positions of every checkpoint in `commitments`, before any elision.
+///
+/// Positions are `start_position` plus the commitment's offset. A duplicate height keeps the
+/// later position, matching `LocatedPrunableTree::from_iter`.
+fn commitment_checkpoint_positions<H>(
+    start_position: Position,
+    commitments: &[Option<(H, Retention<BlockHeight>)>],
+) -> BTreeMap<BlockHeight, Position> {
+    let mut positions = BTreeMap::new();
+    for (offset, commitment) in commitments.iter().enumerate() {
+        if let Some((_, Retention::Checkpoint { id, .. })) = commitment {
+            positions.insert(*id, start_position + offset as u64);
+        }
+    }
+    positions
+}
+
+/// Drops checkpoint retention that `ShardTree` would prune at the end of this batch.
+///
+/// Wallet trees keep [`PRUNING_DEPTH`] non-retained checkpoints, plus every height
+/// `anchor_retention` retains. Checkpoints older than that window are created and then
+/// deleted, and deleting them rehashes the shard. Marking those leaves ephemeral (or
+/// marked, when the note itself must be kept) lets the parallel subtree build fold them
+/// into the same hashes pruning would have produced. Anchor checkpoints and the newest
+/// `max_checkpoints` non-retained checkpoints are left unchanged.
+///
+/// `max_checkpoints` must be the note commitment tree's pruning budget. Wallet trees are
+/// constructed with [`PRUNING_DEPTH`].
+fn elide_pruned_checkpoints<H>(
+    commitments: &mut [Option<(H, Retention<BlockHeight>)>],
+    anchor_retention: Option<&AnchorRetention>,
+    max_checkpoints: usize,
+) {
+    let prunable = commitments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, commitment)| match commitment {
+            Some((_, Retention::Checkpoint { id, .. }))
+                if !should_retain_anchor(anchor_retention, *id) =>
+            {
+                Some(index)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let drop_count = prunable.len().saturating_sub(max_checkpoints);
+    for index in prunable.into_iter().take(drop_count) {
+        let Some((_, retention)) = commitments[index].as_mut() else {
+            continue;
+        };
+        let Retention::Checkpoint { marking, .. } = *retention else {
+            continue;
+        };
+        *retention = match marking {
+            Marking::Marked => Retention::Marked,
+            Marking::Reference => Retention::Reference,
+            Marking::None => Retention::Ephemeral,
+        };
+    }
+}
+
+/// Unites non-overlapping located trees into one tree covering all of them.
+///
+/// Parallel subtree builds emit one tree per chunk. Inserting each chunk rewrites the
+/// frontier shard and prunes checkpoints. Uniting the chunks first makes one shard write
+/// and one prune for the whole batch.
+fn unite_located_trees<H>(
+    trees: impl IntoIterator<Item = LocatedPrunableTree<H>>,
+) -> Result<Option<LocatedPrunableTree<H>>, shardtree::error::InsertionError>
+where
+    H: Hashable + Clone + PartialEq,
+{
+    let mut united = None;
+    for next in trees {
+        if next.root().is_empty() {
+            continue;
+        }
+        united = Some(match united {
+            None => next,
+            Some(current) => unite_located_pair(current, next)?,
+        });
+    }
+    Ok(united)
+}
+
+fn unite_located_pair<H>(
+    left: LocatedPrunableTree<H>,
+    right: LocatedPrunableTree<H>,
+) -> Result<LocatedPrunableTree<H>, shardtree::error::InsertionError>
+where
+    H: Hashable + Clone + PartialEq,
+{
+    let left_addr = left.root_addr();
+    let right_addr = right.root_addr();
+    if left_addr.contains(&right_addr) {
+        let marked = right.root().contains_marked();
+        return Ok(left.insert_subtree(right, marked)?.0);
+    }
+    if right_addr.contains(&left_addr) {
+        let marked = left.root().contains_marked();
+        return Ok(right.insert_subtree(left, marked)?.0);
+    }
+
+    let ancestor = left_addr.common_ancestor(&right_addr);
+    let parent = LocatedPrunableTree::empty(ancestor);
+    let left_marked = left.root().contains_marked();
+    let (parent, _) = parent.insert_subtree(left, left_marked)?;
+    let right_marked = right.root().contains_marked();
+    Ok(parent.insert_subtree(right, right_marked)?.0)
+}
+
 /// Updates the given note commitment tree with all newly read note commitments starting
 /// at the block `frontier_height + 1`.
 ///
@@ -1837,16 +1994,20 @@ where
     )?;
     retain_anchor_checkpoint(tree, anchor_retention, frontier_height)?;
 
+    // One `insert_tree` for the whole batch: each parallel chunk is united with the others
+    // first, so each shard is written once and checkpoints are pruned once. Retention is
+    // recorded before that insert, because pruning runs at the end of it.
+    let mut batch_checkpoints = BTreeMap::new();
+    let mut parts = Vec::new();
     for (subtree, checkpoints) in subtrees {
-        // Register anchor retention for this batch's checkpoint heights *before* `insert_tree`,
-        // which prunes down to `max_checkpoints` during insertion. A batch larger than the
-        // checkpoint budget would otherwise prune an anchor before it could be retained, so
-        // retention must be recorded first; `ShardTree::ensure_retained` accepts a checkpoint
-        // height whose checkpoint does not yet exist.
         for height in checkpoints.keys() {
             retain_anchor_checkpoint(tree, anchor_retention, *height)?;
         }
-        tree.insert_tree(subtree, checkpoints)?;
+        batch_checkpoints.extend(checkpoints);
+        parts.push(subtree);
+    }
+    if let Some(united) = unite_located_trees(parts)? {
+        tree.insert_tree(united, batch_checkpoints)?;
     }
 
     // Ensure we have a tree checkpoint for each checkpointed block height.
@@ -2133,5 +2294,180 @@ mod tests {
             batch_ensure_heights(&sapling, &orchard, &ironwood, None, h(1)..=h(1_000)),
             cross_pool_ensure_heights(&sapling, &orchard, &ironwood)
         );
+    }
+
+    /// Eliding checkpoints that pruning would drop, then uniting the parallel chunks into one
+    /// insert, stores the same shards, cap, checkpoints, and retained anchors as inserting every
+    /// fully checkpointed chunk on its own.
+    #[test]
+    fn elided_united_batch_matches_per_chunk_insert() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use incrementalmerkletree::frontier::Frontier;
+        use incrementalmerkletree::{Marking, Position, Retention};
+        use shardtree::store::memory::MemoryShardStore;
+        use shardtree::store::{Checkpoint, ShardStore};
+        use shardtree::{LocatedPrunableTree, PrunableTree, ShardTree};
+
+        const DEPTH: u8 = 8;
+        const SHARD_HEIGHT: u8 = 4;
+        const MAX_CHECKPOINTS: usize = 5;
+
+        type Tree = ShardTree<MemoryShardStore<String, BlockHeight>, DEPTH, SHARD_HEIGHT>;
+
+        fn checkpoint_leaf(i: u32) -> (String, Retention<BlockHeight>) {
+            (
+                format!("n{i}"),
+                Retention::Checkpoint {
+                    id: BlockHeight::from(i),
+                    marking: if i % 7 == 0 {
+                        Marking::Marked
+                    } else {
+                        Marking::None
+                    },
+                },
+            )
+        }
+
+        fn seed() -> Tree {
+            let mut tree = ShardTree::new(MemoryShardStore::empty(), MAX_CHECKPOINTS);
+            tree.insert_frontier(
+                Frontier::empty(),
+                Retention::Checkpoint {
+                    id: BlockHeight::from(0),
+                    marking: Marking::Reference,
+                },
+            )
+            .unwrap();
+            tree.batch_insert(Position::from(0), (1..=8u32).map(checkpoint_leaf))
+                .unwrap();
+            tree
+        }
+
+        fn per_chunk(
+            tree: &mut Tree,
+            frontier: &Frontier<String, DEPTH>,
+            frontier_height: BlockHeight,
+            anchor_retention: Option<&AnchorRetention>,
+            subtrees: Vec<(LocatedPrunableTree<String>, BTreeMap<BlockHeight, Position>)>,
+        ) {
+            tree.insert_frontier(
+                frontier.clone(),
+                Retention::Checkpoint {
+                    id: frontier_height,
+                    marking: Marking::Reference,
+                },
+            )
+            .unwrap();
+            super::retain_anchor_checkpoint(tree, anchor_retention, frontier_height).unwrap();
+            for (subtree, checkpoints) in subtrees {
+                for height in checkpoints.keys() {
+                    super::retain_anchor_checkpoint(tree, anchor_retention, *height).unwrap();
+                }
+                tree.insert_tree(subtree, checkpoints).unwrap();
+            }
+        }
+
+        type Snapshot = (
+            Vec<LocatedPrunableTree<String>>,
+            PrunableTree<String>,
+            Vec<(BlockHeight, shardtree::store::TreeState, Vec<Position>)>,
+            BTreeSet<BlockHeight>,
+        );
+
+        fn snapshot(tree: &Tree) -> Snapshot {
+            let store = tree.store();
+            let shards = store
+                .get_shard_roots()
+                .unwrap()
+                .into_iter()
+                .map(|addr| store.get_shard(addr).unwrap().unwrap())
+                .collect();
+            let mut checkpoints = Vec::new();
+            let count = store.checkpoint_count().unwrap();
+            store
+                .for_each_checkpoint(count, |id, checkpoint| {
+                    checkpoints.push((
+                        *id,
+                        checkpoint.tree_state(),
+                        checkpoint.marks_removed().iter().copied().collect(),
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+            (
+                shards,
+                store.get_cap().unwrap(),
+                checkpoints,
+                store.retained_checkpoints().unwrap(),
+            )
+        }
+
+        let retention = AnchorRetention::new(
+            BlockHeight::from(0),
+            zcash_protocol::zip318::BlockSpacing::UNIFORM,
+            AnchorRetentionInterval::custom(NonZeroU32::new(10).expect("nonzero")),
+        );
+        assert!(retention.retains(BlockHeight::from(20)));
+        assert!(!retention.retains(BlockHeight::from(21)));
+
+        let mut reference = seed();
+        let frontier = reference.frontier().unwrap();
+        let frontier_height = BlockHeight::from(8);
+        let mut fast = seed();
+
+        let mut commitments = (9..=80u32)
+            .map(|i| Some(checkpoint_leaf(i)))
+            .collect::<Vec<_>>();
+        let start = Position::from(8u64);
+        let original_positions = super::commitment_checkpoint_positions(start, &commitments);
+
+        let mut reference_commitments = commitments.clone();
+        let reference_subtrees =
+            super::build_subtrees::<String, SHARD_HEIGHT>(start, &mut reference_commitments, 10);
+        per_chunk(
+            &mut reference,
+            &frontier,
+            frontier_height,
+            Some(&retention),
+            reference_subtrees,
+        );
+
+        super::elide_pruned_checkpoints(&mut commitments, Some(&retention), MAX_CHECKPOINTS);
+        let fast_subtrees =
+            super::build_subtrees::<String, SHARD_HEIGHT>(start, &mut commitments, 10);
+        super::update_tree(
+            "test",
+            &frontier,
+            frontier_height,
+            &mut fast,
+            Some(&retention),
+            fast_subtrees.into_iter(),
+            #[cfg(feature = "orchard")]
+            std::iter::empty(),
+        )
+        .unwrap();
+
+        // A checkpoint height that belongs to another pool. `put_blocks` adds these from the
+        // pre-elision positions after the tree update.
+        let missing_height = BlockHeight::from(81);
+        let missing_position = *original_positions
+            .values()
+            .next_back()
+            .expect("batch has checkpoints");
+        for tree in [&mut reference, &mut fast] {
+            let min = tree
+                .store()
+                .min_checkpoint_id()
+                .unwrap()
+                .expect("frontier checkpoint");
+            if missing_height > min {
+                tree.store_mut()
+                    .add_checkpoint(missing_height, Checkpoint::at_position(missing_position))
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(snapshot(&reference), snapshot(&fast));
     }
 }
