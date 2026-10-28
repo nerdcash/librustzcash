@@ -26,16 +26,16 @@ fn count(conn: &Connection, sql: &str) -> i64 {
 /// Shard and checkpoint rows a scan would write. The initializer may already have stored an
 /// empty cap; that row is compared separately so a view-only scan can be shown not to touch it.
 fn shard_and_checkpoint_rows(conn: &Connection) -> i64 {
-    let mut rows = count(conn, "SELECT COUNT(*) FROM sapling_tree_shards")
+    let sapling = count(conn, "SELECT COUNT(*) FROM sapling_tree_shards")
         + count(conn, "SELECT COUNT(*) FROM sapling_tree_checkpoints");
     #[cfg(feature = "orchard")]
-    {
-        rows += count(conn, "SELECT COUNT(*) FROM orchard_tree_shards")
-            + count(conn, "SELECT COUNT(*) FROM orchard_tree_checkpoints")
-            + count(conn, "SELECT COUNT(*) FROM ironwood_tree_shards")
-            + count(conn, "SELECT COUNT(*) FROM ironwood_tree_checkpoints");
-    }
-    rows
+    let other = count(conn, "SELECT COUNT(*) FROM orchard_tree_shards")
+        + count(conn, "SELECT COUNT(*) FROM orchard_tree_checkpoints")
+        + count(conn, "SELECT COUNT(*) FROM ironwood_tree_shards")
+        + count(conn, "SELECT COUNT(*) FROM ironwood_tree_checkpoints");
+    #[cfg(not(feature = "orchard"))]
+    let other = 0;
+    sapling + other
 }
 
 fn cap_blobs(conn: &Connection) -> Vec<Option<Vec<u8>>> {
@@ -46,13 +46,18 @@ fn cap_blobs(conn: &Connection) -> Vec<Option<Vec<u8>>> {
         .optional()
         .unwrap()
     }
-    let mut caps = vec![one(conn, "sapling_tree_cap")];
+    #[cfg(not(feature = "orchard"))]
+    {
+        vec![one(conn, "sapling_tree_cap")]
+    }
     #[cfg(feature = "orchard")]
     {
-        caps.push(one(conn, "orchard_tree_cap"));
-        caps.push(one(conn, "ironwood_tree_cap"));
+        vec![
+            one(conn, "sapling_tree_cap"),
+            one(conn, "orchard_tree_cap"),
+            one(conn, "ironwood_tree_cap"),
+        ]
     }
-    caps
 }
 
 fn received_notes(conn: &Connection) -> i64 {

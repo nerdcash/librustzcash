@@ -15,6 +15,7 @@
 //!         WalletRead, WalletWrite, WalletCommitmentTrees,
 //!         chain::{
 //!             BlockSource,
+//!             ChainState,
 //!             CommitmentTreeRoot,
 //!             error::Error,
 //!             scan_cached_blocks,
@@ -60,7 +61,8 @@
 //!         Some(scan_range) if scan_range.priority() == ScanPriority::Verify => {
 //!             // Download the chain state for the block prior to the start of the range you want
 //!             // to scan.
-//!             let chain_state = unimplemented!("get_chain_state(scan_range.block_range().start - 1)?;");
+//!             let chain_state: &ChainState =
+//!                 unimplemented!("get_chain_state(scan_range.block_range().start - 1)?;");
 //!             // Download the blocks in `scan_range` into the block source, overwriting any
 //!             // existing blocks in this range.
 //!             unimplemented!("cache_blocks(scan_range)?;");
@@ -124,7 +126,8 @@
 //! for scan_range in scan_ranges {
 //!     // Download the chain state for the block prior to the start of the range you want
 //!     // to scan.
-//!     let chain_state = unimplemented!("get_chain_state(scan_range.block_range().start - 1)?;");
+//!     let chain_state: &ChainState =
+//!         unimplemented!("get_chain_state(scan_range.block_range().start - 1)?;");
 //!     // Download the blocks in `scan_range` into the block source. While in this example this
 //!     // step is performed in-line, it's fine for the download of scan ranges to be asynchronous
 //!     // and for the scanner to process the downloaded ranges as they become available in a
