@@ -2,7 +2,7 @@
 //! reorg handling.
 use std::collections::HashSet;
 
-use rusqlite::{OptionalExtension, named_params};
+use rusqlite::{named_params, OptionalExtension};
 use schemerz_rusqlite::RusqliteMigration;
 use uuid::Uuid;
 use zcash_client_backend::data_api::WalletCommitmentTrees;
@@ -13,9 +13,8 @@ use zcash_client_backend::data_api::anchor_retention::AnchorRetentionInterval;
 use crate::{
     error::SqliteClientError,
     wallet::{
-        SqlTransaction, WalletDb,
-        init::{WalletMigrationError, migrations::support_legacy_sqlite},
-        trim_scan_queue_to,
+        init::{migrations::support_legacy_sqlite, WalletMigrationError},
+        trim_scan_queue_to, SqlTransaction, WalletDb,
     },
 };
 
@@ -214,6 +213,9 @@ fn truncate_to_height<P: consensus::Parameters>(
             // Truncation removes checkpoints; it never establishes them, so no anchor retention
             // decision is made through this handle and the interval is immaterial.
             anchor_retention_interval: AnchorRetentionInterval::default(),
+            // This migration predates the write-back cache. Leave it on the immediate path so a
+            // repair of an old wallet does not depend on the cache.
+            commitment_tree_write_back: false,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: *gap_limits,
         };
@@ -259,12 +261,12 @@ mod tests {
     use zcash_protocol::consensus::Network;
 
     use crate::{
-        WalletDb,
         testing::db::{test_clock, test_rng},
         wallet::init::{
-            WalletMigrator,
             migrations::{support_legacy_sqlite, tests::test_migrate, tx_observation_height},
+            WalletMigrator,
         },
+        WalletDb,
     };
 
     use super::MIGRATION_ID;

@@ -22,6 +22,10 @@ workspace.
   keys.
 
 ### Changed
+- `put_blocks` builds note-commitment subtrees in chunks of 32768 leaves instead
+  of 1024. `insert_tree` rewrites the frontier shard and prunes checkpoints once
+  per chunk, so the smaller chunk repeated that work many times inside one
+  shard. The persisted tree rows match inserting each leaf on its own.
 - `decrypt_transaction` takes an additional `uivks` argument. Callers that only
   have UFVKs should pass an empty map.
 

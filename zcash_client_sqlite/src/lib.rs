@@ -296,6 +296,9 @@ pub struct WalletDb<C, P, CL, R> {
     clock: CL,
     rng: R,
     anchor_retention_interval: AnchorRetentionInterval,
+    /// When set, each `with_*_tree_mut` callback accumulates note-commitment tree mutations in
+    /// memory and writes them back once. Not persisted. Defaults to `true`.
+    commitment_tree_write_back: bool,
     #[cfg(feature = "transparent-inputs")]
     gap_limits: GapLimits,
 }
@@ -584,6 +587,7 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
                 clock,
                 rng,
                 anchor_retention_interval: AnchorRetentionInterval::default(),
+                commitment_tree_write_back: true,
                 #[cfg(feature = "transparent-inputs")]
                 gap_limits: GapLimits::default(),
             })
@@ -618,6 +622,18 @@ impl<C, P, CL, R> WalletDb<C, P, CL, R> {
     pub fn set_anchor_retention_interval(&mut self, interval: AnchorRetentionInterval) {
         self.anchor_retention_interval = interval;
     }
+
+    /// Enables or disables the in-memory write-back cache for note-commitment trees.
+    ///
+    /// The cache is enabled by default. While it is enabled, each note-commitment tree callback
+    /// keeps shard and checkpoint mutations in memory and writes them to SQLite once, through the
+    /// same statements an immediate update would have used. The final tree rows match immediate
+    /// updates. Disabling the cache restores a statement per mutation, which is the comparison
+    /// point for measuring the cache. The setting applies to this handle and to handles derived
+    /// from it inside [`Self::transactionally`]; it is not stored in the database.
+    pub fn set_commitment_tree_write_back(&mut self, enabled: bool) {
+        self.commitment_tree_write_back = enabled;
+    }
 }
 
 #[cfg(feature = "transparent-inputs")]
@@ -651,6 +667,7 @@ impl<C: Borrow<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             clock,
             rng,
             anchor_retention_interval: AnchorRetentionInterval::default(),
+            commitment_tree_write_back: true,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: GapLimits::default(),
         }
@@ -703,6 +720,7 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             clock: &self.clock,
             rng: &mut self.rng,
             anchor_retention_interval: self.anchor_retention_interval,
+            commitment_tree_write_back: self.commitment_tree_write_back,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
@@ -761,6 +779,7 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             clock: &self.clock,
             rng: &mut self.rng,
             anchor_retention_interval: self.anchor_retention_interval,
+            commitment_tree_write_back: self.commitment_tree_write_back,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
@@ -2126,6 +2145,7 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
             &self.gap_limits,
             &chain_state,
             reset_account_birthdays,
+            self.commitment_tree_write_back,
         );
         if result.is_ok() {
             tx.commit()
@@ -2758,6 +2778,7 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             #[cfg(feature = "transparent-inputs")]
             &self.gap_limits,
             max_height,
+            self.commitment_tree_write_back,
         )
     }
 
@@ -2780,6 +2801,7 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             &self.gap_limits,
             &chain_state,
             reset_account_birthdays,
+            self.commitment_tree_write_back,
         )
     }
 
@@ -3526,10 +3548,26 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL, R> Wallet
             .borrow_mut()
             .transaction()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
+        let flush_report = new_flush_report();
         let result = {
             let mut shardtree = sapling_tree(&tx)?;
-            callback(&mut shardtree)?
-        };
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         tx.commit()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
@@ -3584,10 +3622,26 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL, R> Wallet
             .borrow_mut()
             .transaction()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
+        let flush_report = new_flush_report();
         let result = {
             let mut shardtree = orchard_tree(&tx)?;
-            callback(&mut shardtree)?
-        };
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         tx.commit()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
@@ -3668,15 +3722,44 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL, R> Wallet
             .borrow_mut()
             .transaction()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
+        let flush_report = new_flush_report();
         let result = {
             let mut shardtree = ironwood_tree(&tx)?;
-            callback(&mut shardtree)?
-        };
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         tx.commit()
             .map_err(|e| ShardTreeError::Storage(commitment_tree::Error::Query(e)))?;
         Ok(Some(result))
     }
+}
+
+fn new_flush_report() -> std::rc::Rc<std::cell::RefCell<Result<(), commitment_tree::Error>>> {
+    std::rc::Rc::new(std::cell::RefCell::new(Ok(())))
+}
+
+fn take_flush_report(
+    report: std::rc::Rc<std::cell::RefCell<Result<(), commitment_tree::Error>>>,
+) -> Result<(), ShardTreeError<commitment_tree::Error>> {
+    std::rc::Rc::try_unwrap(report)
+        .unwrap_or_else(|_| panic!("commitment tree write-back report is still held by the tree"))
+        .into_inner()
+        .map_err(ShardTreeError::Storage)
 }
 
 impl<P: consensus::Parameters, CL, R> WalletCommitmentTrees
@@ -3691,8 +3774,26 @@ impl<P: consensus::Parameters, CL, R> WalletCommitmentTrees
             FnMut(&'a mut SaplingCommitmentTree<&'a rusqlite::Transaction<'a>>) -> Result<A, E>,
         E: From<ShardTreeError<commitment_tree::Error>>,
     {
-        let mut shardtree = sapling_tree(self.conn.0)?;
-        let result = callback(&mut shardtree)?;
+        let flush_report = new_flush_report();
+        let result = {
+            let mut shardtree = sapling_tree(self.conn.0)?;
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         Ok(result)
     }
@@ -3728,8 +3829,26 @@ impl<P: consensus::Parameters, CL, R> WalletCommitmentTrees
             FnMut(&'a mut OrchardCommitmentTree<&'a rusqlite::Transaction<'a>>) -> Result<A, E>,
         E: From<ShardTreeError<Self::Error>>,
     {
-        let mut shardtree = orchard_tree(self.conn.0)?;
-        let result = callback(&mut shardtree)?;
+        let flush_report = new_flush_report();
+        let result = {
+            let mut shardtree = orchard_tree(self.conn.0)?;
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         Ok(result)
     }
@@ -3787,8 +3906,26 @@ impl<P: consensus::Parameters, CL, R> WalletCommitmentTrees
             FnMut(&'a mut IronwoodCommitmentTree<&'a rusqlite::Transaction<'a>>) -> Result<A, E>,
         E: From<ShardTreeError<Self::Error>>,
     {
-        let mut shardtree = ironwood_tree(self.conn.0)?;
-        let result = callback(&mut shardtree)?;
+        let flush_report = new_flush_report();
+        let result = {
+            let mut shardtree = ironwood_tree(self.conn.0)?;
+            let flush_on_drop = if self.commitment_tree_write_back {
+                shardtree
+                    .store_mut()
+                    .enable_write_back()
+                    .map_err(ShardTreeError::Storage)?;
+                shardtree
+                    .store_mut()
+                    .set_flush_report(std::rc::Rc::clone(&flush_report));
+                Some(shardtree.store_mut().flush_on_drop())
+            } else {
+                None
+            };
+            let result = callback(&mut shardtree);
+            drop(flush_on_drop);
+            result
+        }?;
+        take_flush_report(flush_report)?;
 
         Ok(Some(result))
     }
@@ -6011,6 +6148,7 @@ mod tests {
     }
 
     /// Diversifier index used when persisting an address through the fork's insertion API.
+    #[cfg(feature = "orchard")]
     const PUT_ADDRESS_DIVERSIFIER_INDEX: u32 = 0;
 
     #[cfg(feature = "orchard")]
