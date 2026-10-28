@@ -826,13 +826,11 @@ impl<C: Borrow<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
                 return Ok(());
             }
             // `wal_checkpoint` returns (busy, log frames, checkpointed frames).
-            // busy != 0 means a reader blocked the truncation. rusqlite's
-            // default busy handler waits 5s on that result, so this is one
-            // nonblocking attempt. The flag stays set and a later scan retries.
+            // busy != 0 means a reader blocked the truncation. The attempt runs
+            // on a separate connection so a caller-installed busy handler on
+            // this one is left alone. The flag stays set and a later scan retries.
             // A busy result does not fail the scan that already committed.
-            let busy: i64 = nonblocking_busy(conn, |conn| {
-                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
-            })?;
+            let busy = wal_checkpoint_truncate_nowait(conn)?;
             self.wal_checkpoint_pending
                 .store(busy != 0, std::sync::atomic::Ordering::Relaxed);
             if busy != 0 {
@@ -854,27 +852,22 @@ impl<C: Borrow<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
     }
 }
 
-/// Runs `body` with SQLite's busy handler disabled, then restores the previous
-/// timeout. `wal_checkpoint(TRUNCATE)` otherwise waits out the handler (5s on a
-/// new rusqlite connection) while a reader still holds the log.
-fn nonblocking_busy<T>(
-    conn: &rusqlite::Connection,
-    body: impl FnOnce(&rusqlite::Connection) -> Result<T, rusqlite::Error>,
-) -> Result<T, rusqlite::Error> {
-    let saved: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
-    conn.execute_batch("PRAGMA busy_timeout = 0")?;
-    let result = body(conn);
-    match conn.execute_batch(&format!("PRAGMA busy_timeout = {saved}")) {
-        Ok(()) => result,
-        Err(restore_err) => {
-            if let Err(body_err) = &result {
-                warn!(
-                    "busy-timeout restore failed after {body_err}; the connection may no longer wait on locks"
-                );
-            }
-            Err(restore_err)
-        }
+/// One `wal_checkpoint(TRUNCATE)` that does not wait on, or replace, the busy
+/// handler of `conn`.
+///
+/// A new rusqlite connection waits 5 seconds inside that handler. Changing
+/// `PRAGMA busy_timeout` on `conn` would also discard a callback installed with
+/// [`rusqlite::Connection::busy_handler`]. The checkpoint therefore uses another
+/// connection to the same file, with the handler turned off. An in-memory
+/// database has no separate file; the attempt then runs on `conn` and keeps
+/// whatever handler the caller installed.
+fn wal_checkpoint_truncate_nowait(conn: &rusqlite::Connection) -> Result<i64, rusqlite::Error> {
+    if let Some(path) = conn.path().filter(|path| !path.is_empty()) {
+        let maintenance = rusqlite::Connection::open(path)?;
+        maintenance.busy_timeout(std::time::Duration::ZERO)?;
+        return maintenance.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0));
     }
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
 }
 
 impl<C, P, CL, R> WalletDb<C, P, CL, R> {
@@ -4819,6 +4812,15 @@ mod tests {
         zcash_client_backend::data_api::TransactionDataRequest,
     };
 
+    thread_local! {
+        static RECLAIM_BUSY_HANDLER_CALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn reclaim_probe_busy_handler(_: i32) -> bool {
+        RECLAIM_BUSY_HANDLER_CALLED.with(|called| called.set(true));
+        false
+    }
+
     #[test]
     fn wal_checkpoint_reclaim_does_not_block_on_a_reader() {
         use std::sync::atomic::Ordering;
@@ -4868,6 +4870,11 @@ mod tests {
             .execute_batch("BEGIN; SELECT x FROM reclaim_probe;")
             .unwrap();
 
+        db.conn
+            .busy_handler(Some(reclaim_probe_busy_handler))
+            .unwrap();
+        RECLAIM_BUSY_HANDLER_CALLED.with(|called| called.set(false));
+
         db.wal_checkpoint_pending.store(true, Ordering::Relaxed);
         let started = Instant::now();
         db.reclaim_freed_pages().unwrap();
@@ -4880,11 +4887,6 @@ mod tests {
             db.wal_checkpoint_pending.load(Ordering::Relaxed),
             "a blocked checkpoint must stay pending for a later scan"
         );
-        let restored: i64 = db
-            .conn
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(restored, before);
 
         drop(reader);
         db.reclaim_freed_pages().unwrap();
@@ -4892,6 +4894,18 @@ mod tests {
             !db.wal_checkpoint_pending.load(Ordering::Relaxed),
             "the checkpoint should finish once the reader is gone"
         );
+
+        // The checkpoint must not have replaced the handler with a bare timeout.
+        let blocker = rusqlite::Connection::open(file.path()).unwrap();
+        blocker.busy_timeout(Duration::ZERO).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let write = db.conn.execute("INSERT INTO reclaim_probe VALUES (2)", []);
+        assert!(write.is_err(), "the exclusive lock should block the insert");
+        assert!(
+            RECLAIM_BUSY_HANDLER_CALLED.with(|called| called.get()),
+            "reclamation replaced the caller-installed busy handler"
+        );
+        drop(blocker);
     }
 
     #[test]

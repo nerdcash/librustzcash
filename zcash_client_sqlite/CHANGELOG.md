@@ -38,8 +38,9 @@ workspace.
   remaining as high-water. A scan composed inside `WalletDb::transactionally` or
   `transactionally_with_extension` asks the outer handle to reclaim those pages
   after that transaction commits. A WAL truncation that a reader blocks is
-  attempted once, without waiting on SQLite's busy handler, and retried on a
-  later scan. A database created without incremental auto-vacuum is switched on
+  attempted once on a separate connection, so the wallet connection's busy
+  handler is left unchanged, and retried on a later scan. A database created
+  without incremental auto-vacuum is switched on
   its next migration, which rewrites the file once.
 - A scan batch writes its surviving nullifiers in one ordered insert instead of
   one statement per spend. Nullifiers that the batch's frontier will drop are
