@@ -826,26 +826,16 @@ impl<C: Borrow<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
                 return Ok(());
             }
             // `wal_checkpoint` returns (busy, log frames, checkpointed frames).
-            // busy != 0 means a reader blocked the truncation. Retry here, and
-            // if it is still busy leave the flag set so a later scan tries
-            // again. This does not fail the scan that already committed.
-            let mut still_busy = false;
-            for attempt in 0..8 {
-                let busy: i64 =
-                    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-                if busy == 0 {
-                    still_busy = false;
-                    break;
-                }
-                still_busy = true;
-                if attempt + 1 < 8 {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            }
+            // busy != 0 means a reader blocked the truncation. rusqlite's
+            // default busy handler waits 5s on that result, so this is one
+            // nonblocking attempt. The flag stays set and a later scan retries.
+            // A busy result does not fail the scan that already committed.
+            let busy: i64 = nonblocking_busy(conn, |conn| {
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            })?;
             self.wal_checkpoint_pending
-                .store(still_busy, std::sync::atomic::Ordering::Relaxed);
-            if still_busy {
+                .store(busy != 0, std::sync::atomic::Ordering::Relaxed);
+            if busy != 0 {
                 warn!("wal checkpoint remained busy after spend-map reclamation");
             }
         }
@@ -860,6 +850,29 @@ impl<C: Borrow<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
         }
         if let Err(err) = self.reclaim_freed_pages() {
             warn!("failed to reclaim freed spend-map pages: {err}");
+        }
+    }
+}
+
+/// Runs `body` with SQLite's busy handler disabled, then restores the previous
+/// timeout. `wal_checkpoint(TRUNCATE)` otherwise waits out the handler (5s on a
+/// new rusqlite connection) while a reader still holds the log.
+fn nonblocking_busy<T>(
+    conn: &rusqlite::Connection,
+    body: impl FnOnce(&rusqlite::Connection) -> Result<T, rusqlite::Error>,
+) -> Result<T, rusqlite::Error> {
+    let saved: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA busy_timeout = 0")?;
+    let result = body(conn);
+    match conn.execute_batch(&format!("PRAGMA busy_timeout = {saved}")) {
+        Ok(()) => result,
+        Err(restore_err) => {
+            if let Err(body_err) = &result {
+                warn!(
+                    "busy-timeout restore failed after {body_err}; the connection may no longer wait on locks"
+                );
+            }
+            Err(restore_err)
         }
     }
 }
@@ -4754,7 +4767,7 @@ extern crate assert_matches;
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     use secrecy::{ExposeSecret, Secret, SecretVec};
     use uuid::Uuid;
@@ -4805,6 +4818,81 @@ mod tests {
         std::collections::BTreeSet,
         zcash_client_backend::data_api::TransactionDataRequest,
     };
+
+    #[test]
+    fn wal_checkpoint_reclaim_does_not_block_on_a_reader() {
+        use std::sync::atomic::Ordering;
+
+        use zcash_protocol::consensus::BlockHeight;
+
+        use crate::{
+            WalletDb,
+            testing::db::{test_clock, test_rng},
+        };
+
+        let network = LocalNetwork {
+            overwinter: Some(BlockHeight::from_u32(1)),
+            sapling: Some(BlockHeight::from_u32(2)),
+            blossom: Some(BlockHeight::from_u32(3)),
+            heartwood: Some(BlockHeight::from_u32(4)),
+            canopy: Some(BlockHeight::from_u32(5)),
+            nu5: Some(BlockHeight::from_u32(6)),
+            nu6: Some(BlockHeight::from_u32(7)),
+            nu6_1: Some(BlockHeight::from_u32(8)),
+            nu6_2: Some(BlockHeight::from_u32(9)),
+            nu6_3: Some(BlockHeight::from_u32(10)),
+            nu7: None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
+        };
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = WalletDb::for_path(file.path(), network, test_clock(), test_rng()).unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TABLE reclaim_probe (x INTEGER);
+                 INSERT INTO reclaim_probe VALUES (1);",
+            )
+            .unwrap();
+        let before: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            before > 0,
+            "the connection should start with a busy handler"
+        );
+
+        let reader = rusqlite::Connection::open(file.path()).unwrap();
+        reader.busy_timeout(Duration::ZERO).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT x FROM reclaim_probe;")
+            .unwrap();
+
+        db.wal_checkpoint_pending.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        db.reclaim_freed_pages().unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a blocked checkpoint waited {elapsed:?}"
+        );
+        assert!(
+            db.wal_checkpoint_pending.load(Ordering::Relaxed),
+            "a blocked checkpoint must stay pending for a later scan"
+        );
+        let restored: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(restored, before);
+
+        drop(reader);
+        db.reclaim_freed_pages().unwrap();
+        assert!(
+            !db.wal_checkpoint_pending.load(Ordering::Relaxed),
+            "the checkpoint should finish once the reader is gone"
+        );
+    }
 
     #[test]
     fn get_wallet_recover_until_is_max_across_accounts() {
