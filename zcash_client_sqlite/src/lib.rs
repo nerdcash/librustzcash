@@ -574,6 +574,13 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
     /// Construct a [`WalletDb`] instance that connects to the wallet database stored at the
     /// specified path.
     ///
+    /// The connection uses WAL journaling and `synchronous = NORMAL`. Recovery applies only
+    /// complete WAL commit frames and discards a torn frame, so a crash cannot leave a
+    /// half-written page or a corrupt database. An application crash keeps the last commit.
+    /// A power loss or operating-system crash can still roll back commits since the last
+    /// checkpoint, which for a scan is the last batch. The page cache is 64 MiB, which is
+    /// enough for a historic scan's block rows and note-commitment frontier.
+    ///
     /// ## Parameters
     /// - `path`: The path to the SQLite database used to store wallet data.
     /// - `params`: Parameters associated with the Zcash network that the wallet will connect to.
@@ -588,6 +595,19 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
     ) -> Result<Self, rusqlite::Error> {
         rusqlite::Connection::open(path).and_then(move |conn| {
             rusqlite::vtab::array::load_module(&conn)?;
+            // Historic scans write tens of thousands of block rows and rewrite the note
+            // commitment frontier in one transaction per batch. WAL with NORMAL sync skips a
+            // full fsync on every batch. SQLite still writes each commit as a complete WAL
+            // frame and, on the next open, replays only complete frames, so the database
+            // cannot be torn. A power loss can drop frames not yet checkpointed. The page
+            // cache stays large enough for the working set of a sync.
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = NORMAL;
+                 PRAGMA temp_store = MEMORY;
+                 PRAGMA cache_size = -65536;
+                 PRAGMA mmap_size = 268435456;",
+            )?;
             Ok(WalletDb {
                 conn,
                 params,
@@ -2757,6 +2777,11 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             .transpose()?
             .flatten();
 
+        // Captured before `blocks` moves. The link runs after the block rows are stored.
+        let mined_link = blocks
+            .last()
+            .map(|block| (from_state.block_height() + 1, block.height() + 1));
+
         ll::wallet::put_blocks::<_, SqliteClientError, commitment_tree::Error>(
             self,
             #[cfg(feature = "transparent-inputs")]
@@ -2765,7 +2790,12 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             blocks,
             anchor_retention.as_ref(),
         )
-        .map_err(SqliteClientError::from)
+        .map_err(SqliteClientError::from)?;
+
+        if let Some((start, end)) = mined_link {
+            wallet::link_mined_transactions(self.conn.0, start, end)?;
+        }
+        Ok(())
     }
 
     fn put_blocks_without_commitment_trees(
@@ -2773,6 +2803,10 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
         prior: &CompactChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
+        let mined_link = blocks
+            .last()
+            .map(|block| (prior.block_height() + 1, block.height() + 1));
+
         ll::wallet::put_blocks_without_commitment_trees::<
             _,
             SqliteClientError,
@@ -2784,7 +2818,12 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             prior,
             blocks,
         )
-        .map_err(SqliteClientError::from)
+        .map_err(SqliteClientError::from)?;
+
+        if let Some((start, end)) = mined_link {
+            wallet::link_mined_transactions(self.conn.0, start, end)?;
+        }
+        Ok(())
     }
 
     fn put_received_transparent_utxo(

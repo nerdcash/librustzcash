@@ -197,6 +197,7 @@ fn checkpoint_order(id: BlockHeight, checkpoint: &Checkpoint) -> (u8, u64, u32) 
 
 impl<H: HashSer + Clone> ShardWriteBack<H> {
     fn load(conn: &rusqlite::Transaction<'_>, table_prefix: &'static str) -> Result<Self, Error> {
+        let _span = tracing::info_span!("commitment_load_cache", table_prefix).entered();
         let cap = get_cap(conn, table_prefix)?;
         let mut checkpoints = BTreeMap::new();
         let count = checkpoint_count(conn, table_prefix)?;
@@ -384,35 +385,50 @@ impl<H: HashSer + Clone> ShardWriteBack<H> {
         );
 
         if let Some(index) = self.truncate_from {
+            let _span = tracing::info_span!("commitment_flush_truncate").entered();
             truncate_shards(conn, table_prefix, index)?;
         }
-        for index in &self.dirty_shards {
-            if let Some(Some(shard)) = self.shards.get(index) {
-                put_shard(conn, table_prefix, shard.clone())?;
+        {
+            let _span =
+                tracing::info_span!("commitment_flush_shards", shards = self.dirty_shards.len())
+                    .entered();
+            for index in &self.dirty_shards {
+                if let Some(Some(shard)) = self.shards.get(index) {
+                    put_shard(conn, table_prefix, shard.clone())?;
+                }
             }
         }
         if self.cap_dirty {
+            let _span = tracing::info_span!("commitment_flush_cap").entered();
             put_cap(conn, table_prefix, self.cap)?;
         }
-        for id in &self.removed_checkpoints {
-            remove_checkpoint(conn, table_prefix, *id)?;
-        }
-        let mut dirty_ids = self.dirty_checkpoints.iter().copied().collect::<Vec<_>>();
-        dirty_ids.sort();
-        for id in dirty_ids {
-            if self.removed_checkpoints.contains(&id) {
-                continue;
+        {
+            let _span = tracing::info_span!(
+                "commitment_flush_checkpoints",
+                removed = self.removed_checkpoints.len(),
+                dirty = self.dirty_checkpoints.len()
+            )
+            .entered();
+            for id in &self.removed_checkpoints {
+                remove_checkpoint(conn, table_prefix, *id)?;
             }
-            let Some(checkpoint) = self.checkpoints.get(&id).cloned() else {
-                continue;
-            };
-            // An id that already has a row cannot be inserted again when its marks changed:
-            // `add_checkpoint` treats that as a conflict. Delete the old row first. The id is the
-            // primary key, so the replacement keeps the same rowid.
-            if self.loaded_ids.contains(&id) {
-                remove_checkpoint(conn, table_prefix, id)?;
+            let mut dirty_ids = self.dirty_checkpoints.iter().copied().collect::<Vec<_>>();
+            dirty_ids.sort();
+            for id in dirty_ids {
+                if self.removed_checkpoints.contains(&id) {
+                    continue;
+                }
+                let Some(checkpoint) = self.checkpoints.get(&id).cloned() else {
+                    continue;
+                };
+                // An id that already has a row cannot be inserted again when its marks changed:
+                // `add_checkpoint` treats that as a conflict. Delete the old row first. The id is the
+                // primary key, so the replacement keeps the same rowid.
+                if self.loaded_ids.contains(&id) {
+                    remove_checkpoint(conn, table_prefix, id)?;
+                }
+                add_checkpoint(conn, table_prefix, id, checkpoint)?;
             }
-            add_checkpoint(conn, table_prefix, id, checkpoint)?;
         }
         for id in self.initial_retained.difference(&self.retained) {
             remove_retained_checkpoint(conn, table_prefix, *id)?;
@@ -1086,12 +1102,19 @@ pub(crate) fn put_shard<H: HashSer>(
         .transpose()
         .map_err(Error::Serialization)?;
 
-    let mut subtree_data = vec![];
-    write_shard(&mut subtree_data, subtree.root()).map_err(Error::Serialization)?;
+    let subtree_data = {
+        let _span = tracing::info_span!("commitment_serialize_shard").entered();
+        let mut subtree_data = vec![];
+        write_shard(&mut subtree_data, subtree.root()).map_err(Error::Serialization)?;
+        subtree_data
+    };
 
     let shard_index = subtree.root_addr().index();
 
-    check_shard_discontinuity(conn, table_prefix, shard_index..shard_index + 1)?;
+    {
+        let _span = tracing::info_span!("commitment_shard_discontinuity").entered();
+        check_shard_discontinuity(conn, table_prefix, shard_index..shard_index + 1)?;
+    }
 
     let mut stmt_put_shard = conn
         .prepare_cached(&format!(
