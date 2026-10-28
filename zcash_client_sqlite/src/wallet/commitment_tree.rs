@@ -1788,9 +1788,7 @@ pub(crate) fn put_shard_roots<
     let mut matched = 0usize;
     while matched < roots.len() {
         let index = start_index + u64::try_from(matched).expect("root count fits in u64");
-        match stored_shard_root::<H>(conn, table_prefix, index)
-            .map_err(ShardTreeError::Storage)?
-        {
+        match stored_shard_root::<H>(conn, table_prefix, index).map_err(ShardTreeError::Storage)? {
             Some((stored_end, stored_hash)) => {
                 let supplied = &roots[matched];
                 if stored_end != Some(supplied.subtree_end_height())
