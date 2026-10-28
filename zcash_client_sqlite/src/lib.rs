@@ -59,13 +59,13 @@ use zcash_client_backend::{
     TransferType,
     data_api::{
         self, Account, AccountBirthday, AccountMeta, AccountPurpose, AccountSource, AddressInfo,
-        BlockMetadata, ChangeReceivers, DecryptedTransaction, InputSource, NoteFilter,
-        NullifierQuery, OutputLockStore, ReceivedNotes, ReceivedTransactionOutput,
-        SAPLING_SHARD_HEIGHT, ScannedBlock, SeedRelevance, SentTransaction, TargetValue,
-        TransactionDataRequest, WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite,
-        Zip32Derivation,
+        BlockMetadata, ChangeReceivers, CommitmentTreeMaintenance, DecryptedTransaction,
+        InputSource, NoteFilter, NullifierQuery, OutputLockStore, ReceivedNotes,
+        ReceivedTransactionOutput, SAPLING_SHARD_HEIGHT, ScannedBlock, SeedRelevance,
+        SentTransaction, TargetValue, TransactionDataRequest, WalletCommitmentTrees, WalletRead,
+        WalletSummary, WalletWrite, Zip32Derivation,
         anchor_retention::{AnchorRetention, AnchorRetentionInterval},
-        chain::{BlockSource, ChainState, CommitmentTreeRoot},
+        chain::{BlockSource, ChainState, CommitmentTreeRoot, CompactChainState},
         error::{FindAccountForAddressError, LockError, RewindError},
         ll::{
             self, LowLevelWalletRead, LowLevelWalletWrite, ReceivedSaplingOutput,
@@ -299,6 +299,9 @@ pub struct WalletDb<C, P, CL, R> {
     /// When set, each `with_*_tree_mut` callback accumulates note-commitment tree mutations in
     /// memory and writes them back once. Not persisted. Defaults to `true`.
     commitment_tree_write_back: bool,
+    /// Whether scanning maintains note commitment trees. Not persisted. Defaults to
+    /// [`CommitmentTreeMaintenance::Automatic`].
+    commitment_tree_maintenance: CommitmentTreeMaintenance,
     #[cfg(feature = "transparent-inputs")]
     gap_limits: GapLimits,
 }
@@ -588,6 +591,7 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
                 rng,
                 anchor_retention_interval: AnchorRetentionInterval::default(),
                 commitment_tree_write_back: true,
+                commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
                 #[cfg(feature = "transparent-inputs")]
                 gap_limits: GapLimits::default(),
             })
@@ -634,6 +638,38 @@ impl<C, P, CL, R> WalletDb<C, P, CL, R> {
     pub fn set_commitment_tree_write_back(&mut self, enabled: bool) {
         self.commitment_tree_write_back = enabled;
     }
+
+    /// Selects whether this wallet maintains note commitment trees while scanning.
+    ///
+    /// Not persisted. [`CommitmentTreeMaintenance::Automatic`] (the default) maintains trees
+    /// unless every account is [`AccountPurpose::ViewOnly`]. [`CommitmentTreeMaintenance::ViewOnly`]
+    /// skips them even if a spending account is present.
+    ///
+    /// Adding a spending account to a database that has already been scanned without trees does
+    /// not rebuild those trees. Rescan the range that should become spendable after switching
+    /// back to [`CommitmentTreeMaintenance::Automatic`] (or after importing the spending account,
+    /// which itself makes [`Automatic`] maintain trees).
+    ///
+    /// [`Automatic`]: CommitmentTreeMaintenance::Automatic
+    pub fn with_commitment_tree_maintenance(mut self, mode: CommitmentTreeMaintenance) -> Self {
+        self.set_commitment_tree_maintenance(mode);
+        self
+    }
+
+    /// Sets note-commitment-tree maintenance on an existing handle. See
+    /// [`Self::with_commitment_tree_maintenance`].
+    pub fn set_commitment_tree_maintenance(&mut self, mode: CommitmentTreeMaintenance) {
+        self.commitment_tree_maintenance = mode;
+    }
+
+    /// Returns the configured note-commitment-tree maintenance mode.
+    ///
+    /// This is the configured mode, not the effective one. A wallet left on
+    /// [`CommitmentTreeMaintenance::Automatic`] still skips trees when every account is
+    /// view-only; [`WalletRead::maintains_note_commitment_trees`] reports that.
+    pub fn commitment_tree_maintenance(&self) -> CommitmentTreeMaintenance {
+        self.commitment_tree_maintenance
+    }
 }
 
 #[cfg(feature = "transparent-inputs")]
@@ -668,6 +704,7 @@ impl<C: Borrow<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             rng,
             anchor_retention_interval: AnchorRetentionInterval::default(),
             commitment_tree_write_back: true,
+            commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: GapLimits::default(),
         }
@@ -721,6 +758,7 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             rng: &mut self.rng,
             anchor_retention_interval: self.anchor_retention_interval,
             commitment_tree_write_back: self.commitment_tree_write_back,
+            commitment_tree_maintenance: self.commitment_tree_maintenance,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
@@ -780,6 +818,7 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             rng: &mut self.rng,
             anchor_retention_interval: self.anchor_retention_interval,
             commitment_tree_write_back: self.commitment_tree_write_back,
+            commitment_tree_maintenance: self.commitment_tree_maintenance,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
@@ -1446,6 +1485,13 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletRea
         self.anchor_retention_interval
     }
 
+    fn maintains_note_commitment_trees(&self) -> Result<bool, Self::Error> {
+        wallet::maintains_note_commitment_trees(
+            self.conn.borrow(),
+            self.commitment_tree_maintenance,
+        )
+    }
+
     fn get_block_hash(&self, block_height: BlockHeight) -> Result<Option<BlockHash>, Self::Error> {
         wallet::get_block_hash(self.conn.borrow(), block_height).map_err(SqliteClientError::from)
     }
@@ -2079,6 +2125,14 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         self.transactionally(|wdb| wdb.put_blocks(from_state, blocks))
     }
 
+    fn put_blocks_without_commitment_trees(
+        &mut self,
+        prior: &CompactChainState,
+        blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        self.transactionally(|wdb| wdb.put_blocks_without_commitment_trees(prior, blocks))
+    }
+
     fn put_received_transparent_utxo(
         &mut self,
         _output: &WalletTransparentOutput<<Self as WalletRead>::AccountId>,
@@ -2632,6 +2686,25 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             from_state,
             blocks,
             anchor_retention.as_ref(),
+        )
+        .map_err(SqliteClientError::from)
+    }
+
+    fn put_blocks_without_commitment_trees(
+        &mut self,
+        prior: &CompactChainState,
+        blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        ll::wallet::put_blocks_without_commitment_trees::<
+            _,
+            SqliteClientError,
+            commitment_tree::Error,
+        >(
+            self,
+            #[cfg(feature = "transparent-inputs")]
+            self.gap_limits,
+            prior,
+            blocks,
         )
         .map_err(SqliteClientError::from)
     }

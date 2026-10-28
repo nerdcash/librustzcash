@@ -216,6 +216,7 @@ fn truncate_to_height<P: consensus::Parameters>(
             // This migration predates the write-back cache. Leave it on the immediate path so a
             // repair of an old wallet does not depend on the cache.
             commitment_tree_write_back: false,
+            commitment_tree_maintenance: zcash_client_backend::data_api::CommitmentTreeMaintenance::Automatic,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: *gap_limits,
         };

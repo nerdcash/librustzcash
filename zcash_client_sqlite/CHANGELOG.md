@@ -11,6 +11,13 @@ workspace.
 ## [Unreleased]
 
 ### Added
+- `WalletDb::with_commitment_tree_maintenance` and
+  `WalletDb::set_commitment_tree_maintenance`. `CommitmentTreeMaintenance::ViewOnly`,
+  and `Automatic` when every account is view-only, make `scan_cached_blocks`
+  persist notes and spends without writing note commitment shards, checkpoints,
+  or the cap. An empty wallet and any wallet with a spending account still
+  maintain trees. Adding a spending account after a view-only scan does not
+  rebuild trees for blocks already scanned; those blocks have to be rescanned.
 - `WalletWrite::import_account_uivk` is implemented for `WalletDb`, enabling
   import of incoming-viewing-key-only accounts.
 - `WalletDb::set_commitment_tree_write_back` disables the note-commitment tree

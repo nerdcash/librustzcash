@@ -638,6 +638,30 @@ pub enum AccountPurpose {
     /// received notes.
     Spending { derivation: Option<Zip32Derivation> },
     /// For view-only accounts, the wallet will not track spend information.
+    ///
+    /// One view-only account does not by itself skip note commitment trees. The trees and the
+    /// scan queue are per wallet. See [`CommitmentTreeMaintenance`].
+    ViewOnly,
+}
+
+/// Whether a wallet maintains note commitment trees, witnesses, and ZIP 318 anchor checkpoints
+/// while scanning.
+///
+/// The trees and the scan queue are per database. A wallet that contains any spending account
+/// maintains them. A wallet whose every account is [`AccountPurpose::ViewOnly`], or one that
+/// selects [`Self::ViewOnly`] explicitly, does not: `put_blocks` persists received notes, spends,
+/// nullifiers, transparent outputs, and block metadata without updating a shard tree.
+///
+/// An empty wallet maintains trees. Adding a spending account to a wallet that has already
+/// scanned in view-only mode does not rebuild trees for the blocks already scanned; those blocks
+/// have to be rescanned after the wallet starts maintaining trees. That rescan is the caller's
+/// responsibility.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CommitmentTreeMaintenance {
+    /// Maintain note commitment trees unless every account is [`AccountPurpose::ViewOnly`].
+    #[default]
+    Automatic,
+    /// Do not maintain note commitment trees, regardless of the accounts in the wallet.
     ViewOnly,
 }
 
@@ -2360,6 +2384,15 @@ pub trait WalletRead {
         anchor_retention::AnchorRetentionInterval::ZIP_318
     }
 
+    /// Returns whether scanning this wallet appends note commitment trees.
+    ///
+    /// The default is `true`, which is the spending-wallet behavior. A backend that supports
+    /// view-only scanning overrides this from [`CommitmentTreeMaintenance`] and the purposes of
+    /// the accounts it stores. See [`CommitmentTreeMaintenance`] for when the result is `false`.
+    fn maintains_note_commitment_trees(&self) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
     /// Returns the ZIP 318 pool-migration parameters in force for this wallet on the network that
     /// `params` describe: the specified values, with the anchor bucket grid taken from
     /// [`Self::anchor_retention_interval`].
@@ -3567,6 +3600,26 @@ impl AccountBirthday {
         }
     }
 
+    /// Constructs a birthday for a view-only import from the prior block's height and hash.
+    ///
+    /// The birthday height — the first block to scan — is `prior_height + 1`. `prior_height` may
+    /// be below Sapling activation, where `lightwalletd` `GetTreeState` does not return a tree
+    /// state. The note commitment frontiers are empty and are not a substitute for a
+    /// [`TreeState`]: a view-only scan checks continuity from compact-block metadata
+    /// ([`chain::CompactChainState`](chain::CompactChainState)) rather than by appending these
+    /// frontiers.
+    ///
+    /// Importing this birthday into a wallet that maintains note commitment trees does not
+    /// install a frontier those trees can be appended to. Use [`Self::from_treestate`] for a
+    /// spending account.
+    pub fn from_viewing_parts(
+        prior_height: BlockHeight,
+        prior_hash: BlockHash,
+        recover_until: Option<BlockHeight>,
+    ) -> Self {
+        Self::from_parts(ChainState::empty(prior_height, prior_hash), recover_until)
+    }
+
     /// Constructs a new [`AccountBirthday`] from a [`TreeState`] returned from `lightwalletd`.
     ///
     /// * `treestate`: The tree state corresponding to the last block prior to the wallet's
@@ -4202,6 +4255,24 @@ pub trait WalletWrite:
     fn put_blocks(
         &mut self,
         from_state: &ChainState,
+        blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error>;
+
+    /// Persists scanned blocks without updating note commitment trees.
+    ///
+    /// Stores received notes, spent-note links, nullifiers for notes this wallet has decrypted,
+    /// transparent outputs, and block hash, height, and time, and advances the scan queue.
+    /// `commitment_tree_position` may be recorded from the compact block's tree sizes;
+    /// `witness_stabilized` stays unset. The call does not write shard, checkpoint, or cap rows
+    /// and does not require [`WalletCommitmentTrees`] to succeed.
+    ///
+    /// `prior` is the block immediately before the first block of `blocks`: its height, hash, and
+    /// end-of-block tree sizes. Each pool's tree size must advance by that block's commitment
+    /// count, and the blocks must be sequential. This is the view-only form of [`Self::put_blocks`].
+    /// Spending wallets continue to use [`Self::put_blocks`].
+    fn put_blocks_without_commitment_trees(
+        &mut self,
+        prior: &chain::CompactChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error>;
 

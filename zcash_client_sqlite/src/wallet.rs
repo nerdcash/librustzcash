@@ -108,9 +108,9 @@ use zcash_client_backend::{
     DecryptedOutput,
     data_api::{
         Account as _, AccountBalance, AccountBirthday, AccountPurpose, AccountSource, AddressInfo,
-        AddressSource, BlockMetadata, ChangeReceivers, Progress, Ratio, ReceivedTransactionOutput,
-        SAPLING_SHARD_HEIGHT, SentTransaction, SentTransactionOutput, TransactionDataRequest,
-        TransactionStatus, WalletSummary, Zip32Derivation,
+        AddressSource, BlockMetadata, ChangeReceivers, CommitmentTreeMaintenance, Progress, Ratio,
+        ReceivedTransactionOutput, SAPLING_SHARD_HEIGHT, SentTransaction, SentTransactionOutput,
+        TransactionDataRequest, TransactionStatus, WalletSummary, Zip32Derivation,
         anchor_retention::AnchorRetentionInterval,
         chain::ChainState,
         defaults::address_receiver_matches_ua,
@@ -193,6 +193,8 @@ pub(crate) mod sapling;
 pub(crate) mod scanning;
 #[cfg(feature = "transparent-inputs")]
 pub(crate) mod transparent;
+#[cfg(test)]
+mod view_only;
 
 pub(crate) const BLOCK_SAPLING_FRONTIER_ABSENT: &[u8] = &[0x0];
 
@@ -4512,6 +4514,7 @@ pub(crate) fn truncate_to_height_internal<P: consensus::Parameters>(
             // decision is made through this handle and the interval is immaterial.
             anchor_retention_interval: AnchorRetentionInterval::default(),
             commitment_tree_write_back,
+            commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: *gap_limits,
         };
@@ -5171,6 +5174,36 @@ pub(crate) fn put_latest_scanned_block_for_transparent<P: consensus::Parameters>
     Ok(())
 }
 
+/// Whether scanning should append note commitment trees.
+///
+/// [`CommitmentTreeMaintenance::ViewOnly`] skips them. [`CommitmentTreeMaintenance::Automatic`]
+/// skips them only when the wallet holds at least one account and every account is view-only
+/// (`account_kind` imported and `has_spend_key` unset). An empty wallet maintains trees: the
+/// next account may be a spending account, and a spending wallet must keep its existing
+/// behavior.
+pub(crate) fn maintains_note_commitment_trees(
+    conn: &rusqlite::Connection,
+    mode: CommitmentTreeMaintenance,
+) -> Result<bool, SqliteClientError> {
+    if mode == CommitmentTreeMaintenance::ViewOnly {
+        return Ok(false);
+    }
+
+    let (accounts, spending) = conn.query_row(
+        "SELECT
+            COUNT(*),
+            COALESCE(SUM(CASE WHEN account_kind = 0 OR has_spend_key != 0 THEN 1 ELSE 0 END), 0)
+         FROM accounts",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+
+    Ok(accounts == 0 || spending > 0)
+}
+
+/// Returns a vector with the IDs of all accounts known to this wallet.
+///
+/// Note that this is called from db migration code.
 pub(crate) fn get_account_ids(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<AccountUuid>, rusqlite::Error> {

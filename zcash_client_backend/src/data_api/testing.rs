@@ -101,7 +101,10 @@ use super::{
     SeedRelevance, SentTransaction, TransactionDataRequest, TransactionStatus,
     WalletCommitmentTrees, WalletRead, WalletSummary, WalletTest, WalletWrite, Zip32Derivation,
     anchor_retention::AnchorRetentionInterval,
-    chain::{BlockSource, ChainState, CommitmentTreeRoot, ScanSummary, scan_cached_blocks},
+    chain::{
+        BlockSource, ChainState, CommitmentTreeRoot, CompactChainState, ScanSummary,
+        scan_cached_blocks,
+    },
     error::Error,
     scanning::{ScanPriority, ScanRange},
     wallet::{
@@ -1126,6 +1129,31 @@ where
         &mut self,
         from_height: BlockHeight,
         from_state: &ChainState,
+        limit: usize,
+    ) -> Result<
+        ScanSummary,
+        super::chain::error::Error<
+            <DbT as WalletRead>::Error,
+            <Cache::BlockSource as BlockSource>::Error,
+        >,
+    > {
+        scan_cached_blocks(
+            &self.network,
+            self.cache.block_source(),
+            &mut self.wallet_data,
+            from_height,
+            from_state,
+            limit,
+        )
+    }
+
+    /// Invokes [`scan_cached_blocks`] with caller-supplied prior-block continuity.
+    ///
+    /// `from_state` may be a [`ChainState`] or a [`CompactChainState`].
+    pub fn try_scan_cached_blocks_from<C: super::chain::ScanContinuity>(
+        &mut self,
+        from_height: BlockHeight,
+        from_state: &C,
         limit: usize,
     ) -> Result<
         ScanSummary,
@@ -3701,6 +3729,14 @@ impl WalletWrite for MockWalletDb {
     fn put_blocks(
         &mut self,
         _from_state: &ChainState,
+        _blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        Ok(())
+    }
+
+    fn put_blocks_without_commitment_trees(
+        &mut self,
+        _prior: &CompactChainState,
         _blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
         Ok(())
