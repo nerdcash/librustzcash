@@ -79,3 +79,25 @@ Against the baseline at the same core count, the spam range is 1.05x at one
 core (inside run-to-run noise), 1.89x at two cores, and 3.68x at four cores.
 Ordinary blocks stay near 9,000 notes/sec at every core count because they are
 below the split threshold.
+
+## Orchard GLV key agreement
+
+Upstream already provides this, and the numbers above include it.
+
+`zcash_note_encryption` 0.5.1's `batch::try_compact_note_decryption` calls
+`BatchDomain::batch_ka_agree_dec`. Orchard 0.16 implements that hook in
+`orchard::note_encryption`: ephemeral keys are prepared with GLV endomorphism
+windows for the whole batch (`PreparedEphemeralPublicKey::batch_tabled`, one
+shared normalization), and each viewing key's scalar is decomposed once
+(`pasta_curves::glv::Decomposed`) and reused for every ephemeral key. The
+primitive is `pasta_curves::glv` (`Table`, `Decomposed`, `Table::mul_decomposed`),
+added for this purpose in orchard 0.15.4. Shared secrets are the same bytes as
+the per-output path.
+
+Compact scan, the trial-decrypt benchmark, and `BatchRunner` all enter through
+that batch API. There is no separate before/after for a local GLV change: the
+baseline and the parallel rows already pay for one GLV ladder per
+(viewing key, ephemeral key) instead of a generic variable-base multiply.
+Reimplementing it here would fork orchard types. Sapling trial decryption still
+uses Jubjub scalar multiplication from `sapling-crypto`, which has no GLV hook
+in the dependency we link.
