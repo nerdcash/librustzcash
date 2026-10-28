@@ -11,6 +11,8 @@ permissions:
 
 jobs:
   deploy:
+    # Pages publishing uses the upstream repo's github-pages environment.
+    if: github.repository == 'zcash/librustzcash'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
