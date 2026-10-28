@@ -2,11 +2,15 @@
 
 use assert_matches::assert_matches;
 use rusqlite::{Connection, OptionalExtension};
+use std::num::NonZeroU32;
+
 use zcash_client_backend::{
     data_api::{
         Account as _, AccountBirthday, AccountPurpose, CommitmentTreeMaintenance, WalletRead,
         WalletWrite,
+        anchor_retention::AnchorRetentionInterval,
         chain::{CompactChainState, error::Error as ScanDbError},
+        scanning::ScanPriority,
         testing::{AddressType, TestBuilder, pool::ShieldedPoolTester, sapling::SaplingPoolTester},
     },
     scanning::ScanError,
@@ -14,6 +18,7 @@ use zcash_client_backend::{
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::{
     consensus::{BlockHeight, NetworkUpgrade, Parameters as _},
+    local_consensus::LocalNetwork,
     value::Zatoshis,
 };
 
@@ -62,6 +67,15 @@ fn cap_blobs(conn: &Connection) -> Vec<Option<Vec<u8>>> {
 
 fn received_notes(conn: &Connection) -> i64 {
     count(conn, "SELECT COUNT(*) FROM sapling_received_notes")
+}
+
+fn queue_priorities(conn: &Connection) -> Vec<ScanPriority> {
+    conn.prepare("SELECT priority FROM scan_queue ORDER BY block_range_start")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .map(|code| super::scanning::parse_priority_code(code.unwrap()).unwrap())
+        .collect()
 }
 
 fn compact_prior(
@@ -303,5 +317,197 @@ fn spending_scan_requires_commitment_frontiers() {
     assert_matches!(
         st.try_scan_cached_blocks_from(height, &prior, 1),
         Err(ScanDbError::Scan(ScanError::CommitmentTreeRequired { .. }))
+    );
+}
+
+/// A shard end beyond the scanned block is what makes a spending scan insert `FoundNote`.
+/// View-only marks the scanned block `Scanned` and does not.
+#[test]
+fn view_only_scan_does_not_extend_found_note_ranges() {
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(TestDbFactory::default())
+        .with_block_cache(BlockCache::new())
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+    st.wallet_mut()
+        .db_mut()
+        .set_commitment_tree_maintenance(CommitmentTreeMaintenance::ViewOnly);
+
+    let activation = st
+        .network()
+        .activation_height(NetworkUpgrade::Sapling)
+        .unwrap();
+    st.wallet()
+        .conn()
+        .execute(
+            "INSERT INTO sapling_tree_shards (shard_index, subtree_end_height) VALUES (0, ?1)",
+            [u32::from(activation + 1000)],
+        )
+        .unwrap();
+
+    let fvk = SaplingPoolTester::test_account_fvk(&st);
+    let (height, _, _) = st.generate_next_block(
+        &fvk,
+        AddressType::DefaultExternal,
+        Zatoshis::const_from_u64(100_000),
+    );
+    st.scan_cached_blocks(height, 1);
+
+    let priorities = queue_priorities(st.wallet().conn());
+    assert!(
+        priorities.contains(&ScanPriority::Scanned),
+        "scanned range missing from {priorities:?}"
+    );
+    assert!(
+        !priorities.contains(&ScanPriority::FoundNote),
+        "view-only queue inserted FoundNote: {priorities:?}"
+    );
+}
+
+#[test]
+fn view_only_chain_tip_does_not_walk_back_to_an_incomplete_shard() {
+    let mut spending = TestBuilder::new()
+        .with_data_store_factory(TestDbFactory::default())
+        .with_block_cache(BlockCache::new())
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+    let mut view_only = TestBuilder::new()
+        .with_data_store_factory(TestDbFactory::default())
+        .with_block_cache(BlockCache::new())
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+    view_only
+        .wallet_mut()
+        .db_mut()
+        .set_commitment_tree_maintenance(CommitmentTreeMaintenance::ViewOnly);
+
+    let activation = spending
+        .network()
+        .activation_height(NetworkUpgrade::Sapling)
+        .unwrap();
+    let mut tables = vec!["sapling_tree_shards"];
+    #[cfg(feature = "orchard")]
+    {
+        tables.push("orchard_tree_shards");
+        tables.push("ironwood_tree_shards");
+    }
+    for wallet in [spending.wallet().conn(), view_only.wallet().conn()] {
+        for table in &tables {
+            wallet
+                .execute(
+                    &format!(
+                        "INSERT INTO {table} (shard_index, subtree_end_height) VALUES (0, ?1)"
+                    ),
+                    [u32::from(activation)],
+                )
+                .unwrap();
+        }
+    }
+
+    let tip = activation + 400;
+    spending.wallet_mut().update_chain_tip(tip).unwrap();
+    view_only.wallet_mut().update_chain_tip(tip).unwrap();
+
+    let spending_priorities = queue_priorities(spending.wallet().conn());
+    let view_priorities = queue_priorities(view_only.wallet().conn());
+    assert!(
+        spending_priorities.contains(&ScanPriority::ChainTip),
+        "spending tip queue: {spending_priorities:?}"
+    );
+    assert!(
+        !view_priorities.contains(&ScanPriority::ChainTip),
+        "view-only tip queue: {view_priorities:?}"
+    );
+    assert!(
+        view_priorities.contains(&ScanPriority::Historic),
+        "view-only tip queue: {view_priorities:?}"
+    );
+}
+
+#[test]
+fn view_only_chain_tip_keeps_verify_lookahead() {
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(TestDbFactory::default())
+        .with_block_cache(BlockCache::new())
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+    st.wallet_mut()
+        .db_mut()
+        .set_commitment_tree_maintenance(CommitmentTreeMaintenance::ViewOnly);
+
+    let fvk = SaplingPoolTester::test_account_fvk(&st);
+    let (height, _, _) = st.generate_next_block(
+        &fvk,
+        AddressType::DefaultExternal,
+        Zatoshis::const_from_u64(100_000),
+    );
+    st.scan_cached_blocks(height, 1);
+    // Far enough above the scanned block that the scanned height is inside the stable region,
+    // so the lookahead is `Verify` and the rest of the catch-up is `Historic`.
+    st.wallet_mut().update_chain_tip(height + 200).unwrap();
+
+    let priorities = queue_priorities(st.wallet().conn());
+    assert!(
+        priorities.contains(&ScanPriority::Verify),
+        "view-only tip queue: {priorities:?}"
+    );
+    assert!(
+        priorities.contains(&ScanPriority::Historic),
+        "view-only tip queue: {priorities:?}"
+    );
+    assert!(
+        !priorities.contains(&ScanPriority::ChainTip),
+        "view-only tip queue: {priorities:?}"
+    );
+    assert!(
+        !priorities.contains(&ScanPriority::FoundNote),
+        "view-only tip queue: {priorities:?}"
+    );
+}
+
+#[test]
+fn spending_wallet_can_disable_anchor_retention() {
+    let activation = BlockHeight::from_u32(100_000);
+    let network = LocalNetwork {
+        nu6: Some(activation),
+        nu6_1: Some(activation),
+        nu6_2: Some(activation),
+        nu6_3: Some(activation),
+        ..TestBuilder::<(), ()>::DEFAULT_NETWORK
+    };
+    let interval = AnchorRetentionInterval::custom(NonZeroU32::new(1).unwrap());
+
+    let scan_one = |retain: bool| {
+        let mut st = TestBuilder::new()
+            .with_network(network)
+            .with_anchor_retention_interval(interval)
+            .with_data_store_factory(TestDbFactory::default())
+            .with_block_cache(BlockCache::new())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+        st.wallet_mut()
+            .db_mut()
+            .set_anchor_retention_enabled(retain);
+        let fvk = SaplingPoolTester::test_account_fvk(&st);
+        let (height, _, _) = st.generate_next_block(
+            &fvk,
+            AddressType::DefaultExternal,
+            Zatoshis::const_from_u64(100_000),
+        );
+        st.scan_cached_blocks(height, 1);
+        count(
+            st.wallet().conn(),
+            "SELECT COUNT(*) FROM sapling_tree_retained_checkpoints",
+        )
+    };
+
+    assert!(
+        scan_one(true) > 0,
+        "a one-block anchor grid retains the scanned checkpoint"
+    );
+    assert_eq!(
+        scan_one(false),
+        0,
+        "disabling anchor retention stores no durable anchor"
     );
 }

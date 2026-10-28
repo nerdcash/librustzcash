@@ -11,6 +11,9 @@ workspace.
 ## [Unreleased]
 
 ### Added
+- `WalletDb::with_anchor_retention_enabled`. Retention stays on by default, on the
+  ZIP 318 grid. Turning it off stores no durable anchor checkpoints. A view-only
+  scan writes no checkpoints either way.
 - `WalletDb::with_commitment_tree_maintenance` and
   `WalletDb::set_commitment_tree_maintenance`. `CommitmentTreeMaintenance::ViewOnly`,
   and `Automatic` when every account is view-only, make `scan_cached_blocks`
@@ -24,6 +27,10 @@ workspace.
   write-back cache. The cache is enabled by default.
 
 ### Changed
+- A view-only scan marks the scanned range `Scanned` and does not insert
+  `FoundNote` ranges. `update_chain_tip` does not pull the queue back to an
+  incomplete shard. The `Verify` lookahead stays, and the rest of the catch-up
+  is `Historic`.
 - Note-commitment tree updates performed through `WalletDb`'s Sapling, Orchard,
   and Ironwood `with_*_tree_mut` callbacks accumulate shard and checkpoint
   mutations in memory and flush them once per callback. Unchanged shards are
