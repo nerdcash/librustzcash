@@ -854,6 +854,42 @@ where
     C: ScanContinuity,
     <DbT as WalletRead>::AccountId: ConditionallySelectable + Default + Send + Sync + 'static,
 {
+    scan_cached_blocks_with_options(
+        params,
+        block_source,
+        data_db,
+        from_height,
+        from_state,
+        limit,
+        crate::scanning::ScanOptions::default(),
+    )
+}
+
+/// Scans cached blocks with [`crate::scanning::ScanOptions`].
+///
+/// [`scan_cached_blocks`] uses [`crate::scanning::ScanOptions::default`], which does not
+/// filter. [`crate::scanning::ScanOptions::spam_filter`] skips trial decryption of
+/// high-output transactions inside the mainnet sandblasting window only. Those
+/// transactions still contribute note commitments and their nullifiers are still
+/// matched, but a payment inside one of them is missed.
+#[tracing::instrument(skip(params, block_source, data_db, from_state, options))]
+#[allow(clippy::type_complexity)]
+pub fn scan_cached_blocks_with_options<ParamsT, DbT, BlockSourceT, C>(
+    params: &ParamsT,
+    block_source: &BlockSourceT,
+    data_db: &mut DbT,
+    from_height: BlockHeight,
+    from_state: &C,
+    limit: usize,
+    options: crate::scanning::ScanOptions,
+) -> Result<ScanSummary, Error<<DbT as WalletRead>::Error, BlockSourceT::Error>>
+where
+    ParamsT: consensus::Parameters + Send + 'static,
+    BlockSourceT: BlockSource,
+    DbT: WalletWrite,
+    C: ScanContinuity,
+    <DbT as WalletRead>::AccountId: ConditionallySelectable + Default + Send + Sync + 'static,
+{
     assert_eq!(from_height, from_state.block_height() + 1);
 
     let view_only = !data_db
@@ -889,6 +925,7 @@ where
     let mut scanning_keys = ScanningKeys::from_account_ufvks(account_ufvks);
     scanning_keys.extend(ScanningKeys::from_account_uivks(account_uivks));
     let mut runners = BatchRunners::<_, (), (), ()>::for_keys(100, &scanning_keys);
+    runners.set_spam_filter(options.spam_filter);
 
     block_source.with_blocks::<_, <DbT as WalletRead>::Error>(
         Some(from_height),
@@ -937,6 +974,7 @@ where
                 &spend_ids,
                 prior_block_metadata.as_ref(),
                 Some(&mut runners),
+                &options,
                 #[cfg(feature = "transparent-inputs")]
                 |address| {
                     Ok::<_, <DbT as WalletRead>::Error>(transparent_receivers.get(address).copied())

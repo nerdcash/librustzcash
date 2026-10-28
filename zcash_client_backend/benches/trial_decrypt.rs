@@ -28,7 +28,8 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::scanning::{
-    ScanningKeys, SpendIdentifiers, scan_block, trial_decrypt_compact_block,
+    ScanOptions, ScanningKeys, SpamFilter, SpendIdentifiers, scan_block_with_options,
+    trial_decrypt_compact_block_with_options,
 };
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::MAIN_NETWORK;
@@ -172,18 +173,33 @@ fn scanning_keys() -> ScanningKeys<u32, (u32, zip32::Scope)> {
     ScanningKeys::from_account_ufvks([(0u32, usk.to_unified_full_viewing_key())])
 }
 
-fn time_decrypt(keys: &ScanningKeys<u32, (u32, zip32::Scope)>, blocks: &[CompactBlock]) -> u128 {
+fn scan_options() -> ScanOptions {
+    match std::env::var("TRIAL_DECRYPT_SPAM_FILTER") {
+        Ok(value) if value == "1" => ScanOptions::default().spam_filter(SpamFilter::default()),
+        _ => ScanOptions::default(),
+    }
+}
+
+fn time_decrypt(
+    keys: &ScanningKeys<u32, (u32, zip32::Scope)>,
+    blocks: &[CompactBlock],
+    options: &ScanOptions,
+) -> u128 {
     let start = Instant::now();
     let mut decrypted = 0usize;
     for block in blocks {
-        decrypted += trial_decrypt_compact_block(&MAIN_NETWORK, block, keys)
+        decrypted += trial_decrypt_compact_block_with_options(&MAIN_NETWORK, block, keys, options)
             .unwrap_or_else(|err| panic!("trial decrypt at height {}: {err}", block.height));
     }
     black_box(decrypted);
     start.elapsed().as_nanos()
 }
 
-fn time_scan(keys: &ScanningKeys<u32, (u32, zip32::Scope)>, blocks: &[CompactBlock]) -> u128 {
+fn time_scan(
+    keys: &ScanningKeys<u32, (u32, zip32::Scope)>,
+    blocks: &[CompactBlock],
+    options: &ScanOptions,
+) -> u128 {
     // `scan_block` takes ownership. Copy the protobufs before the timer so
     // `scan_ns` is the scan itself, not the fixture clone. Trial decryption
     // borrows the same blocks.
@@ -193,12 +209,13 @@ fn time_scan(keys: &ScanningKeys<u32, (u32, zip32::Scope)>, blocks: &[CompactBlo
     let mut txs = 0usize;
     for block in owned {
         let height = block.height;
-        let scanned = scan_block::<_, _, _, std::convert::Infallible>(
+        let scanned = scan_block_with_options::<_, _, _, std::convert::Infallible>(
             &MAIN_NETWORK,
             block,
             keys,
             &spends,
             None,
+            *options,
             #[cfg(feature = "transparent-inputs")]
             |_addr| Ok(None),
         )
@@ -219,16 +236,20 @@ struct Sample {
     scan_ns: u128,
 }
 
-fn measure(keys: &ScanningKeys<u32, (u32, zip32::Scope)>, blocks: &[CompactBlock]) -> Sample {
+fn measure(
+    keys: &ScanningKeys<u32, (u32, zip32::Scope)>,
+    blocks: &[CompactBlock],
+    options: &ScanOptions,
+) -> Sample {
     // The first pass pays for key schedule setup and page faults.
-    black_box(time_decrypt(keys, blocks));
-    black_box(time_scan(keys, blocks));
+    black_box(time_decrypt(keys, blocks, options));
+    black_box(time_scan(keys, blocks, options));
 
     let mut decrypt_ns = [0u128; 3];
     let mut scan_ns = [0u128; 3];
     for i in 0..3 {
-        decrypt_ns[i] = time_decrypt(keys, blocks);
-        scan_ns[i] = time_scan(keys, blocks);
+        decrypt_ns[i] = time_decrypt(keys, blocks, options);
+        scan_ns[i] = time_scan(keys, blocks, options);
     }
     Sample {
         decrypt_ns: median(&mut decrypt_ns),
@@ -259,14 +280,25 @@ fn emit(threads: usize, label: &str, notes: u64, sample: &Sample) {
 fn main() {
     let threads = thread_count();
     let keys = scanning_keys();
+    let options = scan_options();
+    let suffix = if options.spam_filter.is_some() {
+        "+spam-filter"
+    } else {
+        ""
+    };
     let ranges: Vec<Range> = FIXTURES.iter().map(load_fixture).collect();
 
     let mut combined_blocks = Vec::new();
     let mut combined_notes = 0u64;
     let mut samples = Vec::new();
     for range in &ranges {
-        let sample = measure(&keys, &range.blocks);
-        emit(threads, &range.label, range.notes, &sample);
+        let sample = measure(&keys, &range.blocks, &options);
+        emit(
+            threads,
+            &format!("{}{suffix}", range.label),
+            range.notes,
+            &sample,
+        );
         combined_blocks.extend(range.blocks.iter().cloned());
         combined_notes += range.notes;
         samples.push(sample);
@@ -274,7 +306,12 @@ fn main() {
 
     // Combined is measured as its own pass so the ratio is not a sum of
     // independently warmed ranges.
-    let combined = measure(&keys, &combined_blocks);
-    emit(threads, "combined", combined_notes, &combined);
+    let combined = measure(&keys, &combined_blocks, &options);
+    emit(
+        threads,
+        &format!("combined{suffix}"),
+        combined_notes,
+        &combined,
+    );
     black_box(samples);
 }

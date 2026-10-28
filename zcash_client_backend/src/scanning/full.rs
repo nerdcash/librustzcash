@@ -143,6 +143,7 @@ pub(crate) struct BatchRunners<
     ironwood: TaggedIronwoodBatchRunner<IvkTag, TI>,
     #[cfg(not(feature = "orchard"))]
     orchard: PhantomData<(TO, TI)>,
+    spam_filter: Option<super::SpamFilter>,
 }
 
 impl<IvkTag, TS, TO, TI> BatchRunners<IvkTag, TS, TO, TI>
@@ -189,7 +190,13 @@ where
             ),
             #[cfg(not(feature = "orchard"))]
             orchard: PhantomData,
+            spam_filter: None,
         }
+    }
+
+    /// Enables the sandblast trial-decryption filter for subsequent transactions.
+    pub(crate) fn set_spam_filter(&mut self, spam_filter: Option<super::SpamFilter>) {
+        self.spam_filter = spam_filter;
     }
 
     /// Adds the given transaction's shielded outputs to the various batch runners,
@@ -213,6 +220,20 @@ where
         IvkTag: Copy + Send + 'static,
     {
         let zip212_enforcement = zip212_enforcement(params, height);
+        let shielded_outputs = shielded_outputs_of_transaction(&tx);
+        if self
+            .spam_filter
+            .is_some_and(|filter| filter.skips_trial_decryption(params, height, shielded_outputs))
+        {
+            return PendingBatch {
+                tx,
+                sapling_batch: None,
+                #[cfg(feature = "orchard")]
+                orchard_batch: None,
+                #[cfg(feature = "orchard")]
+                ironwood_batch: None,
+            };
+        }
 
         let sapling_batch = tx.sapling_bundle().map(|bundle| {
             self.sapling.process_outputs(
@@ -334,6 +355,24 @@ pub struct BatchResult<IvkTag> {
         HashMap<usize, DecryptedOutput<IvkTag, IronwoodDomain, <IronwoodDomain as Domain>::Memo>>,
 }
 
+fn shielded_outputs_of_transaction(tx: &Transaction) -> usize {
+    let sapling = tx
+        .sapling_bundle()
+        .map(|bundle| bundle.shielded_outputs().len())
+        .unwrap_or(0);
+    #[cfg(feature = "orchard")]
+    let orchard = tx
+        .orchard_bundle()
+        .map(|bundle| bundle.actions().len())
+        .unwrap_or(0)
+        + tx.ironwood_bundle()
+            .map(|bundle| bundle.actions().len())
+            .unwrap_or(0);
+    #[cfg(not(feature = "orchard"))]
+    let orchard = 0;
+    sapling + orchard
+}
+
 /// Decrypts a block with a set of [`ScanningKeys`].
 ///
 /// This is an inline, synchronous alternative to the batch decryption engine in the
@@ -351,6 +390,22 @@ where
     P: consensus::Parameters + Send + 'static,
     IvkTag: Copy + Send + 'static,
 {
+    decrypt_block_with_options(params, block, scanning_keys, &super::ScanOptions::default())
+}
+
+/// Decrypts a block, honoring [`super::ScanOptions`].
+///
+/// [`decrypt_block`] is this function with the default options, which do not filter.
+pub fn decrypt_block_with_options<P, AccountId, IvkTag>(
+    params: &P,
+    block: Block,
+    scanning_keys: &ScanningKeys<AccountId, IvkTag>,
+    options: &super::ScanOptions,
+) -> (BlockHeader, Vec<BatchResult<IvkTag>>)
+where
+    P: consensus::Parameters + Send + 'static,
+    IvkTag: Copy + Send + 'static,
+{
     let mut runners = BatchRunners::<_, (), (), ()>::for_keys(
         DEFAULT_BATCH_SIZE_THRESHOLD,
         #[cfg(feature = "orchard")]
@@ -359,6 +414,7 @@ where
         DEFAULT_BATCH_SIZE_THRESHOLD,
         scanning_keys,
     );
+    runners.set_spam_filter(options.spam_filter);
 
     let mined_height = block.claimed_height();
     let (header, vtx) = block.into_parts();

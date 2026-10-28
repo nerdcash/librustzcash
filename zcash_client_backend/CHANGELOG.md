@@ -11,8 +11,17 @@ workspace.
 ## [Unreleased]
 
 ### Added
-- `scanning::trial_decrypt_compact_block`, the trial-decryption phase of a
-  compact-block scan.
+- `scanning::trial_decrypt_compact_block` and
+  `scanning::trial_decrypt_compact_block_with_options`, the trial-decryption
+  phase of a compact-block scan.
+- `scanning::{SpamFilter, ScanOptions, scan_block_with_options}` and
+  `data_api::chain::scan_cached_blocks_with_options`. The sandblast filter is
+  off by default and, when enabled, skips trial decryption only for mainnet
+  transactions above its output threshold inside heights 1,710,000..=2,050,000.
+  Note commitments and nullifier matching still run. A payment inside a filtered
+  transaction is missed.
+- `scanning::full::decrypt_block_with_options`.
+- `sync::decryptor::Builder::spam_filter` (behind `sync-decryptor`).
 - `CompactChainState` and `ScanContinuity`. `scan_cached_blocks` accepts either
   a `ChainState` or the prior block's height, hash, and end-of-block note
   commitment tree sizes.
