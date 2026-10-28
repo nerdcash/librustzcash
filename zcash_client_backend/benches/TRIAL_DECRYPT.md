@@ -101,3 +101,50 @@ baseline and the parallel rows already pay for one GLV ladder per
 Reimplementing it here would fork orchard types. Sapling trial decryption still
 uses Jubjub scalar multiplication from `sapling-crypto`, which has no GLV hook
 in the dependency we link.
+
+## Sandblast spam filter
+
+`ScanOptions::spam_filter` is off by default. When set, trial decryption is
+skipped for a transaction only when the network is mainnet, the block height
+is in 1,710,000..=2,050,000, and the transaction has more than the threshold
+number of shielded outputs (Sapling outputs + Orchard actions + Ironwood
+actions). The default threshold is 50, so 51 or more are skipped and 50 are
+still decrypted. Transparent outputs are not counted.
+
+The window is the one ECC's wallet SDK used for sandblast batch sizing
+(heights 1,710,000 to 2,050,000, late June 2022 through mid-April 2023;
+<https://github.com/Electric-Coin-Company/zcash-android-wallet-sdk/issues/1365>).
+Block 1,710,000 was mined 2022-06-20. Block 2,050,000 was mined 2023-04-13,
+just before zcashd 5.5.0's ZIP 317 block construction
+(<https://zips.z.cash/zip-0317>). The Arborist sandblasting retrospective
+dates the shielded spam from 15 June 2022 until that fee change
+(<https://github.com/ZcashCommunityGrants/arboretum-notes/blob/main/AllArboristCallNotes/Sandblasting%20Retrospective%20-%20Summary.md>).
+
+Outside that closed interval the filter does nothing, including on testnet
+and regtest, so a later payroll transaction with many outputs is still
+decrypted. Note commitments and nullifier matching still run for a filtered
+transaction. A payment inside one is missed: the dust and a real note are
+not distinguishable without trial decryption.
+
+`TRIAL_DECRYPT_SPAM_FILTER=1` turns the filter on for the benchmark. The
+spam fixture (heights 1,820,000–1,820,049) is inside the window. The ordinary
+fixture is not, so its row matches the unfiltered run.
+
+`notes/sec` still divides every shielded output in the fixture by the time
+taken, including outputs the filter did not decrypt. The spam-range rate below
+is that effective throughput. Almost all of those outputs sit in transactions
+over the threshold, so the trial-decryption time falls from about 5.6s to
+about 9ms. That is not a faster scalar multiplication.
+
+| Change | Cores | Range | notes/sec | decrypt share of scan |
+| --- | --- | --- | --- | --- |
+| spam filter | 1 | spam | 4543015 | 64.7% |
+| spam filter | 2 | spam | 4549486 | 65.0% |
+| spam filter | 4 | spam | 4583089 | 65.0% |
+| spam filter | 1 | ordinary | 9068 | 98.8% |
+| spam filter | 4 | ordinary | 9104 | 99.6% |
+
+The core count no longer matters on the spam range: the remaining outputs are
+below the parallel-split threshold. The decrypt share falls because commitment
+updates for the skipped outputs are now a visible fraction of the scan.
+Ordinary blocks are outside the window and stay near 9,100 notes/sec.

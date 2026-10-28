@@ -21,7 +21,7 @@ use zcash_note_encryption::{BatchDomain, Domain, ShieldedOutput};
 use zcash_primitives::transaction::TxId;
 use zcash_protocol::{
     ShieldedPool,
-    consensus::{self, BlockHeight},
+    consensus::{self, BlockHeight, NetworkType},
 };
 use zip32::Scope;
 
@@ -1067,7 +1067,104 @@ impl<E: std::error::Error + 'static> std::error::Error for ScanBlockError<E> {
     }
 }
 
-pub use compact::trial_decrypt_compact_block;
+pub use compact::{trial_decrypt_compact_block, trial_decrypt_compact_block_with_options};
+
+/// First mainnet height of the sandblasting window used by [`SpamFilter`], inclusive.
+///
+/// [ECC's wallet SDK] recorded this window as the period when sandblasting dominated
+/// scan cost: late June 2022 through mid-April 2023, heights 1,710,000 to 2,050,000.
+/// Block 1,710,000 was mined 2022-06-20 (NU5, block 1,687,104, was mined 2022-05-31).
+/// Block 2,050,000 was mined 2023-04-13, shortly before zcashd 5.5.0 shipped the ZIP 317
+/// block-construction rules at the end of April 2023. The [Arborist retrospective]
+/// dates the shielded sandblast from 15 June 2022 until that fee change took effect.
+///
+/// [ECC's wallet SDK]: https://github.com/Electric-Coin-Company/zcash-android-wallet-sdk/issues/1365
+/// [ZIP 317]: https://zips.z.cash/zip-0317
+/// [Arborist retrospective]: https://github.com/ZcashCommunityGrants/arboretum-notes/blob/main/AllArboristCallNotes/Sandblasting%20Retrospective%20-%20Summary.md
+pub const MAINNET_SANDBLAST_START_HEIGHT: u32 = 1_710_000;
+
+/// Last mainnet height of the sandblasting window used by [`SpamFilter`], inclusive.
+///
+/// See [`MAINNET_SANDBLAST_START_HEIGHT`] for the sources. Heights outside this closed
+/// interval are never filtered: a later payroll transaction may legitimately have many
+/// shielded outputs.
+pub const MAINNET_SANDBLAST_END_HEIGHT: u32 = 2_050_000;
+
+/// Opt-in skip of trial decryption for high-output transactions in the 2022–2023
+/// mainnet sandblast.
+///
+/// The filter is off unless a caller sets [`ScanOptions::spam_filter`]. When it is on,
+/// a transaction is not trial-decrypted only if all of the following hold:
+///
+/// * the network is mainnet;
+/// * the block height is in [`MAINNET_SANDBLAST_START_HEIGHT`]..=[`MAINNET_SANDBLAST_END_HEIGHT`];
+/// * the transaction has more shielded outputs than [`Self::output_threshold`].
+///
+/// Shielded outputs are Sapling outputs plus Orchard actions plus Ironwood actions.
+/// Transparent outputs are not counted, because they are not trial-decrypted.
+///
+/// Note-commitment tree updates and nullifier matching still run. A payment carried
+/// inside a filtered transaction is missed, and the wallet will not learn about it
+/// from this scan. That is the tradeoff: the sandblasting transactions were almost
+/// entirely dust created to inflate trial-decryption cost, but a real note inside one
+/// of them is indistinguishable from that dust without decrypting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpamFilter {
+    /// Skip trial decryption when the shielded-output count is strictly greater than this.
+    ///
+    /// [`SpamFilter::default`] uses 50, so a transaction with 51 or more shielded outputs
+    /// is skipped and a transaction with 50 is still decrypted.
+    pub output_threshold: usize,
+}
+
+impl Default for SpamFilter {
+    fn default() -> Self {
+        Self {
+            output_threshold: 50,
+        }
+    }
+}
+
+impl SpamFilter {
+    /// Returns whether trial decryption of this transaction must be skipped.
+    ///
+    /// False outside mainnet and outside the sandblasting height window, regardless of
+    /// how many outputs the transaction has.
+    pub fn skips_trial_decryption<P: consensus::Parameters>(
+        &self,
+        params: &P,
+        height: BlockHeight,
+        shielded_outputs: usize,
+    ) -> bool {
+        params.network_type() == NetworkType::Main
+            && height >= BlockHeight::from(MAINNET_SANDBLAST_START_HEIGHT)
+            && height <= BlockHeight::from(MAINNET_SANDBLAST_END_HEIGHT)
+            && shielded_outputs > self.output_threshold
+    }
+}
+
+/// Options for compact-block scanning.
+///
+/// [`Default`] leaves every option off, which is what [`scan_block`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanOptions {
+    /// When set, high-output transactions inside the mainnet sandblasting window are
+    /// not trial-decrypted. See [`SpamFilter`].
+    pub spam_filter: Option<SpamFilter>,
+}
+
+impl ScanOptions {
+    /// Enables the sandblast filter with the given threshold policy.
+    pub fn spam_filter(mut self, filter: SpamFilter) -> Self {
+        self.spam_filter = Some(filter);
+        self
+    }
+}
+
+/// Number of shielded outputs a compact transaction would trial-decrypt.
+pub(crate) fn compact_tx_shielded_outputs(tx: &crate::proto::compact_formats::CompactTx) -> usize {
+    tx.outputs.len() + tx.actions.len() + tx.ironwood_actions.len()
+}
 
 /// Scans a [`CompactBlock`] with a set of [`ScanningKeys`].
 ///
@@ -1094,6 +1191,43 @@ where
     AccountId: Default + Eq + Hash + ConditionallySelectable + Send + Sync + 'static,
     IvkTag: Copy + std::hash::Hash + Eq + Send + 'static,
 {
+    scan_block_with_options(
+        params,
+        block,
+        scanning_keys,
+        spend_ids,
+        prior_block_metadata,
+        ScanOptions::default(),
+        #[cfg(feature = "transparent-inputs")]
+        find_account_for_address,
+    )
+}
+
+/// Scans a compact block with [`ScanOptions`].
+///
+/// [`scan_block`] is this function with [`ScanOptions::default`], which does not filter.
+/// [`ScanOptions::spam_filter`] can skip trial decryption of high-output transactions
+/// inside the mainnet sandblasting window. Note-commitment updates and nullifier
+/// matching still run, and a payment inside a filtered transaction is missed.
+pub fn scan_block_with_options<P, AccountId, IvkTag, E>(
+    params: &P,
+    block: CompactBlock,
+    scanning_keys: &ScanningKeys<AccountId, IvkTag>,
+    spend_ids: &SpendIdentifiers<AccountId>,
+    prior_block_metadata: Option<&BlockMetadata>,
+    options: ScanOptions,
+    #[cfg(feature = "transparent-inputs")] find_account_for_address: impl Fn(
+        &TransparentAddress,
+    ) -> Result<
+        Option<(AccountId, Option<TransparentKeyScope>)>,
+        E,
+    >,
+) -> Result<ScannedBlock<AccountId>, ScanBlockError<E>>
+where
+    P: consensus::Parameters + Send + 'static,
+    AccountId: Default + Eq + Hash + ConditionallySelectable + Send + Sync + 'static,
+    IvkTag: Copy + std::hash::Hash + Eq + Send + 'static,
+{
     compact::scan_block_with_runners::<_, _, _, (), (), (), _>(
         params,
         block,
@@ -1101,6 +1235,7 @@ where
         spend_ids,
         prior_block_metadata,
         None,
+        &options,
         #[cfg(feature = "transparent-inputs")]
         find_account_for_address,
     )
@@ -1503,6 +1638,32 @@ mod tests {
     use std::{sync::Arc, thread::spawn};
 
     use super::ScanningKeys;
+
+    #[test]
+    fn spam_filter_is_mainnet_sandblast_window_only() {
+        use zcash_protocol::consensus::{BlockHeight, Network};
+
+        let filter = super::SpamFilter::default();
+        let inside = BlockHeight::from(super::MAINNET_SANDBLAST_START_HEIGHT + 100_000);
+        assert!(filter.skips_trial_decryption(&Network::MainNetwork, inside, 51));
+        assert!(!filter.skips_trial_decryption(&Network::MainNetwork, inside, 50));
+        assert!(!filter.skips_trial_decryption(
+            &Network::MainNetwork,
+            BlockHeight::from(super::MAINNET_SANDBLAST_START_HEIGHT - 1),
+            51,
+        ));
+        assert!(filter.skips_trial_decryption(
+            &Network::MainNetwork,
+            BlockHeight::from(super::MAINNET_SANDBLAST_END_HEIGHT),
+            51,
+        ));
+        assert!(!filter.skips_trial_decryption(
+            &Network::MainNetwork,
+            BlockHeight::from(super::MAINNET_SANDBLAST_END_HEIGHT + 1),
+            51,
+        ));
+        assert!(!filter.skips_trial_decryption(&Network::TestNetwork, inside, 10_000));
+    }
 
     #[test]
     fn arc_scanning_keys() {
