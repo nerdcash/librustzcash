@@ -706,11 +706,14 @@ where
             anchor_retention,
             PRUNING_DEPTH as usize,
         );
-        let sapling_subtrees = build_subtrees::<_, SAPLING_SHARD_HEIGHT>(
-            sapling_start,
-            &mut sapling_commitments,
-            CHUNK_SIZE,
-        );
+        let sapling_subtrees = {
+            let _span = tracing::info_span!("build_subtrees_sapling").entered();
+            build_subtrees::<_, SAPLING_SHARD_HEIGHT>(
+                sapling_start,
+                &mut sapling_commitments,
+                CHUNK_SIZE,
+            )
+        };
 
         #[cfg(feature = "orchard")]
         let mut orchard_commitments = orchard_commitments;
@@ -726,11 +729,10 @@ where
             PRUNING_DEPTH as usize,
         );
         #[cfg(feature = "orchard")]
-        let orchard_subtrees = build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
-            orchard_start,
-            &mut orchard_commitments,
-            CHUNK_SIZE,
-        );
+        let orchard_subtrees = {
+            let _span = tracing::info_span!("build_subtrees_orchard").entered();
+            build_orchard_subtrees(orchard_start, &mut orchard_commitments, CHUNK_SIZE)
+        };
 
         // The Ironwood note commitment tree is Orchard-shaped and so uses the Orchard shard
         // height, but is a distinct pool with its own tree.
@@ -748,11 +750,10 @@ where
             PRUNING_DEPTH as usize,
         );
         #[cfg(feature = "orchard")]
-        let ironwood_subtrees = build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
-            ironwood_start,
-            &mut ironwood_commitments,
-            CHUNK_SIZE,
-        );
+        let ironwood_subtrees = {
+            let _span = tracing::info_span!("build_subtrees_ironwood").entered();
+            build_orchard_subtrees(ironwood_start, &mut ironwood_commitments, CHUNK_SIZE)
+        };
 
         // Ensure that we have the same set of checkpoints across all trees. Each tree must gain a
         // checkpoint at every height that is checkpointed in any of the other trees, so the set of
@@ -1650,6 +1651,174 @@ where
         .collect()
 }
 
+/// Builds Orchard-shaped subtrees.
+///
+/// Parents at one level are hashed together: the Sinsemilla generators are cached, and the
+/// pairs run in parallel. The located tree, retention flags, and checkpoint map match
+/// [`build_subtrees`].
+#[cfg(feature = "orchard")]
+fn build_orchard_subtrees(
+    start_position: Position,
+    commitments: &mut [Option<(orchard::tree::MerkleHashOrchard, Retention<BlockHeight>)>],
+    chunk_size: usize,
+) -> Vec<(
+    LocatedPrunableTree<orchard::tree::MerkleHashOrchard>,
+    BTreeMap<BlockHeight, Position>,
+)> {
+    commitments
+        .par_chunks_mut(chunk_size)
+        .enumerate()
+        .filter_map(|(i, chunk)| {
+            let start = start_position + (i * chunk_size) as u64;
+            let end = start + chunk.len() as u64;
+            build_orchard_chunk(start..end, ORCHARD_SHARD_HEIGHT.into(), chunk)
+        })
+        .collect()
+}
+
+/// Identity of a leaf or of a folded parent recorded while the structure is built.
+#[cfg(feature = "orchard")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecHash(u32);
+
+#[cfg(feature = "orchard")]
+struct CombineLog {
+    next_id: u32,
+    /// `(child_level, left_id, right_id, result_id)`, in call order.
+    combines: Vec<(u8, u32, u32, u32)>,
+}
+
+#[cfg(feature = "orchard")]
+thread_local! {
+    static ORCHARD_COMBINES: std::cell::RefCell<CombineLog> = std::cell::RefCell::new(CombineLog {
+        next_id: 0,
+        combines: Vec::new(),
+    });
+}
+
+#[cfg(feature = "orchard")]
+impl Hashable for RecHash {
+    fn empty_leaf() -> Self {
+        // `from_iter` folds real leaves. An empty leaf here would mean a hash was invented.
+        RecHash(u32::MAX)
+    }
+
+    fn combine(level: incrementalmerkletree::Level, a: &Self, b: &Self) -> Self {
+        ORCHARD_COMBINES.with(|slot| {
+            let mut state = slot.borrow_mut();
+            let id = state.next_id;
+            state.next_id += 1;
+            state.combines.push((u8::from(level), a.0, b.0, id));
+            RecHash(id)
+        })
+    }
+
+    fn empty_root(_level: incrementalmerkletree::Level) -> Self {
+        // Do not record a combine. `from_iter` builds Nil nodes instead of empty roots.
+        RecHash(u32::MAX)
+    }
+}
+
+/// One chunk of an Orchard or Ironwood note-commitment batch.
+///
+/// The shape comes from [`shardtree::LocatedTree::from_iter`] over placeholder hashes, which
+/// records every fold. Those folds are then evaluated one level at a time.
+#[cfg(feature = "orchard")]
+fn build_orchard_chunk(
+    position_range: std::ops::Range<Position>,
+    prune_below: incrementalmerkletree::Level,
+    leaves: &mut [Option<(orchard::tree::MerkleHashOrchard, Retention<BlockHeight>)>],
+) -> Option<(
+    LocatedPrunableTree<orchard::tree::MerkleHashOrchard>,
+    BTreeMap<BlockHeight, Position>,
+)> {
+    use orchard::tree::MerkleHashOrchard;
+    use shardtree::{LocatedTree, Node, Tree};
+    use std::ops::Deref;
+    use std::sync::Arc;
+
+    let leaf_count = leaves.len();
+    if leaf_count == 0 {
+        return None;
+    }
+
+    let mut leaf_hashes = Vec::with_capacity(leaf_count);
+    let mut placeholders = Vec::with_capacity(leaf_count);
+    for (index, slot) in leaves.iter_mut().enumerate() {
+        let (hash, retention) = slot.take().expect("commitment slot is populated");
+        leaf_hashes.push(hash);
+        placeholders.push((
+            RecHash(u32::try_from(index).expect("chunk fits in u32")),
+            retention,
+        ));
+    }
+
+    ORCHARD_COMBINES.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.combines.clear();
+        state.next_id = u32::try_from(leaf_count).expect("chunk fits in u32");
+    });
+    let built = LocatedTree::from_iter(position_range, prune_below, placeholders.into_iter())?;
+    let combines = ORCHARD_COMBINES.with(|slot| std::mem::take(&mut slot.borrow_mut().combines));
+
+    let mut hashes = leaf_hashes;
+    hashes.resize(
+        hashes.len() + combines.len(),
+        MerkleHashOrchard::empty_leaf(),
+    );
+    if !combines.is_empty() {
+        let max_level = combines
+            .iter()
+            .map(|(level, _, _, _)| *level)
+            .max()
+            .unwrap();
+        for level in 0..=max_level {
+            let batch = combines
+                .iter()
+                .filter(|(combine_level, _, _, _)| *combine_level == level)
+                .copied()
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                continue;
+            }
+            let hashed = super::orchard_merkle::combine_merkle_batch(
+                incrementalmerkletree::Level::from(level),
+                batch
+                    .iter()
+                    .map(|(_, left, right, _)| (&hashes[*left as usize], &hashes[*right as usize])),
+            );
+            for ((_, _, _, result), hash) in batch.into_iter().zip(hashed) {
+                hashes[result as usize] = hash;
+            }
+        }
+    }
+    fn map_tree(
+        tree: &Tree<Option<Arc<RecHash>>, (RecHash, shardtree::RetentionFlags)>,
+        hashes: &[orchard::tree::MerkleHashOrchard],
+    ) -> Tree<
+        Option<Arc<orchard::tree::MerkleHashOrchard>>,
+        (orchard::tree::MerkleHashOrchard, shardtree::RetentionFlags),
+    > {
+        match tree.deref() {
+            Node::Parent { ann, left, right } => Tree::parent(
+                ann.as_ref().map(|id| Arc::new(hashes[id.0 as usize])),
+                map_tree(left, hashes),
+                map_tree(right, hashes),
+            ),
+            Node::Leaf { value: (id, flags) } => Tree::leaf((hashes[id.0 as usize], *flags)),
+            Node::Nil => Tree::empty(),
+        }
+    }
+
+    let root_addr = built.subtree.root_addr();
+    let checkpoints = built.checkpoints;
+    let root = map_tree(&built.subtree.take_root(), &hashes);
+    let subtree = LocatedTree::from_parts(root_addr, root).unwrap_or_else(|_| {
+        panic!("batched orchard subtree kept the address produced by from_iter")
+    });
+    Some((subtree, checkpoints))
+}
+
 /// Produces an overall set of checkpoints from a list of subtrees.
 #[cfg(feature = "orchard")]
 pub fn checkpoint_positions<H>(
@@ -1986,14 +2155,17 @@ where
     );
     // We insert the frontier with `Checkpoint` retention because we need to be
     // able to truncate the tree back to this point.
-    tree.insert_frontier(
-        frontier.clone(),
-        Retention::Checkpoint {
-            id: frontier_height,
-            marking: Marking::Reference,
-        },
-    )?;
-    retain_anchor_checkpoint(tree, anchor_retention, frontier_height)?;
+    {
+        let _span = tracing::info_span!("update_tree_frontier", protocol).entered();
+        tree.insert_frontier(
+            frontier.clone(),
+            Retention::Checkpoint {
+                id: frontier_height,
+                marking: Marking::Reference,
+            },
+        )?;
+        retain_anchor_checkpoint(tree, anchor_retention, frontier_height)?;
+    }
 
     // One `insert_tree` for the whole batch: each parallel chunk is united with the others
     // first, so each shard is written once and checkpoints are pruned once. Retention is
@@ -2007,7 +2179,12 @@ where
         batch_checkpoints.extend(checkpoints);
         parts.push(subtree);
     }
-    if let Some(united) = unite_located_trees(parts)? {
+    let united = {
+        let _span = tracing::info_span!("update_tree_unite", protocol).entered();
+        unite_located_trees(parts)?
+    };
+    if let Some(united) = united {
+        let _span = tracing::info_span!("update_tree_insert", protocol).entered();
         tree.insert_tree(united, batch_checkpoints)?;
     }
 
@@ -2078,6 +2255,81 @@ mod tests {
             spend_tracking_floor(Some(h(600_000)), h(500_000), Some(h(510_000))),
             None
         );
+    }
+
+    /// A batched Orchard build matches `from_iter`, including unaligned ranges and every
+    /// retention flag that changes whether a parent is folded.
+    #[cfg(feature = "orchard")]
+    #[test]
+    fn orchard_batch_build_matches_scalar_from_iter() {
+        use incrementalmerkletree::{Marking, Position, Retention};
+        use orchard::tree::MerkleHashOrchard;
+
+        use super::{build_orchard_subtrees, build_subtrees};
+
+        fn leaf(index: u64) -> MerkleHashOrchard {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&index.to_le_bytes());
+            Option::from(MerkleHashOrchard::from_bytes(&bytes)).expect("canonical field element")
+        }
+
+        fn retention(index: u64) -> Retention<BlockHeight> {
+            match index % 11 {
+                0 => Retention::Checkpoint {
+                    id: BlockHeight::from_u32(u32::try_from(index).unwrap_or(u32::MAX)),
+                    marking: Marking::None,
+                },
+                1 => Retention::Marked,
+                2 => Retention::Reference,
+                3 => Retention::Checkpoint {
+                    id: BlockHeight::from_u32(50_000 + u32::try_from(index).unwrap_or(0)),
+                    marking: Marking::Marked,
+                },
+                4 => Retention::Checkpoint {
+                    id: BlockHeight::from_u32(100_000 + u32::try_from(index).unwrap_or(0)),
+                    marking: Marking::Reference,
+                },
+                _ => Retention::Ephemeral,
+            }
+        }
+
+        fn compare(start: u64, len: u64, chunk: usize) {
+            let leaves = (0..len)
+                .map(|offset| Some((leaf(start + offset), retention(offset))))
+                .collect::<Vec<_>>();
+            let mut scalar = leaves.clone();
+            let mut batched = leaves;
+            let position = Position::from(start);
+            let scalar = build_subtrees::<MerkleHashOrchard, 16>(position, &mut scalar, chunk);
+            let batched = build_orchard_subtrees(position, &mut batched, chunk);
+            assert_eq!(
+                scalar.len(),
+                batched.len(),
+                "start {start} len {len} chunk {chunk}"
+            );
+            for (scalar, batched) in scalar.into_iter().zip(batched) {
+                assert_eq!(scalar.0.root_addr(), batched.0.root_addr());
+                assert_eq!(scalar.0.root(), batched.0.root());
+                assert_eq!(scalar.1, batched.1);
+            }
+        }
+
+        for (start, len, chunk) in [
+            (0, 1, 8),
+            (0, 2, 8),
+            (0, 3, 8),
+            (1, 1, 8),
+            (1, 7, 8),
+            (3, 5, 4),
+            (5, 13, 4),
+            (0, 64, 16),
+            (7, 64, 10),
+            (100, 80, 32),
+            (65_530, 20, 8),
+            (0, 300, 64),
+        ] {
+            compare(start, len, chunk);
+        }
     }
 
     /// Extending the contiguous frontier skips inserts below the trailing retention

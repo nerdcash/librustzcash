@@ -5198,28 +5198,6 @@ pub(crate) fn put_block(
     #[cfg(feature = "orchard")] ironwood_commitment_tree_size: u32,
     #[cfg(feature = "orchard")] ironwood_action_count: u32,
 ) -> Result<(), SqliteClientError> {
-    let block_hash_data = conn
-        .query_row(
-            "SELECT hash FROM blocks WHERE height = ?",
-            [u32::from(block_height)],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()?;
-
-    // Ensure that in the case of an upsert, we don't overwrite block data
-    // with information for a block with a different hash.
-    if let Some(bytes) = block_hash_data {
-        let expected_hash = BlockHash::try_from_slice(&bytes).ok_or_else(|| {
-            SqliteClientError::CorruptedData(format!(
-                "Invalid block hash at height {}",
-                u32::from(block_height)
-            ))
-        })?;
-        if expected_hash != block_hash {
-            return Err(SqliteClientError::BlockConflict(block_height));
-        }
-    }
-
     let mut stmt_upsert_block = conn.prepare_cached(
         "INSERT INTO blocks (
             height,
@@ -5253,7 +5231,8 @@ pub(crate) fn put_block(
             orchard_commitment_tree_size = :orchard_commitment_tree_size,
             orchard_action_count = :orchard_action_count,
             ironwood_commitment_tree_size = :ironwood_commitment_tree_size,
-            ironwood_action_count = :ironwood_action_count",
+            ironwood_action_count = :ironwood_action_count
+        WHERE hash = :hash",
     )?;
 
     #[cfg(not(feature = "orchard"))]
@@ -5265,7 +5244,7 @@ pub(crate) fn put_block(
     #[cfg(not(feature = "orchard"))]
     let ironwood_action_count: Option<u32> = None;
 
-    stmt_upsert_block.execute(named_params![
+    let changed = stmt_upsert_block.execute(named_params![
         ":height": u32::from(block_height),
         ":hash": &block_hash.0[..],
         ":block_time": block_time,
@@ -5276,26 +5255,51 @@ pub(crate) fn put_block(
         ":ironwood_commitment_tree_size": ironwood_commitment_tree_size,
         ":ironwood_action_count": ironwood_action_count,
     ])?;
+    // A conflicting height whose stored hash differs from this block makes the `DO UPDATE`
+    // `WHERE` fail, so SQLite reports no change. Re-read that row so a corrupt hash is still
+    // distinguished from a genuine chain conflict. The matching-hash path updates in place.
+    if changed == 0 {
+        let bytes = conn.query_row(
+            "SELECT hash FROM blocks WHERE height = ?",
+            [u32::from(block_height)],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let expected_hash = BlockHash::try_from_slice(&bytes).ok_or_else(|| {
+            SqliteClientError::CorruptedData(format!(
+                "Invalid block hash at height {}",
+                u32::from(block_height)
+            ))
+        })?;
+        if expected_hash != block_hash {
+            return Err(SqliteClientError::BlockConflict(block_height));
+        }
+    }
 
-    // If we now have a block corresponding to a received transparent output that had not been
-    // scanned at the time the UTXO was discovered, update the associated transaction record to
-    // refer to that block.
-    //
-    // NOTE: There's a small data corruption hazard here, in that we're relying exclusively upon
-    // the block height to associate the transaction to the block. This is because CompactBlock
-    // values only contain CompactTx entries for transactions that contain shielded inputs or
-    // outputs, and the GetAddressUtxosReply data does not contain the block hash. As such, it's
-    // necessary to ensure that any chain rollback to below the received height causes that height
-    // to be set to NULL.
-    let mut stmt_update_transaction_block_reference = conn.prepare_cached(
+    Ok(())
+}
+
+/// Points transactions mined in `[start, end)` at the block row of that height.
+///
+/// Scanning used to run this update once per block. One statement for the batch writes the same
+/// rows: `block` becomes `mined_height` for every transaction mined in the range. Callers invoke
+/// it after the block rows exist, because `transactions.block` refers to `blocks.height`.
+///
+/// Compact-block scanning and transparent UTXO discovery do not always share a block hash, so the
+/// link is by height. A rollback below the received height has to clear that height.
+pub(crate) fn link_mined_transactions(
+    conn: &rusqlite::Transaction<'_>,
+    start: BlockHeight,
+    end: BlockHeight,
+) -> Result<(), SqliteClientError> {
+    conn.prepare_cached(
         "UPDATE transactions
-         SET block = :height
-         WHERE mined_height = :height",
-    )?;
-
-    stmt_update_transaction_block_reference
-        .execute(named_params![":height": u32::from(block_height),])?;
-
+         SET block = mined_height
+         WHERE mined_height >= :start AND mined_height < :end",
+    )?
+    .execute(named_params![
+        ":start": u32::from(start),
+        ":end": u32::from(end),
+    ])?;
     Ok(())
 }
 

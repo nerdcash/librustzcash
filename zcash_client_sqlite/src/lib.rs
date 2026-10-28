@@ -567,6 +567,10 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
     /// Construct a [`WalletDb`] instance that connects to the wallet database stored at the
     /// specified path.
     ///
+    /// The connection uses WAL journaling and `synchronous = NORMAL`, so a committed batch
+    /// survives a process crash. A power loss can still drop the last commit. The page cache is
+    /// 64 MiB, which is enough for a historic scan's block rows and note-commitment frontier.
+    ///
     /// ## Parameters
     /// - `path`: The path to the SQLite database used to store wallet data.
     /// - `params`: Parameters associated with the Zcash network that the wallet will connect to.
@@ -581,6 +585,18 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
     ) -> Result<Self, rusqlite::Error> {
         rusqlite::Connection::open(path).and_then(move |conn| {
             rusqlite::vtab::array::load_module(&conn)?;
+            // Historic scans write tens of thousands of block rows and rewrite the note
+            // commitment frontier in one transaction per batch. WAL with NORMAL sync keeps
+            // those commits durable across a process crash and skips a full fsync of the
+            // rollback journal on every batch. The page cache stays large enough for the
+            // working set of a sync.
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = NORMAL;
+                 PRAGMA temp_store = MEMORY;
+                 PRAGMA cache_size = -65536;
+                 PRAGMA mmap_size = 268435456;",
+            )?;
             Ok(WalletDb {
                 conn,
                 params,
@@ -2625,6 +2641,11 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             .transpose()?
             .flatten();
 
+        // Captured before `blocks` moves. The link runs after the block rows are stored.
+        let mined_link = blocks
+            .last()
+            .map(|block| (from_state.block_height() + 1, block.height() + 1));
+
         ll::wallet::put_blocks::<_, SqliteClientError, commitment_tree::Error>(
             self,
             #[cfg(feature = "transparent-inputs")]
@@ -2633,7 +2654,12 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             blocks,
             anchor_retention.as_ref(),
         )
-        .map_err(SqliteClientError::from)
+        .map_err(SqliteClientError::from)?;
+
+        if let Some((start, end)) = mined_link {
+            wallet::link_mined_transactions(self.conn.0, start, end)?;
+        }
+        Ok(())
     }
 
     fn put_received_transparent_utxo(

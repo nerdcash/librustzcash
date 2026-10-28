@@ -73,6 +73,7 @@ subtle.workspace = true
 bls12_381.workspace = true
 group.workspace = true
 orchard.workspace = true
+sinsemilla = { version = "0.2.0", optional = true }
 sapling.workspace = true
 
 # - Transparent protocol
@@ -211,7 +212,7 @@ spend-index = ["transparent-inputs"]
 ## `zcash_primitives`, which always requires it because every v5+ transaction
 ## carries an Orchard bundle type); this feature gates the wallet's
 ## Orchard note-handling code, not the crate linkage.
-orchard = ["dep:pasta_curves", "zcash_keys/orchard"]
+orchard = ["dep:pasta_curves", "dep:sinsemilla", "zcash_keys/orchard"]
 
 ## Enables compatibility with legacy zcashd wallet data
 zcashd-compat = ["zcash_keys/zcashd-compat"]
