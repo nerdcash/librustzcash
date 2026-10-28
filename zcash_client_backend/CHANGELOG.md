@@ -23,6 +23,8 @@ workspace.
   notes, spends, and block metadata without updating a note commitment tree.
 - `WalletWrite::rewind_view_only`, which drops wallet rows above a block
   identified by height and hash and requeues that range as `Historic`.
+- `Balance::viewed_value`, the observed total of notes a view-only wallet
+  decrypted and has not seen spent. Spending wallets leave it at zero.
 - `WalletWrite::import_account_uivk`, for importing an account from a
   [`UnifiedIncomingViewingKey`].
 - `ScanningKeys::from_account_uivks` and `ScanningKeys::extend`, so wallets can

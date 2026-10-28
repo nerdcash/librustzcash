@@ -2730,6 +2730,7 @@ pub(crate) fn get_wallet_snapshot<P: consensus::Parameters>(
     tx: &rusqlite::Transaction,
     params: &P,
     confirmations_policy: ConfirmationsPolicy,
+    view_only: bool,
 ) -> Result<Option<crate::WalletSnapshot<AccountUuid>>, SqliteClientError> {
     let chain_tip_height = match chain_tip_height(tx)? {
         Some(h) => h,
@@ -2766,11 +2767,13 @@ pub(crate) fn get_wallet_snapshot<P: consensus::Parameters>(
         confirmations_policy: ConfirmationsPolicy,
         account_balances: &mut HashMap<AccountUuid, AccountBalance>,
         protocol: ShieldedPool,
+        view_only: bool,
         with_pool_balance: F,
     ) -> Result<(), SqliteClientError>
     where
         F: Fn(
             &mut AccountBalance,
+            Zatoshis,
             Zatoshis,
             Zatoshis,
             Zatoshis,
@@ -2923,22 +2926,27 @@ pub(crate) fn get_wallet_snapshot<P: consensus::Parameters>(
                 change_pending_confirmation,
                 value_pending_spendability,
                 uneconomic_value,
+                viewed_value,
             ) = {
                 let zero = Zatoshis::ZERO;
-                if value <= zip317::MARGINAL_FEE {
-                    (zero, zero, zero, zero, value)
+                if view_only {
+                    // Observed notes, spent ones already excluded by the query. Spendable stays
+                    // zero: there is no witness. Dust is still part of the observed total.
+                    (zero, zero, zero, zero, zero, value)
+                } else if value <= zip317::MARGINAL_FEE {
+                    (zero, zero, zero, zero, value, zero)
                 } else if is_spendable && is_locked {
                     // Only notes that would otherwise be spendable are counted as locked; a
                     // locked note that is still pending confirmations is deliberately reported
                     // in the pending buckets below, since locking only matters once the note
                     // would enter selection. This mirrors the transparent balance computation.
-                    (zero, value, zero, zero, zero)
+                    (zero, value, zero, zero, zero, zero)
                 } else if is_spendable {
-                    (value, zero, zero, zero, zero)
+                    (value, zero, zero, zero, zero, zero)
                 } else if is_pending_change {
-                    (zero, zero, value, zero, zero)
+                    (zero, zero, value, zero, zero, zero)
                 } else {
-                    (zero, zero, zero, value, zero)
+                    (zero, zero, zero, value, zero, zero)
                 }
             };
 
@@ -2950,6 +2958,7 @@ pub(crate) fn get_wallet_snapshot<P: consensus::Parameters>(
                     change_pending_confirmation,
                     value_pending_spendability,
                     uneconomic_value,
+                    viewed_value,
                 )?;
             }
         }
@@ -2967,18 +2976,21 @@ pub(crate) fn get_wallet_snapshot<P: consensus::Parameters>(
             confirmations_policy,
             &mut account_balances,
             ShieldedPool::Orchard,
+            view_only,
             |balances,
              spendable_value,
              locked_value,
              change_pending_confirmation,
              value_pending_spendability,
-             uneconomic_value| {
+             uneconomic_value,
+             viewed_value| {
                 balances.with_orchard_balance_mut::<_, SqliteClientError>(|bal| {
                     bal.add_spendable_value(spendable_value)?;
                     bal.add_locked_value(locked_value)?;
                     bal.add_pending_change_value(change_pending_confirmation)?;
                     bal.add_pending_spendable_value(value_pending_spendability)?;
                     bal.add_uneconomic_value(uneconomic_value)?;
+                    bal.add_viewed_value(viewed_value)?;
                     Ok(())
                 })
             },
@@ -2997,18 +3009,21 @@ pub(crate) fn get_wallet_snapshot<P: consensus::Parameters>(
             confirmations_policy,
             &mut account_balances,
             ShieldedPool::Ironwood,
+            view_only,
             |balances,
              spendable_value,
              locked_value,
              change_pending_confirmation,
              value_pending_spendability,
-             uneconomic_value| {
+             uneconomic_value,
+             viewed_value| {
                 balances.with_ironwood_balance_mut::<_, SqliteClientError>(|bal| {
                     bal.add_spendable_value(spendable_value)?;
                     bal.add_locked_value(locked_value)?;
                     bal.add_pending_change_value(change_pending_confirmation)?;
                     bal.add_pending_spendable_value(value_pending_spendability)?;
                     bal.add_uneconomic_value(uneconomic_value)?;
+                    bal.add_viewed_value(viewed_value)?;
                     Ok(())
                 })
             },
@@ -3025,18 +3040,21 @@ pub(crate) fn get_wallet_snapshot<P: consensus::Parameters>(
         confirmations_policy,
         &mut account_balances,
         ShieldedPool::Sapling,
+        view_only,
         |balances,
          spendable_value,
          locked_value,
          change_pending_confirmation,
          value_pending_spendability,
-         uneconomic_value| {
+         uneconomic_value,
+         viewed_value| {
             balances.with_sapling_balance_mut::<_, SqliteClientError>(|bal| {
                 bal.add_spendable_value(spendable_value)?;
                 bal.add_locked_value(locked_value)?;
                 bal.add_pending_change_value(change_pending_confirmation)?;
                 bal.add_pending_spendable_value(value_pending_spendability)?;
                 bal.add_uneconomic_value(uneconomic_value)?;
+                bal.add_viewed_value(viewed_value)?;
                 Ok(())
             })
         },
@@ -3097,6 +3115,7 @@ pub(crate) fn get_wallet_summary<P: consensus::Parameters>(
     params: &P,
     confirmations_policy: ConfirmationsPolicy,
     progress: &impl ProgressEstimator,
+    view_only: bool,
 ) -> Result<Option<WalletSummary<AccountUuid>>, SqliteClientError> {
     let chain_tip_height = match chain_tip_height(tx)? {
         Some(h) => h,
@@ -3163,8 +3182,10 @@ pub(crate) fn get_wallet_summary<P: consensus::Parameters>(
         None => return Ok(None),
     };
 
-    Ok(get_wallet_snapshot(tx, params, confirmations_policy)?
-        .map(|snapshot| snapshot.into_wallet_summary(progress)))
+    Ok(
+        get_wallet_snapshot(tx, params, confirmations_policy, view_only)?
+            .map(|snapshot| snapshot.into_wallet_summary(progress)),
+    )
 }
 
 /// Returns the memo for a received note, if the note is known to the wallet.
@@ -6860,13 +6881,19 @@ mod tests {
         }
 
         let tx = st.wallet().conn().unchecked_transaction().unwrap();
-        let forced =
-            super::get_wallet_summary(&tx, st.network(), ConfirmationsPolicy::MIN, &FixedProgress)
+        let forced = super::get_wallet_summary(
+            &tx,
+            st.network(),
+            ConfirmationsPolicy::MIN,
+            &FixedProgress,
+            false,
+        )
+        .unwrap()
+        .expect("fixed progress plus snapshot must yield a summary");
+        let snapshot =
+            super::get_wallet_snapshot(&tx, st.network(), ConfirmationsPolicy::MIN, false)
                 .unwrap()
-                .expect("fixed progress plus snapshot must yield a summary");
-        let snapshot = super::get_wallet_snapshot(&tx, st.network(), ConfirmationsPolicy::MIN)
-            .unwrap()
-            .expect("scanned wallet has a snapshot");
+                .expect("scanned wallet has a snapshot");
         assert_eq!(snapshot.account_balances().len(), 2);
         assert_eq!(snapshot.account_balances(), forced.account_balances());
         assert_eq!(
@@ -6922,14 +6949,21 @@ mod tests {
 
         let tx = st.wallet().conn().unchecked_transaction().unwrap();
         assert_eq!(
-            super::get_wallet_summary(&tx, st.network(), ConfirmationsPolicy::MIN, &NoProgress)
-                .unwrap(),
+            super::get_wallet_summary(
+                &tx,
+                st.network(),
+                ConfirmationsPolicy::MIN,
+                &NoProgress,
+                false,
+            )
+            .unwrap(),
             None,
             "missing progress must keep get_wallet_summary returning None"
         );
-        let snapshot = super::get_wallet_snapshot(&tx, st.network(), ConfirmationsPolicy::MIN)
-            .unwrap()
-            .expect("snapshot must still return balances when progress is unavailable");
+        let snapshot =
+            super::get_wallet_snapshot(&tx, st.network(), ConfirmationsPolicy::MIN, false)
+                .unwrap()
+                .expect("snapshot must still return balances when progress is unavailable");
         assert_eq!(snapshot.account_balances().len(), 1);
         assert_eq!(snapshot.chain_tip_height(), h);
     }

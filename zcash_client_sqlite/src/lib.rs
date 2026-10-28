@@ -760,11 +760,10 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletDb<
         &self,
         confirmations_policy: ConfirmationsPolicy,
     ) -> Result<Option<WalletSnapshot<AccountUuid>>, SqliteClientError> {
-        wallet::get_wallet_snapshot(
-            &self.conn.borrow().unchecked_transaction()?,
-            &self.params,
-            confirmations_policy,
-        )
+        let tx = self.conn.borrow().unchecked_transaction()?;
+        let view_only =
+            !wallet::maintains_note_commitment_trees(&tx, self.commitment_tree_maintenance)?;
+        wallet::get_wallet_snapshot(&tx, &self.params, confirmations_policy, view_only)
     }
 }
 
@@ -1504,11 +1503,15 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletRea
     ) -> Result<Option<WalletSummary<Self::AccountId>>, Self::Error> {
         // This will return a runtime error if we call `get_wallet_summary` from two
         // threads at the same time, as transactions cannot nest.
+        let tx = self.conn.borrow().unchecked_transaction()?;
+        let view_only =
+            !wallet::maintains_note_commitment_trees(&tx, self.commitment_tree_maintenance)?;
         wallet::get_wallet_summary(
-            &self.conn.borrow().unchecked_transaction()?,
+            &tx,
             &self.params,
             confirmations_policy,
             &SubtreeProgressEstimator,
+            view_only,
         )
     }
 

@@ -6,12 +6,13 @@ use std::num::NonZeroU32;
 
 use zcash_client_backend::{
     data_api::{
-        Account as _, AccountBirthday, AccountPurpose, CommitmentTreeMaintenance, WalletRead,
-        WalletWrite,
+        Account as _, AccountBalance, AccountBirthday, AccountPurpose, CommitmentTreeMaintenance,
+        WalletRead, WalletWrite,
         anchor_retention::AnchorRetentionInterval,
         chain::{CompactChainState, error::Error as ScanDbError},
         scanning::ScanPriority,
         testing::{AddressType, TestBuilder, pool::ShieldedPoolTester, sapling::SaplingPoolTester},
+        wallet::ConfirmationsPolicy,
     },
     scanning::ScanError,
 };
@@ -512,6 +513,71 @@ fn spending_wallet_can_disable_anchor_retention() {
         0,
         "disabling anchor retention stores no durable anchor"
     );
+}
+
+fn sapling_balance(
+    balances: &std::collections::HashMap<crate::AccountUuid, AccountBalance>,
+    id: crate::AccountUuid,
+) -> &zcash_client_backend::data_api::Balance {
+    balances
+        .get(&id)
+        .expect("account balance")
+        .sapling_balance()
+}
+
+#[test]
+fn view_only_summary_reports_observed_notes_without_a_witness() {
+    let value = Zatoshis::const_from_u64(100_000);
+    let mut view_only = TestBuilder::new()
+        .with_data_store_factory(TestDbFactory::default())
+        .with_block_cache(BlockCache::new())
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+    view_only
+        .wallet_mut()
+        .db_mut()
+        .set_commitment_tree_maintenance(CommitmentTreeMaintenance::ViewOnly);
+    let view_id = view_only.test_account().unwrap().id();
+    let fvk = SaplingPoolTester::test_account_fvk(&view_only);
+    let (height, _, _) = view_only.generate_next_block(&fvk, AddressType::DefaultExternal, value);
+    view_only.scan_cached_blocks(height, 1);
+    view_only.wallet_mut().update_chain_tip(height).unwrap();
+
+    let snapshot = view_only
+        .wallet()
+        .db()
+        .get_wallet_snapshot(ConfirmationsPolicy::MIN)
+        .unwrap()
+        .expect("snapshot");
+    let viewed = sapling_balance(snapshot.account_balances(), view_id);
+    assert_eq!(viewed.spendable_value(), Zatoshis::ZERO);
+    assert_eq!(viewed.value_pending_spendability(), Zatoshis::ZERO);
+    assert_eq!(viewed.viewed_value(), value);
+    assert_eq!(viewed.total(), value);
+
+    let mut spending = TestBuilder::new()
+        .with_data_store_factory(TestDbFactory::default())
+        .with_block_cache(BlockCache::new())
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+    let spending_id = spending.test_account().unwrap().id();
+    let spending_fvk = SaplingPoolTester::test_account_fvk(&spending);
+    let (spend_height, _, _) =
+        spending.generate_next_block(&spending_fvk, AddressType::DefaultExternal, value);
+    spending.scan_cached_blocks(spend_height, 1);
+    spending
+        .wallet_mut()
+        .update_chain_tip(spend_height)
+        .unwrap();
+    let spending_snapshot = spending
+        .wallet()
+        .db()
+        .get_wallet_snapshot(ConfirmationsPolicy::MIN)
+        .unwrap()
+        .expect("spending snapshot");
+    let spendable = sapling_balance(spending_snapshot.account_balances(), spending_id);
+    assert_eq!(spendable.viewed_value(), Zatoshis::ZERO);
+    assert_eq!(spendable.total(), value);
 }
 
 fn block_hash_at(conn: &Connection, height: BlockHeight) -> BlockHash {

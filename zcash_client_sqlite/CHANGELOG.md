@@ -33,6 +33,9 @@ workspace.
   write-back cache. The cache is enabled by default.
 
 ### Changed
+- `get_wallet_summary` and `get_wallet_snapshot` report a view-only wallet's
+  unspent decrypted notes in `Balance::viewed_value`. Spendable stays zero.
+  A spending wallet's summary is unchanged and `viewed_value` stays zero.
 - A view-only scan marks the scanned range `Scanned` and does not insert
   `FoundNote` ranges. `update_chain_tip` does not pull the queue back to an
   incomplete shard. The `Verify` lookahead stays, and the rest of the catch-up

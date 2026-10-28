@@ -246,6 +246,9 @@ pub struct Balance {
     change_pending_confirmation: Zatoshis,
     value_pending_spendability: Zatoshis,
     uneconomic_value: Zatoshis,
+    /// Notes a view-only wallet decrypted and has not seen spent. Spending wallets leave this
+    /// at zero; those notes are classified in the spendable and pending buckets instead.
+    viewed_value: Zatoshis,
 }
 
 impl Balance {
@@ -256,6 +259,7 @@ impl Balance {
         change_pending_confirmation: Zatoshis::ZERO,
         value_pending_spendability: Zatoshis::ZERO,
         uneconomic_value: Zatoshis::ZERO,
+        viewed_value: Zatoshis::ZERO,
     };
 
     fn check_total_adding(&self, value: Zatoshis) -> Result<Zatoshis, BalanceError> {
@@ -263,6 +267,7 @@ impl Balance {
             + self.locked_value
             + self.change_pending_confirmation
             + self.value_pending_spendability
+            + self.viewed_value
             + value)
             .ok_or(BalanceError::Overflow)
     }
@@ -335,12 +340,31 @@ impl Balance {
         Ok(())
     }
 
+    /// Returns notes this view-only wallet decrypted and has not seen spent.
+    ///
+    /// A spending wallet reports this as zero. The same notes are then either
+    /// [`Self::spendable_value`] or [`Self::value_pending_spendability`], depending on whether a
+    /// witness can be built. A view-only wallet has no witness, so spendable stays zero and the
+    /// observed total — received notes minus notes whose nullifier has been seen — is here,
+    /// including notes at or below the ZIP 317 marginal fee.
+    pub fn viewed_value(&self) -> Zatoshis {
+        self.viewed_value
+    }
+
+    /// Adds the specified value to the view-only observed total, checking for overflow.
+    pub fn add_viewed_value(&mut self, value: Zatoshis) -> Result<(), BalanceError> {
+        self.check_total_adding(value)?;
+        self.viewed_value = (self.viewed_value + value).unwrap();
+        Ok(())
+    }
+
     /// Returns the total value of funds represented by this [`Balance`].
     pub fn total(&self) -> Zatoshis {
         (self.spendable_value
             + self.locked_value
             + self.change_pending_confirmation
-            + self.value_pending_spendability)
+            + self.value_pending_spendability
+            + self.viewed_value)
             .expect("Balance cannot overflow MAX_MONEY")
     }
 }
@@ -361,6 +385,7 @@ impl core::ops::Add<Balance> for Balance {
                 .ok_or(BalanceError::Overflow)?,
             uneconomic_value: (self.uneconomic_value + rhs.uneconomic_value)
                 .ok_or(BalanceError::Overflow)?,
+            viewed_value: (self.viewed_value + rhs.viewed_value).ok_or(BalanceError::Overflow)?,
         };
 
         result.check_total_adding(Zatoshis::ZERO)?;
