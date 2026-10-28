@@ -39,7 +39,7 @@ else
     counts=("${unique[@]}")
 fi
 
-echo "host_cores=$cores measured_counts=${counts[*]}"
+echo "logical_cpus=$cores measured_counts=${counts[*]}"
 printf '%-28s %8s %12s %10s %12s %14s\n' \
     "range" "threads" "notes" "notes/sec" "scan_sec" "decrypt_share"
 
