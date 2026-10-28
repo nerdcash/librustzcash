@@ -188,11 +188,19 @@ pub(crate) const PRUNING_DEPTH: u32 = 100;
 pub(crate) static NULLIFIER_MAP_WRITE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// When set, the next [`WalletWrite::put_blocks`] finishes its database work and
-/// then returns an error so the transaction rolls back. The scan test uses this
-/// to check that a failed batch does not leave staged nullifiers behind.
-pub(crate) static FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT: std::sync::atomic::AtomicBool =
+/// A WAL truncation was blocked by a reader after pages were freed. The next
+/// reclamation retries the checkpoint even when the freelist is already empty.
+static WAL_CHECKPOINT_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-dependencies"))]
+thread_local! {
+    /// When set on this thread, the next `put_blocks` on this thread finishes
+    /// its database work and then returns an error so the transaction rolls
+    /// back. Other threads do not see it.
+    pub(crate) static FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 /// The number of blocks to verify ahead when the chain tip is updated.
 pub(crate) const VERIFY_LOOKAHEAD: u32 = 10;
@@ -807,29 +815,50 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletDb<
     fn reclaim_freed_pages(&self) -> Result<(), SqliteClientError> {
         let conn = self.conn.borrow();
         let freelist: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
-        if freelist == 0 {
-            return Ok(());
-        }
         let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
         // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. Incremental vacuum is a no-op in
         // the other modes, and a FULL vacuum here would rewrite the whole file.
-        if mode != 2 {
-            return Ok(());
-        }
-        // Drain the pragma's result rows without assuming a column layout.
-        // `incremental_vacuum` reports leftover freelist pages on some SQLite
-        // builds and an empty row on others.
-        {
+        if mode == 2 && freelist > 0 {
+            // Drain the pragma's result rows without assuming a column layout.
+            // `incremental_vacuum` reports leftover freelist pages on some SQLite
+            // builds and an empty row on others.
             let mut stmt = conn.prepare("PRAGMA incremental_vacuum")?;
             let mut rows = stmt.query([])?;
             while rows.next()?.is_some() {}
+            drop(rows);
+            drop(stmt);
+            // Truncating a WAL database waits on the checkpoint. Remember to
+            // retry it even after the freelist is already empty.
+            WAL_CHECKPOINT_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        let journal: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-        if journal.eq_ignore_ascii_case("wal") {
-            // A WAL database does not truncate until the WAL is checkpointed.
-            let mut stmt = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
-            let mut rows = stmt.query([])?;
-            while rows.next()?.is_some() {}
+        if WAL_CHECKPOINT_PENDING.load(std::sync::atomic::Ordering::Relaxed) {
+            let journal: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+            if !journal.eq_ignore_ascii_case("wal") {
+                WAL_CHECKPOINT_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+            // `wal_checkpoint` returns (busy, log frames, checkpointed frames).
+            // busy != 0 means a reader blocked the truncation. Retry here, and
+            // if it is still busy leave the flag set so a later scan tries
+            // again. This does not fail the scan that already committed.
+            let mut still_busy = false;
+            for attempt in 0..8 {
+                let busy: i64 =
+                    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+                if busy == 0 {
+                    still_busy = false;
+                    break;
+                }
+                still_busy = true;
+                if attempt + 1 < 8 {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            WAL_CHECKPOINT_PENDING.store(still_busy, std::sync::atomic::Ordering::Relaxed);
+            if still_busy {
+                warn!("wal checkpoint remained busy after spend-map reclamation");
+            }
         }
         Ok(())
     }
@@ -2228,9 +2257,10 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         from_state: &ChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
-        self.transactionally(|wdb| {
+        self.transactionally(|wdb| -> Result<(), SqliteClientError> {
             wdb.put_blocks(from_state, blocks)?;
-            if FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            #[cfg(any(test, feature = "test-dependencies"))]
+            if FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.with(|flag| flag.replace(false)) {
                 return Err(SqliteClientError::CorruptedData(
                     "test rollback after staged spend write".into(),
                 ));

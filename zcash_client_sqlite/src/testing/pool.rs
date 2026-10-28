@@ -1122,11 +1122,11 @@ pub(crate) fn staged_nullifier_write_rolls_back_and_retries() {
     let queue_before = scan_queue_rows(st.wallet().conn());
     assert_eq!(table_count(st.wallet().conn(), "blocks"), 0);
 
-    crate::FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.with(|flag| flag.set(true));
     let failed = st.try_scan_cached_blocks(birthday, BLOCKS);
     assert!(failed.is_err(), "the injected rollback must fail the scan");
     assert!(
-        !crate::FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.load(std::sync::atomic::Ordering::SeqCst),
+        !crate::FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.with(|flag| flag.get()),
         "the rollback hook must run once"
     );
     assert_eq!(table_count(st.wallet().conn(), "blocks"), 0);

@@ -352,29 +352,104 @@ pub trait LowLevelWalletRead {
     ) -> Result<Option<Self::Account>, Self::Error>;
 }
 
+/// A shielded nullifier tagged with the pool it belongs to.
+///
+/// The pool and the nullifier are one value, so a caller cannot persist a
+/// Sapling nullifier under an Orchard pool code. Bytes are produced only when
+/// the row is written.
+#[derive(Clone, Debug)]
+pub enum StagedNullifier {
+    /// A Sapling nullifier.
+    Sapling(::sapling::Nullifier),
+    /// An Orchard nullifier.
+    #[cfg(feature = "orchard")]
+    Orchard(::orchard::note::Nullifier),
+    /// An Ironwood nullifier.
+    #[cfg(feature = "orchard")]
+    Ironwood(::orchard::note::Nullifier),
+}
+
+impl StagedNullifier {
+    /// The pool this nullifier belongs to.
+    pub fn pool(&self) -> ShieldedPool {
+        match self {
+            Self::Sapling(_) => ShieldedPool::Sapling,
+            #[cfg(feature = "orchard")]
+            Self::Orchard(_) => ShieldedPool::Orchard,
+            #[cfg(feature = "orchard")]
+            Self::Ironwood(_) => ShieldedPool::Ironwood,
+        }
+    }
+
+    /// The 32-byte nullifier stored in `nullifier_map`.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        match self {
+            Self::Sapling(nf) => {
+                let bytes = nf.as_ref();
+                let mut out = [0u8; 32];
+                out.copy_from_slice(bytes);
+                out
+            }
+            #[cfg(feature = "orchard")]
+            Self::Orchard(nf) | Self::Ironwood(nf) => nf.to_bytes(),
+        }
+    }
+}
+
+/// One shielded spend to record in the nullifier map.
+///
+/// Scanning builds these in memory and the wallet writes the whole batch once.
+/// Only spends that are still needed for spend detection at the end of the
+/// batch are included. Fields stay private so the nullifier cannot be separated
+/// from its pool.
+#[derive(Clone, Debug)]
+pub struct StagedSpend {
+    height: BlockHeight,
+    tx_index: TxIndex,
+    txid: TxId,
+    nullifier: StagedNullifier,
+}
+
+impl StagedSpend {
+    pub(crate) fn new(
+        height: BlockHeight,
+        tx_index: TxIndex,
+        txid: TxId,
+        nullifier: StagedNullifier,
+    ) -> Self {
+        Self {
+            height,
+            tx_index,
+            txid,
+            nullifier,
+        }
+    }
+
+    /// Block that revealed the nullifier.
+    pub fn height(&self) -> BlockHeight {
+        self.height
+    }
+
+    /// Index of the spending transaction within that block.
+    pub fn tx_index(&self) -> TxIndex {
+        self.tx_index
+    }
+
+    /// Transaction that revealed the nullifier.
+    pub fn txid(&self) -> TxId {
+        self.txid
+    }
+
+    /// Pool-tagged nullifier.
+    pub fn nullifier(&self) -> &StagedNullifier {
+        &self.nullifier
+    }
+}
+
 /// A capability trait that provides low-level wallet write operations. These operations are used
 /// to provide standard implementations for certain [`WalletWrite`] trait methods.
 ///
 /// [`WalletWrite`]: super::WalletWrite
-/// One shielded spend to record in the nullifier map.
-///
-/// Scanning builds these in memory, possibly on another thread, and the wallet
-/// writes the whole batch once. Only spends that are still needed for spend
-/// detection at the end of the batch are included.
-#[derive(Clone, Debug)]
-pub struct StagedSpend {
-    /// Block that revealed the nullifier.
-    pub height: BlockHeight,
-    /// Index of the spending transaction within that block.
-    pub tx_index: TxIndex,
-    /// Transaction that revealed the nullifier.
-    pub txid: TxId,
-    /// Shielded pool the nullifier belongs to.
-    pub pool: ShieldedPool,
-    /// Nullifier bytes.
-    pub nf: [u8; 32],
-}
-
 pub trait LowLevelWalletWrite: LowLevelWalletRead {
     /// Add metadata about a block to the wallet data store.
     #[allow(clippy::too_many_arguments)]

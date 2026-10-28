@@ -6295,12 +6295,13 @@ fn insert_staged_nullifiers_inner(
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
         for spend in spends {
+            let nf = spend.nullifier().to_bytes();
             insert.execute(params![
-                pool_code(PoolType::Shielded(spend.pool)),
-                &spend.nf[..],
-                u32::from(spend.height),
-                u16::from(spend.tx_index),
-                spend.txid.as_ref(),
+                pool_code(PoolType::Shielded(spend.nullifier().pool())),
+                &nf[..],
+                u32::from(spend.height()),
+                u16::from(spend.tx_index()),
+                spend.txid().as_ref(),
             ])?;
         }
     }

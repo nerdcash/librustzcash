@@ -34,7 +34,7 @@ use crate::{
     wallet::{Recipient, WalletTransparentOutput},
 };
 
-use super::{LowLevelWalletRead, LowLevelWalletWrite, StagedSpend, TxMeta};
+use super::{LowLevelWalletRead, LowLevelWalletWrite, StagedNullifier, StagedSpend, TxMeta};
 
 #[cfg(feature = "orchard")]
 use crate::data_api::anchor_retention::{AnchorRetentionInterval, PoolMigrationParams};
@@ -439,9 +439,7 @@ where
     // commits. A crash before that commit scans the batch again, and a crash
     // after it can still match a spend to a note found later in a gap.
     let shielded_spends = snapshot_shielded_spends(&blocks, spend_tracking_floor);
-    let staging = JoinOnDrop(Some(std::thread::spawn(move || {
-        stage_surviving_spends(shielded_spends)
-    })));
+    let staging = start_staging(shielded_spends);
 
     let mut sapling_commitments = vec![];
     #[cfg(feature = "orchard")]
@@ -2064,21 +2062,32 @@ fn should_track_spends(
     spend_tracking_floor.is_none_or(|floor| block_height >= floor)
 }
 
-struct JoinOnDrop<T>(Option<std::thread::JoinHandle<T>>);
+enum StagingJob {
+    Inline(Vec<StagedSpend>),
+    #[cfg(not(target_arch = "wasm32"))]
+    Thread(Option<std::thread::JoinHandle<Vec<StagedSpend>>>),
+}
 
-impl<T> JoinOnDrop<T> {
-    fn join(mut self) -> T {
-        self.0
-            .take()
-            .expect("staging thread")
-            .join()
-            .expect("nullifier staging")
+impl StagingJob {
+    fn join(mut self) -> Vec<StagedSpend> {
+        match &mut self {
+            StagingJob::Inline(spends) => std::mem::take(spends),
+            #[cfg(not(target_arch = "wasm32"))]
+            StagingJob::Thread(handle) => handle
+                .take()
+                .expect("staging thread")
+                .join()
+                .expect("nullifier staging"),
+        }
     }
 }
 
-impl<T> Drop for JoinOnDrop<T> {
+impl Drop for StagingJob {
     fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let StagingJob::Thread(handle) = self
+            && let Some(handle) = handle.take()
+        {
             // The batch failed before the staged spends were needed. Wait so a
             // panic in staging is not detached from this thread.
             let _ = handle.join();
@@ -2086,26 +2095,42 @@ impl<T> Drop for JoinOnDrop<T> {
     }
 }
 
-fn copy_nullifier(bytes: &[u8]) -> [u8; 32] {
-    bytes.try_into().expect("shielded nullifier is 32 bytes")
+/// Sorts `spends` off the SQLite writer when this target can create a thread.
+///
+/// `wasm32` (including `wasm32-wasip1`, which CI builds) has no threads:
+/// `std::thread::spawn` panics there. Native targets try `Builder::spawn` and
+/// sort inline if the process cannot create a thread. An empty set does not
+/// start a thread.
+fn start_staging(spends: Vec<StagedSpend>) -> StagingJob {
+    if spends.is_empty() {
+        return StagingJob::Inline(spends);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::thread::Builder::new()
+        .name("nullifier-stage".into())
+        .spawn(|| ())
+        .is_ok()
+    {
+        // The probe consumed no spend data. Moving `spends` into the worker is
+        // safe only because thread creation just succeeded.
+        let handle = std::thread::Builder::new()
+            .name("nullifier-stage".into())
+            .spawn(move || stage_surviving_spends(spends))
+            .expect("nullifier staging thread");
+        return StagingJob::Thread(Some(handle));
+    }
+    StagingJob::Inline(stage_surviving_spends(spends))
 }
 
 fn push_nullifiers<NF>(
     out: &mut Vec<StagedSpend>,
     height: BlockHeight,
-    pool: ShieldedPool,
     nullifiers: &[(TxIndex, TxId, Vec<NF>)],
-    to_bytes: impl Fn(&NF) -> [u8; 32],
+    to_nullifier: impl Fn(&NF) -> StagedNullifier,
 ) {
     for (tx_index, txid, nfs) in nullifiers {
         for nf in nfs {
-            out.push(StagedSpend {
-                height,
-                tx_index: *tx_index,
-                txid: *txid,
-                pool,
-                nf: to_bytes(nf),
-            });
+            out.push(StagedSpend::new(height, *tx_index, *txid, to_nullifier(nf)));
         }
     }
 }
@@ -2122,25 +2147,22 @@ fn snapshot_shielded_spends<A>(
         push_nullifiers(
             &mut spends,
             block.height(),
-            ShieldedPool::Sapling,
             block.sapling().nullifier_map(),
-            |nf| copy_nullifier(nf.as_ref()),
+            |nf| StagedNullifier::Sapling(*nf),
         );
         #[cfg(feature = "orchard")]
         push_nullifiers(
             &mut spends,
             block.height(),
-            ShieldedPool::Orchard,
             block.orchard().nullifier_map(),
-            |nf| nf.to_bytes(),
+            |nf| StagedNullifier::Orchard(*nf),
         );
         #[cfg(feature = "orchard")]
         push_nullifiers(
             &mut spends,
             block.height(),
-            ShieldedPool::Ironwood,
             block.ironwood().nullifier_map(),
-            |nf| nf.to_bytes(),
+            |nf| StagedNullifier::Ironwood(*nf),
         );
     }
     spends
@@ -2150,13 +2172,21 @@ fn snapshot_shielded_spends<A>(
 /// thread, not the global Rayon pool and not the SQLite connection.
 fn stage_surviving_spends(mut spends: Vec<StagedSpend>) -> Vec<StagedSpend> {
     spends.sort_unstable_by(|left, right| {
-        left.pool
-            .cmp(&right.pool)
-            .then(left.nf.cmp(&right.nf))
-            .then(right.height.cmp(&left.height))
+        left.nullifier()
+            .pool()
+            .cmp(&right.nullifier().pool())
+            .then(
+                left.nullifier()
+                    .to_bytes()
+                    .cmp(&right.nullifier().to_bytes()),
+            )
+            .then(right.height().cmp(&left.height()))
     });
     // `dedup_by` keeps the first of each run. The sort put the greatest height first.
-    spends.dedup_by(|left, right| left.pool == right.pool && left.nf == right.nf);
+    spends.dedup_by(|left, right| {
+        left.nullifier().pool() == right.nullifier().pool()
+            && left.nullifier().to_bytes() == right.nullifier().to_bytes()
+    });
     spends
 }
 
