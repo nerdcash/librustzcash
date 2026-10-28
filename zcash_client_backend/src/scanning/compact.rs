@@ -12,8 +12,8 @@ use zcash_protocol::{
 };
 
 use super::{
-    PositionTracker, ScanBlockError, ScanError, ScanningKeys, SpendIdentifiers, find_received,
-    find_spent,
+    PositionTracker, ScanBlockError, ScanError, ScanOptions, ScanningKeys, SpendIdentifiers,
+    compact_tx_shielded_outputs, find_received, find_spent,
 };
 use crate::{
     data_api::{BlockMetadata, ScannedBlock, ScannedBundles},
@@ -118,6 +118,7 @@ pub(crate) struct BatchRunners<
     ironwood: TaggedIronwoodBatchRunner<IvkTag, TI>,
     #[cfg(not(feature = "orchard"))]
     orchard: PhantomData<(TO, TI)>,
+    spam_filter: Option<super::SpamFilter>,
 }
 
 impl<IvkTag, TS, TO, TI> BatchRunners<IvkTag, TS, TO, TI>
@@ -157,7 +158,15 @@ where
             ),
             #[cfg(not(feature = "orchard"))]
             orchard: PhantomData,
+            spam_filter: None,
         }
+    }
+
+    /// Enables the sandblast trial-decryption filter for subsequent blocks.
+    ///
+    /// `None` restores the default, which decrypts every output.
+    pub(crate) fn set_spam_filter(&mut self, spam_filter: Option<super::SpamFilter>) {
+        self.spam_filter = spam_filter;
     }
 
     pub(crate) fn flush(&mut self) {
@@ -180,6 +189,17 @@ where
 
         for tx in block.vtx.into_iter() {
             let txid = tx.txid();
+            // A filtered sandblast transaction still has its note commitments applied
+            // later, when the block is scanned. Only trial decryption is skipped.
+            if self.spam_filter.is_some_and(|filter| {
+                filter.skips_trial_decryption(
+                    params,
+                    block_height,
+                    compact_tx_shielded_outputs(&tx),
+                )
+            }) {
+                continue;
+            }
 
             self.sapling.add_outputs(
                 block_hash,
@@ -245,6 +265,7 @@ where
 }
 
 #[tracing::instrument(skip_all, fields(height = block.height))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_block_with_runners<P, AccountId, IvkTag, TS, TO, TI, E>(
     params: &P,
     block: CompactBlock,
@@ -252,6 +273,7 @@ pub(crate) fn scan_block_with_runners<P, AccountId, IvkTag, TS, TO, TI, E>(
     spend_ids: &SpendIdentifiers<AccountId>,
     prior_block_metadata: Option<&BlockMetadata>,
     mut batch_runners: Option<&mut BatchRunners<IvkTag, TS, TO, TI>>,
+    options: &ScanOptions,
     #[cfg(feature = "transparent-inputs")] find_account_for_address: impl Fn(
         &TransparentAddress,
     ) -> Result<
@@ -329,6 +351,11 @@ where
         let txid = tx.txid();
         let tx_index =
             TxIndex::try_from(tx.index).expect("Cannot fit more than 2^16 transactions in a block");
+        // Commitments and nullifiers below still run. Only the trial-decryption
+        // closures observe this flag.
+        let skip_trial_decryption = options.spam_filter.is_some_and(|filter| {
+            filter.skips_trial_decryption(params, cur_height, compact_tx_shielded_outputs(&tx))
+        });
 
         // A compact spend carries its nullifier as raw bytes; validate them up front so that a
         // malformed (wrong-length) nullifier from an untrusted server yields a handleable
@@ -471,6 +498,9 @@ where
                 .as_mut()
                 .map(|runners| |txid| runners.sapling.collect_results(cur_hash, txid)),
             |ivks, outputs| {
+                if skip_trial_decryption {
+                    return vec![None; outputs.len()];
+                }
                 parallel_try_compact_note_decryption(ivks, outputs)
                     .into_iter()
                     .map(|opt| opt.map(|((note, recipient), i)| ((note, recipient, ()), i)))
@@ -509,6 +539,9 @@ where
                 .as_mut()
                 .map(|runners| |txid| runners.orchard.collect_results(cur_hash, txid)),
             |ivks, outputs| {
+                if skip_trial_decryption {
+                    return vec![None; outputs.len()];
+                }
                 parallel_try_compact_note_decryption(ivks, outputs)
                     .into_iter()
                     .map(|opt| opt.map(|((note, recipient), i)| ((note, recipient, ()), i)))
@@ -547,6 +580,9 @@ where
                 .as_mut()
                 .map(|runners| |txid| runners.ironwood.collect_results(cur_hash, txid)),
             |ivks, outputs| {
+                if skip_trial_decryption {
+                    return vec![None; outputs.len()];
+                }
                 parallel_try_compact_note_decryption(ivks, outputs)
                     .into_iter()
                     .map(|opt| opt.map(|((note, recipient), i)| ((note, recipient, ()), i)))
@@ -919,12 +955,33 @@ where
     P: consensus::Parameters,
     IvkTag: Clone,
 {
+    trial_decrypt_compact_block_with_options(params, block, scanning_keys, &ScanOptions::default())
+}
+
+/// Trial-decrypts a compact block, honoring [`ScanOptions`].
+///
+/// [`trial_decrypt_compact_block`] is this function with [`ScanOptions::default`].
+pub fn trial_decrypt_compact_block_with_options<P, AccountId, IvkTag>(
+    params: &P,
+    block: &CompactBlock,
+    scanning_keys: &ScanningKeys<AccountId, IvkTag>,
+    options: &ScanOptions,
+) -> Result<usize, ScanError>
+where
+    P: consensus::Parameters,
+    IvkTag: Clone,
+{
     let height = block.height();
     let zip212 = zip212_enforcement(params, height);
     let mut decrypted = 0usize;
 
     for tx in &block.vtx {
         let txid = tx.txid();
+        if options.spam_filter.is_some_and(|filter| {
+            filter.skips_trial_decryption(params, height, compact_tx_shielded_outputs(tx))
+        }) {
+            continue;
+        }
 
         let sapling_ivks: Vec<_> = scanning_keys
             .sapling()
@@ -1053,7 +1110,7 @@ mod tests {
     };
     use zip32::AccountId;
 
-    use super::{BatchRunners, scan_block_with_runners};
+    use super::{BatchRunners, ScanOptions, scan_block_with_runners};
     use crate::{
         data_api::BlockMetadata,
         scanning::{
@@ -1110,6 +1167,7 @@ mod tests {
                     Some(0),
                 )),
                 batch_runners.as_mut(),
+                &ScanOptions::default(),
                 #[cfg(feature = "transparent-inputs")]
                 |_addr| Ok::<_, Infallible>(None),
             )
@@ -1370,6 +1428,119 @@ mod tests {
         assert_eq!(found, COPIES);
     }
 
+    /// A note inside a 51-output transaction is missed only on mainnet, and only inside
+    /// the sandblast window. Commitments are still recorded.
+    #[test]
+    fn spam_filter_misses_a_note_only_inside_the_mainnet_window() {
+        use sapling::{
+            note_encryption::{COMPACT_NOTE_SIZE, sapling_note_encryption},
+            util::generate_random_rseed,
+            value::NoteValue,
+        };
+        use zcash_note_encryption::Domain;
+        use zcash_primitives::transaction::components::sapling::zip212_enforcement;
+        use zcash_protocol::memo::MemoBytes;
+
+        use crate::proto::compact_formats::{
+            ChainMetadata, CompactBlock, CompactSaplingOutput, CompactTx,
+        };
+        use crate::scanning::{ScanOptions, SpamFilter, scan_block_with_options};
+        use rand::rngs::SysRng;
+        use rand_core::UnwrapErr;
+
+        let account = AccountId::ZERO;
+
+        fn owned_block(
+            network: Network,
+            height: BlockHeight,
+            copies: usize,
+            dfvk: &sapling::zip32::DiversifiableFullViewingKey,
+        ) -> CompactBlock {
+            use rand_core::Rng;
+            let mut rng = UnwrapErr(SysRng);
+            let zip212 = zip212_enforcement(&network, height);
+            let to = dfvk.default_address().1;
+            let rseed = generate_random_rseed(zip212, &mut rng);
+            let note = sapling::Note::from_parts(to, NoteValue::from_raw(5), rseed);
+            let encryptor = sapling_note_encryption(
+                Some(dfvk.fvk().ovk),
+                note.clone(),
+                MemoBytes::empty().into_bytes(),
+                &mut rng,
+            );
+            let output = CompactSaplingOutput {
+                cmu: note.cmu().to_bytes().to_vec(),
+                ephemeral_key: sapling::note_encryption::SaplingDomain::epk_bytes(encryptor.epk())
+                    .0
+                    .to_vec(),
+                ciphertext: encryptor.encrypt_note_plaintext().0[..COMPACT_NOTE_SIZE].to_vec(),
+            };
+            let mut txid = vec![0u8; 32];
+            rng.fill_bytes(&mut txid);
+            let mut hash = vec![0u8; 32];
+            rng.fill_bytes(&mut hash);
+            let tx = CompactTx {
+                txid,
+                outputs: vec![output; copies],
+                ..Default::default()
+            };
+            CompactBlock {
+                hash,
+                prev_hash: vec![0u8; 32],
+                height: u64::from(u32::from(height)),
+                vtx: vec![tx],
+                chain_metadata: Some(ChainMetadata {
+                    sapling_commitment_tree_size: copies as u32,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                }),
+                ..Default::default()
+            }
+        }
+
+        let usk = UnifiedSpendingKey::from_seed(&Network::MainNetwork, &[0u8; 32], account)
+            .expect("Valid USK");
+        let ufvk = usk.to_unified_full_viewing_key();
+        let dfvk = ufvk.sapling().expect("sapling").clone();
+        let keys = ScanningKeys::from_account_ufvks([(account, ufvk)]);
+        let filter = ScanOptions::default().spam_filter(SpamFilter::default());
+        let inside = BlockHeight::from(1_820_000u32);
+        let outside = BlockHeight::from(2_200_000u32);
+
+        let missed = owned_block(Network::MainNetwork, inside, 51, &dfvk);
+        let decrypted = super::trial_decrypt_compact_block_with_options(
+            &Network::MainNetwork,
+            &missed,
+            &keys,
+            &filter,
+        )
+        .unwrap();
+        assert_eq!(decrypted, 0);
+        let scanned = scan_block_with_options::<_, _, _, Infallible>(
+            &Network::MainNetwork,
+            missed,
+            &keys,
+            &SpendIdentifiers::empty(),
+            None,
+            filter,
+            #[cfg(feature = "transparent-inputs")]
+            |_addr| Ok::<_, Infallible>(None),
+        )
+        .unwrap();
+        assert!(scanned.transactions().is_empty());
+        assert_eq!(scanned.sapling().commitments().len(), 51);
+
+        let kept = owned_block(Network::MainNetwork, outside, 51, &dfvk);
+        let decrypted = super::trial_decrypt_compact_block_with_options(
+            &Network::MainNetwork,
+            &kept,
+            &keys,
+            &filter,
+        )
+        .unwrap();
+        assert_eq!(decrypted, 51);
+    }
+
     #[cfg(feature = "orchard")]
     proptest::proptest! {
         #![proptest_config(proptest::test_runner::Config::with_cases(24))]
@@ -1481,6 +1652,7 @@ mod tests {
                     Some(0),
                 )),
                 Some(&mut runners),
+                &ScanOptions::default(),
                 #[cfg(feature = "transparent-inputs")]
                 |_addr| Ok::<_, Infallible>(None),
             )
@@ -1554,6 +1726,7 @@ mod tests {
                 Some(0),
             )),
             None,
+            &ScanOptions::default(),
             #[cfg(feature = "transparent-inputs")]
             |_addr| Ok::<_, Infallible>(None),
         );
@@ -1611,6 +1784,7 @@ mod tests {
                 &SpendIdentifiers::empty(),
                 None,
                 batch_runners.as_mut(),
+                &ScanOptions::default(),
                 #[cfg(feature = "transparent-inputs")]
                 |_addr| Ok::<_, Infallible>(None),
             )

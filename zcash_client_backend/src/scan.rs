@@ -58,6 +58,15 @@ where
 
 /// Trial-decrypts compact outputs, using every rayon thread when called from
 /// outside the pool and the batch is large enough to split.
+///
+/// Orchard (Pallas) key agreement on this path is the upstream batch hook, not
+/// a second implementation in this crate. `zcash_note_encryption` 0.5 calls
+/// `BatchDomain::batch_ka_agree_dec`. Orchard 0.16 implements that by building
+/// GLV endomorphism windows for every ephemeral key in the batch
+/// (`PreparedEphemeralPublicKey::batch_tabled`) and decomposing each viewing-key
+/// scalar once (`pasta_curves::glv::Decomposed`) for reuse against those windows.
+/// Shared secrets match the per-output path. Sapling key agreement stays in
+/// `sapling-crypto`'s prepared scalar multiplication on Jubjub.
 #[allow(clippy::type_complexity)]
 pub(crate) fn parallel_try_compact_note_decryption<D, Output>(
     ivks: &[D::IncomingViewingKey],

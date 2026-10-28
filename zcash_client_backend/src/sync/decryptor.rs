@@ -15,7 +15,7 @@ use zcash_primitives::{
 use zcash_protocol::consensus::{self, BlockHeight};
 
 use crate::scanning::{
-    ScanningKeys,
+    ScanningKeys, SpamFilter,
     full::{BatchResult, BatchRunners, DEFAULT_BATCH_SIZE_THRESHOLD},
 };
 
@@ -34,6 +34,7 @@ pub fn new() -> Builder {
         #[cfg(feature = "orchard")]
         orchard_batch_size_threshold: DEFAULT_BATCH_SIZE_THRESHOLD,
         batch_start_delay: DEFAULT_BATCH_START_DELAY,
+        spam_filter: None,
     }
 }
 
@@ -41,6 +42,7 @@ pub fn new() -> Builder {
 pub struct Builder {
     queue_size: usize,
     sapling_batch_size_threshold: usize,
+    spam_filter: Option<SpamFilter>,
     #[cfg(feature = "orchard")]
     orchard_batch_size_threshold: usize,
     batch_start_delay: Duration,
@@ -92,6 +94,13 @@ impl Builder {
         self
     }
 
+    /// Skips trial decryption of high-output transactions inside the mainnet sandblast
+    /// window. Off unless this is called. See [`SpamFilter`].
+    pub fn spam_filter(mut self, spam_filter: SpamFilter) -> Self {
+        self.spam_filter = Some(spam_filter);
+        self
+    }
+
     /// Sets how long the engine will wait for a queue item before automatically flushing
     /// any pending batches.
     ///
@@ -115,6 +124,7 @@ impl Builder {
                 #[cfg(feature = "orchard")]
                 orchard_batch_size_threshold: self.orchard_batch_size_threshold,
                 batch_start_delay: self.batch_start_delay,
+                spam_filter: self.spam_filter,
             },
         )
     }
@@ -330,6 +340,7 @@ pub struct Engine<AccountId, IvkTag> {
     #[cfg(feature = "orchard")]
     orchard_batch_size_threshold: usize,
     batch_start_delay: Duration,
+    spam_filter: Option<SpamFilter>,
 }
 
 impl<AccountId, IvkTag> Engine<AccountId, IvkTag>
@@ -369,6 +380,7 @@ where
             self.orchard_batch_size_threshold,
             &scanning_keys,
         );
+        runners.set_spam_filter(self.spam_filter);
 
         // Whether a batch has been accumulated since the last flush. The idle-flush
         // timer is only armed while this is set, so that a quiescent engine does not
@@ -456,6 +468,7 @@ where
                             self.orchard_batch_size_threshold,
                             &scanning_keys,
                         );
+                        runners.set_spam_filter(self.spam_filter);
 
                         // An error means the calling task is shutting down.
                         let _ = on_complete.send(());
