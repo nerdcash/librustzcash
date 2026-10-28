@@ -221,6 +221,7 @@ fn truncate_to_height<P: consensus::Parameters>(
                 zcash_client_backend::data_api::CommitmentTreeMaintenance::Automatic,
             anchor_retention_enabled: true,
             wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
+            spend_map_reclaim_requested: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: *gap_limits,
         };

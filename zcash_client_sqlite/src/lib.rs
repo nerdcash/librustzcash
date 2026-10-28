@@ -324,6 +324,10 @@ pub struct WalletDb<C, P, CL, R> {
     /// This wallet still needs a WAL truncation after a reader blocked it.
     /// Kept on the handle so a scan of a different database cannot clear it.
     wal_checkpoint_pending: std::sync::atomic::AtomicBool,
+    /// A scan on this handle freed spend-map pages. Set on a transaction-scoped
+    /// handle; the outer `transactionally` helpers read it after commit and
+    /// reclaim. Connection-level scans reclaim themselves.
+    spend_map_reclaim_requested: std::sync::atomic::AtomicBool,
     #[cfg(feature = "transparent-inputs")]
     gap_limits: GapLimits,
 }
@@ -636,6 +640,7 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
                 commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
                 anchor_retention_enabled: true,
                 wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
+                spend_map_reclaim_requested: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "transparent-inputs")]
                 gap_limits: GapLimits::default(),
             })
@@ -778,32 +783,10 @@ impl<C: Borrow<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
             anchor_retention_enabled: true,
             wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
+            spend_map_reclaim_requested: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: GapLimits::default(),
         }
-    }
-}
-
-impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletDb<C, P, CL, R> {
-    /// Returns wallet balances, heights, and subtree indices without computing scan progress.
-    ///
-    /// Callers that track sync progress outside of [`WalletSummary::progress`] can
-    /// use this method to obtain the same balance and metadata information as
-    /// [`WalletRead::get_wallet_summary`] without computing the
-    /// `subtree_scan_progress` aggregates.
-    ///
-    /// Returns `Ok(None)` when the wallet has no chain tip or birthday, matching
-    /// the early-exit conditions of [`WalletRead::get_wallet_summary`]. Unlike
-    /// that method, a missing progress estimate does not force `None` — progress
-    /// is simply not computed.
-    pub fn get_wallet_snapshot(
-        &self,
-        confirmations_policy: ConfirmationsPolicy,
-    ) -> Result<Option<WalletSnapshot<AccountUuid>>, SqliteClientError> {
-        let tx = self.conn.borrow().unchecked_transaction()?;
-        let view_only =
-            !wallet::maintains_note_commitment_trees(&tx, self.commitment_tree_maintenance)?;
-        wallet::get_wallet_snapshot(&tx, &self.params, confirmations_policy, view_only)
     }
 
     /// Returns spend-map freelist pages to the file so a prune does not leave the
@@ -868,6 +851,54 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletDb<
         }
         Ok(())
     }
+
+    /// Services a reclamation request from a scan that ran inside the transaction
+    /// that just committed. Errors are logged: the scan data is already durable.
+    fn reclaim_freed_pages_if_requested(&self, requested: bool) {
+        if !requested {
+            return;
+        }
+        if let Err(err) = self.reclaim_freed_pages() {
+            warn!("failed to reclaim freed spend-map pages: {err}");
+        }
+    }
+}
+
+impl<C, P, CL, R> WalletDb<C, P, CL, R> {
+    /// Asks the handle that owns the connection to return freed spend-map pages
+    /// after the surrounding transaction commits.
+    fn request_spend_map_reclaim(&self) {
+        self.spend_map_reclaim_requested
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn take_spend_map_reclaim_request(&self) -> bool {
+        self.spend_map_reclaim_requested
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletDb<C, P, CL, R> {
+    /// Returns wallet balances, heights, and subtree indices without computing scan progress.
+    ///
+    /// Callers that track sync progress outside of [`WalletSummary::progress`] can
+    /// use this method to obtain the same balance and metadata information as
+    /// [`WalletRead::get_wallet_summary`] without computing the
+    /// `subtree_scan_progress` aggregates.
+    ///
+    /// Returns `Ok(None)` when the wallet has no chain tip or birthday, matching
+    /// the early-exit conditions of [`WalletRead::get_wallet_summary`]. Unlike
+    /// that method, a missing progress estimate does not force `None` — progress
+    /// is simply not computed.
+    pub fn get_wallet_snapshot(
+        &self,
+        confirmations_policy: ConfirmationsPolicy,
+    ) -> Result<Option<WalletSnapshot<AccountUuid>>, SqliteClientError> {
+        let tx = self.conn.borrow().unchecked_transaction()?;
+        let view_only =
+            !wallet::maintains_note_commitment_trees(&tx, self.commitment_tree_maintenance)?;
+        wallet::get_wallet_snapshot(&tx, &self.params, confirmations_policy, view_only)
+    }
 }
 
 impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
@@ -895,14 +926,19 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             commitment_tree_write_back: self.commitment_tree_write_back,
             commitment_tree_maintenance: self.commitment_tree_maintenance,
             anchor_retention_enabled: self.anchor_retention_enabled,
-            // Reclamation runs on the outer handle after this transaction
-            // commits. This temporary handle does not own that retry.
+            // The checkpoint retry stays on the outer handle. This temporary
+            // handle only records that a scan freed pages.
             wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
+            spend_map_reclaim_requested: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
         let result = f(&mut wdb)?;
+        let reclaim = wdb.take_spend_map_reclaim_request();
         tx.commit()?;
+        // The batch is already committed. Reclamation only returns freed pages;
+        // a lock or I/O error here must not turn a successful scan into a failure.
+        self.reclaim_freed_pages_if_requested(reclaim);
         Ok(result)
     }
 
@@ -960,13 +996,16 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             commitment_tree_maintenance: self.commitment_tree_maintenance,
             anchor_retention_enabled: self.anchor_retention_enabled,
             wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
+            spend_map_reclaim_requested: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
         // Both handles hold shared references to the same transaction, so aliasing is fine.
         let ext = ExtensionTransaction { conn: &tx };
         let result = f(&mut wdb, &ext)?;
+        let reclaim = wdb.take_spend_map_reclaim_request();
         tx.commit()?;
+        self.reclaim_freed_pages_if_requested(reclaim);
         Ok(result)
     }
 
@@ -2834,7 +2873,7 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
                     "view-only scan prior tree size does not fit in u32: {e}"
                 ))
             })?;
-            return ll::wallet::put_blocks_without_commitment_trees::<
+            ll::wallet::put_blocks_without_commitment_trees::<
                 _,
                 SqliteClientError,
                 commitment_tree::Error,
@@ -2845,7 +2884,9 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
                 &prior,
                 blocks,
             )
-            .map_err(SqliteClientError::from);
+            .map_err(SqliteClientError::from)?;
+            self.request_spend_map_reclaim();
+            return Ok(());
         }
 
         // Once the NU6.3 (Ironwood) activation height is reached, checkpoints on the anchor
@@ -2901,6 +2942,7 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
         if let Some((start, end)) = mined_link {
             wallet::link_mined_transactions(self.conn.0, start, end)?;
         }
+        self.request_spend_map_reclaim();
         Ok(())
     }
 
@@ -2929,6 +2971,7 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
         if let Some((start, end)) = mined_link {
             wallet::link_mined_transactions(self.conn.0, start, end)?;
         }
+        self.request_spend_map_reclaim();
         Ok(())
     }
 

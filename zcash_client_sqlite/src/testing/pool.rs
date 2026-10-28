@@ -12,7 +12,7 @@ use crate::{
 use zcash_client_backend::data_api::{
     WalletWrite,
     anchor_retention::AnchorRetentionInterval,
-    chain::{ChainState, error::Error},
+    chain::{self, ChainState, error::Error},
     testing::{
         AddressType,
         pool::{InputTrust, ShieldedPoolTester, dsl::TestDsl},
@@ -1271,6 +1271,67 @@ pub(crate) fn bridging_historic_batch_skips_nullifiers_below_the_floor() {
         "bridging batch left {rows} nullifiers (bound {row_bound}, tip had {after_tip})"
     );
     assert_eq!(freelist, 0, "bridging batch left {freelist} freelist pages");
+}
+
+/// Gap chunks commit every nullifier. The batch that closes the gap is composed
+/// inside `transactionally`, so it does not use the connection-level `put_blocks`
+/// wrapper. Pruned pages still have to be reclaimed after that outer commit.
+pub(crate) fn transactionally_scoped_scan_reclaims_nullifier_pages() {
+    use zcash_client_backend::data_api::ll::wallet::SPEND_MAP_RETENTION_BLOCKS;
+
+    let mut st =
+        TestDsl::with_sapling_birthday_account(TestDbFactory::default(), BlockCache::new())
+            .build::<SaplingPoolTester>();
+    let birthday = st
+        .network()
+        .activation_height(NetworkUpgrade::Sapling)
+        .unwrap();
+
+    const TOTAL: u32 = 400;
+    const TIP: u32 = 20;
+    const CHUNK: u32 = 100;
+    const SPENDS: usize = 20;
+    for _ in 0..TOTAL {
+        st.generate_next_block_with_unrelated_spends(SPENDS);
+    }
+    let tip = birthday + TOTAL - 1;
+    st.scan_cached_blocks(tip - TIP + 1, TIP as usize);
+
+    let mut end = tip - TIP + 1;
+    let mut max_pages = 0i64;
+    while end - birthday > CHUNK {
+        let start = end - CHUNK;
+        st.scan_cached_blocks(start, usize::try_from(end - start).unwrap());
+        let (_, pages, _, _) = nullifier_map_stats(st.wallet().conn());
+        max_pages = max_pages.max(pages);
+        end = start;
+    }
+
+    let from_state = st.prior_chain_state(birthday);
+    let limit = usize::try_from(end - birthday).unwrap();
+    st.with_block_source_and_wallet(|blocks, network, wallet| {
+        wallet.db_mut().transactionally(|wdb| {
+            chain::scan_cached_blocks(network, blocks, wdb, birthday, &from_state, limit).map_err(
+                |err| SqliteClientError::CorruptedData(format!("transaction-scoped scan: {err}")),
+            )
+        })
+    })
+    .unwrap();
+
+    let (rows, final_pages, freelist, _) = nullifier_map_stats(st.wallet().conn());
+    let row_bound = i64::from(SPEND_MAP_RETENTION_BLOCKS + 3) * SPENDS as i64;
+    assert!(
+        rows <= row_bound,
+        "transaction-scoped bridging scan left {rows} nullifiers (bound {row_bound})"
+    );
+    assert!(
+        final_pages < max_pages,
+        "bridging batch did not shrink the file: max_pages={max_pages} final_pages={final_pages} freelist={freelist}"
+    );
+    assert_eq!(
+        freelist, 0,
+        "transaction-scoped scan left {freelist} freelist pages (max_pages={max_pages} final_pages={final_pages} rows={rows})"
+    );
 }
 
 fn nullifier_map_stats(conn: &rusqlite::Connection) -> (i64, i64, i64, i64) {

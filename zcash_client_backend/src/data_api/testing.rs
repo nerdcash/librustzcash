@@ -1127,6 +1127,32 @@ where
     <DbT as WalletRead>::AccountId:
         std::fmt::Debug + ConditionallySelectable + Default + Send + Sync + 'static,
 {
+    /// Chain state of the cached block immediately below `from_height`.
+    ///
+    /// This is the prior block [`scan_cached_blocks`] expects. When the cache has
+    /// nothing below `from_height`, the result is the empty pre-shielded state.
+    pub fn prior_chain_state(&self, from_height: BlockHeight) -> ChainState {
+        self.latest_cached_block_below_height(from_height)
+            .map(|block| block.chain_state().clone())
+            .unwrap_or_else(|| CachedBlock::none(from_height - 1).chain_state().clone())
+    }
+
+    /// Calls `body` with this state's block source, network, and wallet.
+    ///
+    /// The references are disjoint, so `body` can open a transaction on the wallet
+    /// and still read the block source. A scan that goes through that
+    /// transaction-scoped handle does not use the connection-level `put_blocks`.
+    pub fn with_block_source_and_wallet<R>(
+        &mut self,
+        body: impl FnOnce(&Cache::BlockSource, &ParamsT, &mut DbT) -> R,
+    ) -> R {
+        body(
+            self.cache.block_source(),
+            &self.network,
+            &mut self.wallet_data,
+        )
+    }
+
     /// Invokes [`scan_cached_blocks`] with the given arguments, expecting success.
     pub fn scan_cached_blocks(&mut self, from_height: BlockHeight, limit: usize) -> ScanSummary {
         let result = self.try_scan_cached_blocks(from_height, limit);

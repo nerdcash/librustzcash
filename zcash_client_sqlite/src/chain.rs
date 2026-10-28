@@ -464,6 +464,11 @@ mod tests {
     }
 
     #[test]
+    fn transactionally_scoped_scan_reclaims_nullifier_pages() {
+        testing::pool::transactionally_scoped_scan_reclaims_nullifier_pages();
+    }
+
+    #[test]
     fn rewind_after_non_contiguous_scan_sapling() {
         testing::pool::rewind_after_non_contiguous_scan::<SaplingPoolTester>()
     }
