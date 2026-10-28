@@ -71,6 +71,12 @@ pub enum Error {
         /// The index range of subtree roots already present in the database.
         existing_range: Range<u64>,
     },
+    /// A subtree root was supplied for an index that is already stored, and the hash or the
+    /// subtree end height does not match the stored root.
+    SubtreeRootConflict {
+        /// The shard index whose stored root disagreed with the supplied root.
+        shard_index: u64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -98,6 +104,12 @@ impl fmt::Display for Error {
                     "Attempted to write subtree roots with indices {attempted_insertion_range:?} which is discontinuous with existing subtree range {existing_range:?}",
                 )
             }
+            Error::SubtreeRootConflict { shard_index } => {
+                write!(
+                    f,
+                    "Subtree root at index {shard_index} does not match the root already stored there"
+                )
+            }
         }
     }
 }
@@ -109,6 +121,7 @@ impl error::Error for Error {
             Error::Query(e) => Some(e),
             Error::CheckpointConflict { .. } => None,
             Error::SubtreeDiscontinuity { .. } => None,
+            Error::SubtreeRootConflict { .. } => None,
         }
     }
 }
@@ -1742,6 +1755,44 @@ pub(crate) fn truncate_checkpoints_retaining(
     Ok(())
 }
 
+fn stored_shard_root<H: HashSer>(
+    conn: &rusqlite::Connection,
+    table_prefix: &str,
+    shard_index: u64,
+) -> Result<Option<(BlockHeight, H)>, Error> {
+    conn.query_row(
+        &format!(
+            "SELECT subtree_end_height, root_hash
+             FROM {table_prefix}_tree_shards
+             WHERE shard_index = ?1"
+        ),
+        [shard_index],
+        |row| {
+            Ok((
+                row.get::<_, Option<u32>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(Error::Query)?
+    .map(|(end, hash)| {
+        // A shard row written by tree maintenance can exist before its root hash and end
+        // height are filled in. That is not a stored subtree root, so the caller inserts
+        // rather than matching a prefix.
+        let Some(hash) = hash else {
+            return Ok(None);
+        };
+        let Some(end) = end else {
+            return Ok(None);
+        };
+        let root = H::read(Cursor::new(hash)).map_err(Error::Serialization)?;
+        Ok(Some((BlockHeight::from(end), root)))
+    })
+    .transpose()
+    .map(Option::flatten)
+}
+
 #[tracing::instrument(skip(conn, roots))]
 pub(crate) fn put_shard_roots<
     H: Hashable + HashSer + Clone + Eq,
@@ -1755,6 +1806,33 @@ pub(crate) fn put_shard_roots<
 ) -> Result<(), ShardTreeError<Error>> {
     if roots.is_empty() {
         // nothing to do
+        return Ok(());
+    }
+
+    // A repeat of an already-stored prefix is a no-op. Roots past that prefix are still written,
+    // which is how a sync appends `start_index = max_stored_index + 1` and how a caller that
+    // resends the whole stream from index 0 still records shards completed since the last store.
+    let mut matched = 0usize;
+    while matched < roots.len() {
+        let index = start_index + u64::try_from(matched).expect("root count fits in u64");
+        match stored_shard_root::<H>(conn, table_prefix, index).map_err(ShardTreeError::Storage)? {
+            Some((stored_end, stored_hash)) => {
+                let supplied = &roots[matched];
+                if stored_end != supplied.subtree_end_height()
+                    || &stored_hash != supplied.root_hash()
+                {
+                    return Err(ShardTreeError::Storage(Error::SubtreeRootConflict {
+                        shard_index: index,
+                    }));
+                }
+                matched += 1;
+            }
+            None => break,
+        }
+    }
+    let start_index = start_index + u64::try_from(matched).expect("root count fits in u64");
+    let roots = &roots[matched..];
+    if roots.is_empty() {
         return Ok(());
     }
 
@@ -2493,6 +2571,70 @@ mod tests {
                 "________________________________"
             ]
         );
+    }
+
+    /// `put_shard_roots(0, full_stream)` is a no-op for an already-stored prefix and still writes
+    /// roots past the stored maximum. `start_index = max + 1` is the incremental update.
+    #[test]
+    fn put_shard_roots_appends_past_a_repeated_prefix() {
+        let data_file = NamedTempFile::new().unwrap();
+        let mut db_data = WalletDb::for_path(
+            data_file.path(),
+            Network::TestNetwork,
+            test_clock(),
+            test_rng(),
+        )
+        .unwrap();
+        WalletMigrator::new().init_or_migrate(&mut db_data).unwrap();
+        let tx = db_data.conn.transaction().unwrap();
+        let prefix = crate::SAPLING_TABLES_PREFIX;
+
+        let root = |index: u32| {
+            CommitmentTreeRoot::from_parts(BlockHeight::from((index + 1) * 10), index.to_string())
+        };
+        let first = vec![root(0), root(1)];
+        super::put_shard_roots::<_, 6, 3>(&tx, prefix, 0, &first).unwrap();
+
+        // The same prefix again, plus one new root.
+        let extended = vec![root(0), root(1), root(2)];
+        super::put_shard_roots::<_, 6, 3>(&tx, prefix, 0, &extended).unwrap();
+
+        let stored_end = |index: u64| -> u32 {
+            tx.query_row(
+                &format!(
+                    "SELECT subtree_end_height FROM {prefix}_tree_shards WHERE shard_index = ?1"
+                ),
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stored_end(0), 10);
+        assert_eq!(stored_end(1), 20);
+        assert_eq!(stored_end(2), 30);
+
+        // Incremental append at max_stored_index + 1.
+        super::put_shard_roots::<_, 6, 3>(&tx, prefix, 3, &[root(3)]).unwrap();
+        assert_eq!(stored_end(3), 40);
+
+        // A repeated call of only the stored prefix does not fail.
+        super::put_shard_roots::<_, 6, 3>(&tx, prefix, 0, &first).unwrap();
+
+        let conflict = super::put_shard_roots::<_, 6, 3>(
+            &tx,
+            prefix,
+            0,
+            &[CommitmentTreeRoot::from_parts(
+                BlockHeight::from(10),
+                "not-the-stored-root".to_string(),
+            )],
+        );
+        assert!(matches!(
+            conflict,
+            Err(ShardTreeError::Storage(super::Error::SubtreeRootConflict {
+                shard_index: 0
+            }))
+        ));
     }
 
     /// Test that `generate_orchard_witnesses_at_historical_height` produces valid

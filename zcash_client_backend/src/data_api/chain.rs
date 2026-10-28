@@ -15,6 +15,7 @@
 //!         WalletRead, WalletWrite, WalletCommitmentTrees,
 //!         chain::{
 //!             BlockSource,
+//!             ChainState,
 //!             CommitmentTreeRoot,
 //!             error::Error,
 //!             scan_cached_blocks,
@@ -60,7 +61,8 @@
 //!         Some(scan_range) if scan_range.priority() == ScanPriority::Verify => {
 //!             // Download the chain state for the block prior to the start of the range you want
 //!             // to scan.
-//!             let chain_state = unimplemented!("get_chain_state(scan_range.block_range().start - 1)?;");
+//!             let chain_state: &ChainState =
+//!                 unimplemented!("get_chain_state(scan_range.block_range().start - 1)?;");
 //!             // Download the blocks in `scan_range` into the block source, overwriting any
 //!             // existing blocks in this range.
 //!             unimplemented!("cache_blocks(scan_range)?;");
@@ -124,7 +126,8 @@
 //! for scan_range in scan_ranges {
 //!     // Download the chain state for the block prior to the start of the range you want
 //!     // to scan.
-//!     let chain_state = unimplemented!("get_chain_state(scan_range.block_range().start - 1)?;");
+//!     let chain_state: &ChainState =
+//!         unimplemented!("get_chain_state(scan_range.block_range().start - 1)?;");
 //!     // Download the blocks in `scan_range` into the block source. While in this example this
 //!     // step is performed in-line, it's fine for the download of scan ranges to be asynchronous
 //!     // and for the scanner to process the downloaded ranges as they become available in a
@@ -162,7 +165,7 @@ use crate::{
     data_api::WalletWrite,
     proto::compact_formats::CompactBlock,
     scanning::{
-        ScanBlockError, ScanningKeys, SpendIdentifiers,
+        ScanBlockError, ScanError, ScanningKeys, SpendIdentifiers,
         compact::{BatchRunners, scan_block_with_runners},
     },
 };
@@ -175,7 +178,7 @@ use {
 pub mod error;
 use error::Error;
 
-use super::{Account, WalletRead};
+use super::{Account, BlockMetadata, WalletRead};
 
 /// A struct containing metadata about a subtree root of the note commitment tree.
 ///
@@ -595,6 +598,212 @@ impl ChainState {
     }
 }
 
+/// The previous block's height, hash, and end-of-block note commitment tree sizes.
+///
+/// This is the continuity a view-only scan needs. The sizes are the `u32`s already carried on a
+/// compact block's chain metadata; a frontier is not required, including for a birthday below
+/// Sapling activation where `GetTreeState` does not return a tree state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactChainState {
+    block_height: BlockHeight,
+    block_hash: BlockHash,
+    sapling_tree_size: u32,
+    #[cfg(feature = "orchard")]
+    orchard_tree_size: u32,
+    #[cfg(feature = "orchard")]
+    ironwood_tree_size: u32,
+}
+
+impl CompactChainState {
+    /// Constructs a prior-block description from its height, hash, and end-of-block tree sizes.
+    pub fn from_parts(
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+        sapling_tree_size: u32,
+        #[cfg(feature = "orchard")] orchard_tree_size: u32,
+        #[cfg(feature = "orchard")] ironwood_tree_size: u32,
+    ) -> Self {
+        Self {
+            block_height,
+            block_hash,
+            sapling_tree_size,
+            #[cfg(feature = "orchard")]
+            orchard_tree_size,
+            #[cfg(feature = "orchard")]
+            ironwood_tree_size,
+        }
+    }
+
+    /// Returns the block height this state describes.
+    pub fn block_height(&self) -> BlockHeight {
+        self.block_height
+    }
+
+    /// Returns the hash of the block this state describes.
+    pub fn block_hash(&self) -> BlockHash {
+        self.block_hash
+    }
+
+    /// Returns the Sapling note commitment tree size at the end of the block.
+    pub fn sapling_tree_size(&self) -> u32 {
+        self.sapling_tree_size
+    }
+
+    /// Returns the Orchard note commitment tree size at the end of the block.
+    #[cfg(feature = "orchard")]
+    pub fn orchard_tree_size(&self) -> u32 {
+        self.orchard_tree_size
+    }
+
+    /// Returns the Ironwood note commitment tree size at the end of the block.
+    #[cfg(feature = "orchard")]
+    pub fn ironwood_tree_size(&self) -> u32 {
+        self.ironwood_tree_size
+    }
+}
+
+/// Prior-block continuity for [`scan_cached_blocks`].
+///
+/// [`ChainState`] supplies frontiers so a spending wallet can append its note commitment trees.
+/// [`CompactChainState`] supplies only the height, hash, and end-of-block tree sizes a view-only
+/// scan checks.
+pub trait ScanContinuity {
+    /// The height of the block immediately before the range to scan.
+    fn block_height(&self) -> BlockHeight;
+
+    /// The hash of the block immediately before the range to scan.
+    fn block_hash(&self) -> BlockHash;
+
+    /// The Sapling note commitment tree size at the end of that block.
+    fn sapling_tree_size(&self) -> u64;
+
+    /// The Orchard note commitment tree size at the end of that block.
+    #[cfg(feature = "orchard")]
+    fn orchard_tree_size(&self) -> u64;
+
+    /// The Ironwood note commitment tree size at the end of that block.
+    #[cfg(feature = "orchard")]
+    fn ironwood_tree_size(&self) -> u64;
+
+    /// Frontiers for appending note commitment trees, when this value carries them.
+    fn commitment_trees(&self) -> Option<&ChainState>;
+
+    /// Height, hash, and tree sizes as block metadata.
+    ///
+    /// A tree size that does not fit in a `u32` is omitted. Compact blocks report sizes as
+    /// `u32`, so a spending frontier that does not fit cannot seed a view-only continuity check.
+    fn to_block_metadata(&self) -> BlockMetadata {
+        BlockMetadata::from_parts(
+            self.block_height(),
+            self.block_hash(),
+            u32::try_from(self.sapling_tree_size()).ok(),
+            #[cfg(feature = "orchard")]
+            u32::try_from(self.orchard_tree_size()).ok(),
+            #[cfg(feature = "orchard")]
+            u32::try_from(self.ironwood_tree_size()).ok(),
+        )
+    }
+
+    /// The compact form of this continuity value.
+    ///
+    /// Returns [`ScanError::TreeSizeOverflow`] when a tree size does not fit in a `u32`.
+    fn to_compact(&self) -> Result<CompactChainState, ScanError> {
+        let at_height = self.block_height();
+        Ok(CompactChainState::from_parts(
+            at_height,
+            self.block_hash(),
+            tree_size_to_u32(
+                zcash_protocol::ShieldedPool::Sapling,
+                at_height,
+                self.sapling_tree_size(),
+            )?,
+            #[cfg(feature = "orchard")]
+            tree_size_to_u32(
+                zcash_protocol::ShieldedPool::Orchard,
+                at_height,
+                self.orchard_tree_size(),
+            )?,
+            #[cfg(feature = "orchard")]
+            tree_size_to_u32(
+                zcash_protocol::ShieldedPool::Ironwood,
+                at_height,
+                self.ironwood_tree_size(),
+            )?,
+        ))
+    }
+}
+
+fn tree_size_to_u32(
+    protocol: zcash_protocol::ShieldedPool,
+    at_height: BlockHeight,
+    size: u64,
+) -> Result<u32, ScanError> {
+    u32::try_from(size).map_err(|_| ScanError::TreeSizeOverflow {
+        protocol,
+        at_height,
+    })
+}
+
+impl ScanContinuity for ChainState {
+    fn block_height(&self) -> BlockHeight {
+        ChainState::block_height(self)
+    }
+
+    fn block_hash(&self) -> BlockHash {
+        ChainState::block_hash(self)
+    }
+
+    fn sapling_tree_size(&self) -> u64 {
+        self.final_sapling_tree().tree_size()
+    }
+
+    #[cfg(feature = "orchard")]
+    fn orchard_tree_size(&self) -> u64 {
+        self.final_orchard_tree().tree_size()
+    }
+
+    #[cfg(feature = "orchard")]
+    fn ironwood_tree_size(&self) -> u64 {
+        self.final_ironwood_tree().tree_size()
+    }
+
+    fn commitment_trees(&self) -> Option<&ChainState> {
+        Some(self)
+    }
+}
+
+impl ScanContinuity for CompactChainState {
+    fn block_height(&self) -> BlockHeight {
+        self.block_height
+    }
+
+    fn block_hash(&self) -> BlockHash {
+        self.block_hash
+    }
+
+    fn sapling_tree_size(&self) -> u64 {
+        u64::from(self.sapling_tree_size)
+    }
+
+    #[cfg(feature = "orchard")]
+    fn orchard_tree_size(&self) -> u64 {
+        u64::from(self.orchard_tree_size)
+    }
+
+    #[cfg(feature = "orchard")]
+    fn ironwood_tree_size(&self) -> u64 {
+        u64::from(self.ironwood_tree_size)
+    }
+
+    fn commitment_trees(&self) -> Option<&ChainState> {
+        None
+    }
+
+    fn to_compact(&self) -> Result<CompactChainState, ScanError> {
+        Ok(*self)
+    }
+}
+
 /// Scans at most `limit` blocks from the provided block source in order to find transactions
 /// received by the accounts tracked in the provided wallet database.
 ///
@@ -613,26 +822,54 @@ impl ChainState {
 ///   surfaces such a failure as a `PutBlocksCommitmentTree` error identifying the affected
 ///   shielded pool and block range).
 ///
+/// `from_state` is the block immediately before `from_height`. A spending wallet passes a
+/// [`ChainState`], whose frontiers are appended with the scanned commitments. A view-only wallet
+/// — one whose every account is [`AccountPurpose::ViewOnly`](super::AccountPurpose::ViewOnly), or
+/// one configured with [`CommitmentTreeMaintenance::ViewOnly`](super::CommitmentTreeMaintenance::ViewOnly)
+/// — may instead pass a [`CompactChainState`] of height, hash, and the three end-of-block tree
+/// sizes. In that mode the scan checks that the next block's `prev_hash` matches and that each
+/// pool's tree size advances by the block's commitment count, and it persists received notes,
+/// spends, and block metadata without updating a note commitment tree.
+///
+/// A spending wallet passed a [`CompactChainState`] fails with
+/// [`ScanError::CommitmentTreeRequired`]: frontiers are still required to append the trees.
+///
 /// ## Panics
 ///
 /// This method will panic if `from_height != from_state.block_height() + 1`.
 #[tracing::instrument(skip(params, block_source, data_db, from_state))]
 #[allow(clippy::type_complexity)]
-pub fn scan_cached_blocks<ParamsT, DbT, BlockSourceT>(
+pub fn scan_cached_blocks<ParamsT, DbT, BlockSourceT, C>(
     params: &ParamsT,
     block_source: &BlockSourceT,
     data_db: &mut DbT,
     from_height: BlockHeight,
-    from_state: &ChainState,
+    from_state: &C,
     limit: usize,
 ) -> Result<ScanSummary, Error<<DbT as WalletRead>::Error, BlockSourceT::Error>>
 where
     ParamsT: consensus::Parameters + Send + 'static,
     BlockSourceT: BlockSource,
     DbT: WalletWrite,
+    C: ScanContinuity,
     <DbT as WalletRead>::AccountId: ConditionallySelectable + Default + Send + Sync + 'static,
 {
-    assert_eq!(from_height, from_state.block_height + 1);
+    assert_eq!(from_height, from_state.block_height() + 1);
+
+    let view_only = !data_db
+        .maintains_note_commitment_trees()
+        .map_err(Error::Wallet)?;
+    // A spending scan still requires frontiers. Resolved up front so a missing frontier fails
+    // before any block is read.
+    let spending_trees = if view_only {
+        None
+    } else {
+        Some(from_state.commitment_trees().ok_or_else(|| {
+            Error::Scan(ScanError::CommitmentTreeRequired {
+                at_height: from_state.block_height(),
+            })
+        })?)
+    };
 
     // Fetch the viewing keys we are tracking. Prefer UFVKs when available so that
     // both external and internal scopes (and nullifiers) can be observed; fall back
@@ -667,6 +904,13 @@ where
     } else {
         None
     };
+    // A spending scan leaves a missing prior block unchecked, as it always has: the frontiers
+    // passed to `put_blocks` are what connect the note commitment trees. A view-only scan has
+    // no frontiers, so the caller's height, hash, and tree sizes stand in for that block when
+    // it has not yet been stored (the birthday, including one below Sapling activation).
+    if view_only && prior_block_metadata.is_none() && from_height > BlockHeight::from(0) {
+        prior_block_metadata = Some(from_state.to_block_metadata());
+    }
 
     // Get the spend identifiers for the unspent outputs we are tracking.
     let mut spend_ids = SpendIdentifiers::unspent(data_db).map_err(Error::Wallet)?;
@@ -721,9 +965,16 @@ where
         },
     )?;
 
-    data_db
-        .put_blocks(from_state, scanned_blocks)
-        .map_err(Error::Wallet)?;
+    if let Some(trees) = spending_trees {
+        data_db
+            .put_blocks(trees, scanned_blocks)
+            .map_err(Error::Wallet)?;
+    } else {
+        let prior = from_state.to_compact().map_err(Error::Scan)?;
+        data_db
+            .put_blocks_without_commitment_trees(&prior, scanned_blocks)
+            .map_err(Error::Wallet)?;
+    }
     Ok(scan_summary)
 }
 

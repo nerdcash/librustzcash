@@ -414,7 +414,17 @@ pub(crate) fn scan_complete<P: consensus::Parameters>(
     params: &P,
     range: Range<BlockHeight>,
     wallet_note_positions: &[(ShieldedPool, Position)],
+    extend_witness_ranges: bool,
 ) -> Result<(), SqliteClientError> {
+    // A view-only scan records the range as scanned and stops. FoundNote extensions exist to
+    // finish the shards that contain discovered notes so those notes can be spent, and
+    // `witness_stabilized` is spendability. Neither is meaningful without commitment trees.
+    if !extend_witness_ranges {
+        let scanned = ScanRange::from_parts(range.clone(), ScanPriority::Scanned);
+        replace_queue_entries::<SqliteClientError>(conn, &range, Some(scanned).into_iter(), false)?;
+        return Ok(());
+    }
+
     // Read the wallet birthday (if known).
     // TODO: use per-pool birthdays?
     let wallet_birthday = wallet_birthday(conn)?;
@@ -615,6 +625,7 @@ pub(crate) fn update_chain_tip<P: consensus::Parameters>(
     conn: &rusqlite::Transaction<'_>,
     params: &P,
     new_tip: BlockHeight,
+    view_only: bool,
 ) -> Result<(), SqliteClientError> {
     // If the caller provided a chain tip that is before Sapling activation, do nothing.
     let sapling_activation = match params.activation_height(NetworkUpgrade::Sapling) {
@@ -665,6 +676,9 @@ pub(crate) fn update_chain_tip<P: consensus::Parameters>(
         .min();
     #[cfg(not(feature = "orchard"))]
     let min_shard_tip = sapling_shard_tip;
+    // The shard-tip range exists to keep the last incomplete shard witnessable. A view-only
+    // queue does not pull the tip back to that shard.
+    let min_shard_tip = min_shard_tip.filter(|_| !view_only);
 
     // Create a scanning range for the fragment of the last shard leading up to new tip.
     // We set a lower bound at the wallet birthday (if known), because account creation
@@ -677,6 +691,10 @@ pub(crate) fn update_chain_tip<P: consensus::Parameters>(
 
     // Create scan ranges to either validate potentially invalid blocks at the wallet's
     // view of the chain tip, or connect the prior tip to the new tip.
+    // A view-only catch-up is Historic through the tip. When the scanned height is still inside
+    // the stable region, the same `Verify` lookahead a spending wallet uses is overlaid on the
+    // front of that range so a reorg is checked before older blocks are trusted.
+    let mut view_only_verify = None;
     let tip_entry = max_scanned.map_or_else(
         || {
             // No blocks have been scanned, so we need to anchor the start of the new scan
@@ -698,6 +716,20 @@ pub(crate) fn update_chain_tip<P: consensus::Parameters>(
             // (if it exists), the connectivity of the scan range to the max scanned block
             // will always be checked if relevant.
             let min_unscanned = max_scanned + 1;
+
+            if view_only {
+                let stable_height = new_tip.saturating_sub(PRUNING_DEPTH);
+                if max_scanned <= stable_height {
+                    let verify_end = min(stable_height + 1, min_unscanned + VERIFY_LOOKAHEAD);
+                    if verify_end > min_unscanned {
+                        view_only_verify = Some(ScanRange::from_parts(
+                            min_unscanned..verify_end,
+                            ScanPriority::Verify,
+                        ));
+                    }
+                }
+                return ScanRange::from_parts(min_unscanned..chain_end, ScanPriority::Historic);
+            }
 
             // If we don't have shard metadata, this means we're doing linear scanning, so
             // create a scan range from the prior tip to the current tip with `Historic`
@@ -778,7 +810,10 @@ pub(crate) fn update_chain_tip<P: consensus::Parameters>(
     replace_queue_entries::<SqliteClientError>(
         conn,
         &query_range,
-        tip_shard_entry.into_iter().chain(Some(tip_entry)),
+        tip_shard_entry
+            .into_iter()
+            .chain(view_only_verify)
+            .chain(Some(tip_entry)),
         false,
     )?;
 
