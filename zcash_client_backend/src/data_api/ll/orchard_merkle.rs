@@ -1,10 +1,11 @@
 //! Orchard note-commitment hashing with the Sinsemilla generators cached.
 //!
-//! [`orchard::tree::MerkleHashOrchard::combine`] rebuilds each of the 1,024 Sinsemilla
-//! generators with a curve-equation check. Those points are constant, so this module validates
-//! them once and reuses the affine points. The message layout, the incomplete-addition rules, and
-//! the extracted digest match `combine`. Pairs at one level are independent and are hashed in
-//! parallel; the final coordinate extraction is one batched inversion.
+//! The scalar [`incrementalmerkletree::Hashable::combine`] implementation rebuilds each of the
+//! 1,024 Sinsemilla generators with a curve-equation check. Those points are constant, so this
+//! module validates them once and reuses the affine points. The message layout, the
+//! incomplete-addition rules, and the extracted digest match that scalar hash. Pairs at one
+//! level are independent and are hashed in parallel; the final coordinate extraction is one
+//! batched inversion.
 
 use std::sync::OnceLock;
 

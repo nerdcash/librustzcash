@@ -574,9 +574,12 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
     /// Construct a [`WalletDb`] instance that connects to the wallet database stored at the
     /// specified path.
     ///
-    /// The connection uses WAL journaling and `synchronous = NORMAL`, so a committed batch
-    /// survives a process crash. A power loss can still drop the last commit. The page cache is
-    /// 64 MiB, which is enough for a historic scan's block rows and note-commitment frontier.
+    /// The connection uses WAL journaling and `synchronous = NORMAL`. Recovery applies only
+    /// complete WAL commit frames and discards a torn frame, so a crash cannot leave a
+    /// half-written page or a corrupt database. An application crash keeps the last commit.
+    /// A power loss or operating-system crash can still roll back commits since the last
+    /// checkpoint, which for a scan is the last batch. The page cache is 64 MiB, which is
+    /// enough for a historic scan's block rows and note-commitment frontier.
     ///
     /// ## Parameters
     /// - `path`: The path to the SQLite database used to store wallet data.
@@ -593,10 +596,11 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
         rusqlite::Connection::open(path).and_then(move |conn| {
             rusqlite::vtab::array::load_module(&conn)?;
             // Historic scans write tens of thousands of block rows and rewrite the note
-            // commitment frontier in one transaction per batch. WAL with NORMAL sync keeps
-            // those commits durable across a process crash and skips a full fsync of the
-            // rollback journal on every batch. The page cache stays large enough for the
-            // working set of a sync.
+            // commitment frontier in one transaction per batch. WAL with NORMAL sync skips a
+            // full fsync on every batch. SQLite still writes each commit as a complete WAL
+            // frame and, on the next open, replays only complete frames, so the database
+            // cannot be torn. A power loss can drop frames not yet checkpointed. The page
+            // cache stays large enough for the working set of a sync.
             conn.execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = NORMAL;
