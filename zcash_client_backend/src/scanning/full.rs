@@ -8,7 +8,7 @@ use sapling::note_encryption::SaplingDomain;
 use subtle::ConditionallySelectable;
 use tracing::{debug, trace, warn};
 
-use zcash_note_encryption::{Domain, batch};
+use zcash_note_encryption::Domain;
 use zcash_primitives::{
     block::{Block, BlockHeader},
     transaction::{Transaction, components::sapling::zip212_enforcement},
@@ -31,7 +31,10 @@ use crate::{
     data_api::{
         BlockMetadata, ScannedBlock, ScannedBundles, ll::wallet::detect_wallet_transparent_outputs,
     },
-    scan::{Batch, BatchReceiver, BatchRunner, DecryptedOutput, FullDecryptor, Tasks},
+    scan::{
+        Batch, BatchReceiver, BatchRunner, DecryptedOutput, FullDecryptor, Tasks,
+        parallel_try_note_decryption,
+    },
     wallet::{WalletSpend, WalletTx},
 };
 
@@ -48,6 +51,11 @@ use std::marker::PhantomData;
 use transparent::{address::TransparentAddress, keys::TransparentKeyScope};
 
 /// The default number of outputs at which a batch runner immediately flushes a batch.
+///
+/// [`crate::scan::BatchRunner::flush`] then splits a batch of this size into one serial
+/// task per rayon thread, as long as each task still has a few dozen outputs. 200 is
+/// enough work to fill a typical machine once it is split, and small enough that a
+/// stream of outputs starts decrypting before the rest of the block has been queued.
 pub(crate) const DEFAULT_BATCH_SIZE_THRESHOLD: usize = 200;
 
 type TaggedSaplingBatch<IvkTag> = Batch<
@@ -605,7 +613,7 @@ where
                         .map(|output| (SaplingDomain::new(zip212_enforcement), output.clone()))
                         .collect::<Vec<_>>(),
                     Some(move |_| sapling_decrypted),
-                    batch::try_note_decryption,
+                    parallel_try_note_decryption,
                     |output| sapling::Node::from_cmu(output.cmu()),
                     |note| note,
                 )
@@ -631,7 +639,7 @@ where
                         .map(|action| (OrchardDomain::for_action(action), action.clone()))
                         .collect::<Vec<_>>(),
                     Some(move |_| orchard_decrypted),
-                    batch::try_note_decryption,
+                    parallel_try_note_decryption,
                     |action| MerkleHashOrchard::from_cmx(action.cmx()),
                     |note| (note, orchard::ValuePool::Orchard),
                 )
@@ -657,7 +665,7 @@ where
                         .map(|action| (IronwoodDomain::for_action(action), action.clone()))
                         .collect::<Vec<_>>(),
                     Some(move |_| ironwood_decrypted),
-                    batch::try_note_decryption,
+                    parallel_try_note_decryption,
                     |action| MerkleHashOrchard::from_cmx(action.cmx()),
                     |note| (note, orchard::ValuePool::Ironwood),
                 )

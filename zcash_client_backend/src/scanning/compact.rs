@@ -5,7 +5,6 @@ use sapling::note_encryption::{CompactOutputDescription, SaplingDomain};
 use subtle::ConditionallySelectable;
 
 use tracing::{debug, trace, warn};
-use zcash_note_encryption::batch;
 use zcash_primitives::transaction::components::sapling::zip212_enforcement;
 use zcash_protocol::{
     ShieldedPool,
@@ -19,7 +18,7 @@ use super::{
 use crate::{
     data_api::{BlockMetadata, ScannedBlock, ScannedBundles},
     proto::compact_formats::{ChainMetadata, CompactBlock, CompactTx},
-    scan::{Batch, BatchRunner, CompactDecryptor, Tasks},
+    scan::{Batch, BatchRunner, CompactDecryptor, Tasks, parallel_try_compact_note_decryption},
     wallet::{WalletSpend, WalletTx},
 };
 
@@ -472,7 +471,7 @@ where
                 .as_mut()
                 .map(|runners| |txid| runners.sapling.collect_results(cur_hash, txid)),
             |ivks, outputs| {
-                batch::try_compact_note_decryption(ivks, outputs)
+                parallel_try_compact_note_decryption(ivks, outputs)
                     .into_iter()
                     .map(|opt| opt.map(|((note, recipient), i)| ((note, recipient, ()), i)))
                     .collect()
@@ -510,7 +509,7 @@ where
                 .as_mut()
                 .map(|runners| |txid| runners.orchard.collect_results(cur_hash, txid)),
             |ivks, outputs| {
-                batch::try_compact_note_decryption(ivks, outputs)
+                parallel_try_compact_note_decryption(ivks, outputs)
                     .into_iter()
                     .map(|opt| opt.map(|((note, recipient), i)| ((note, recipient, ()), i)))
                     .collect()
@@ -548,7 +547,7 @@ where
                 .as_mut()
                 .map(|runners| |txid| runners.ironwood.collect_results(cur_hash, txid)),
             |ivks, outputs| {
-                batch::try_compact_note_decryption(ivks, outputs)
+                parallel_try_compact_note_decryption(ivks, outputs)
                     .into_iter()
                     .map(|opt| opt.map(|((note, recipient), i)| ((note, recipient, ()), i)))
                     .collect()
@@ -901,11 +900,11 @@ impl PositionTracker {
 ///
 /// This is only the trial-decryption phase of [`crate::scanning::scan_block`]: nullifier
 /// matching, note-commitment tree updates, and transparent address lookups are not
-/// performed. Both routines decrypt with
-/// `zcash_note_encryption::batch::try_compact_note_decryption` and the same note-encryption
-/// domains, so a benchmark can divide the time spent here by the time spent in
-/// [`crate::scanning::scan_block`] to measure the fraction of a scan that is trial
-/// decryption.
+/// performed. Both routines decrypt with the same parallel batch helper and the same
+/// note-encryption domains, so a benchmark can divide the time spent here by the time
+/// spent in [`crate::scanning::scan_block`] to measure the fraction of a scan that is
+/// trial decryption. A batch large enough to occupy more than one core is split across
+/// the rayon pool when this is called from outside that pool.
 ///
 /// Incoming viewing keys are prepared once per transaction, matching the inline compact
 /// scan path.
@@ -947,7 +946,7 @@ where
                     })
             })
             .collect::<Result<Vec<_>, ScanError>>()?;
-        decrypted += batch::try_compact_note_decryption(&sapling_ivks, &sapling_outputs)
+        decrypted += parallel_try_compact_note_decryption(&sapling_ivks, &sapling_outputs)
             .into_iter()
             .flatten()
             .count();
@@ -975,7 +974,7 @@ where
                     Ok((OrchardDomain::for_compact_action(&action), action))
                 })
                 .collect::<Result<Vec<_>, ScanError>>()?;
-            decrypted += batch::try_compact_note_decryption(&orchard_ivks, &orchard_outputs)
+            decrypted += parallel_try_compact_note_decryption(&orchard_ivks, &orchard_outputs)
                 .into_iter()
                 .flatten()
                 .count();
@@ -1001,7 +1000,7 @@ where
                     Ok((IronwoodDomain::for_compact_action(&action), action))
                 })
                 .collect::<Result<Vec<_>, ScanError>>()?;
-            decrypted += batch::try_compact_note_decryption(&ironwood_ivks, &ironwood_outputs)
+            decrypted += parallel_try_compact_note_decryption(&ironwood_ivks, &ironwood_outputs)
                 .into_iter()
                 .flatten()
                 .count();
@@ -1323,6 +1322,52 @@ mod tests {
     fn trial_decrypt_matches_scan_for_owned_orchard_and_ironwood_notes() {
         assert_owned_note_matches_scan(ShieldedPool::Orchard);
         assert_owned_note_matches_scan(ShieldedPool::Ironwood);
+    }
+
+    /// A batch larger than one chunk per core must keep every decrypted note, in order.
+    /// 128 copies of one real output forces the parallel split on any machine with at
+    /// least two cores, and is still correct on one core.
+    #[test]
+    fn trial_decrypt_parallel_chunks_keep_every_note() {
+        let network = Network::TestNetwork;
+        let account = AccountId::ZERO;
+        let usk = UnifiedSpendingKey::from_seed(&network, &[0u8; 32], account).expect("Valid USK");
+        let ufvk = usk.to_unified_full_viewing_key();
+        let sapling_dfvk = ufvk.sapling().expect("Sapling key is present").clone();
+        let scanning_keys = ScanningKeys::from_account_ufvks([(account, ufvk)]);
+
+        let mut cb = fake_compact_block(
+            1u32.into(),
+            BlockHash([0; 32]),
+            Nullifier([0; 32]),
+            &sapling_dfvk,
+            Zatoshis::const_from_u64(5),
+            false,
+            None,
+        );
+        let real = cb.vtx[1].outputs[0].clone();
+        const COPIES: usize = 128;
+        cb.vtx[1].outputs = vec![real; COPIES];
+
+        let decrypted = super::trial_decrypt_compact_block(&network, &cb, &scanning_keys).unwrap();
+        assert_eq!(decrypted, COPIES);
+
+        let scanned = scan_block::<_, _, _, Infallible>(
+            &network,
+            cb,
+            &scanning_keys,
+            &SpendIdentifiers::empty(),
+            None,
+            #[cfg(feature = "transparent-inputs")]
+            |_addr| Ok(None),
+        )
+        .unwrap();
+        let found: usize = scanned
+            .transactions()
+            .iter()
+            .map(|tx| tx.sapling_outputs().len())
+            .sum();
+        assert_eq!(found, COPIES);
     }
 
     #[cfg(feature = "orchard")]

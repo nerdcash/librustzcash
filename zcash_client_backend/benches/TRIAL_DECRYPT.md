@@ -57,3 +57,25 @@ because this scanner does not use rayon.
 The fixture copy that `scan_block` requires happens before the scan timer.
 Ordinary blocks alone (206 notes) ran at about 8,600–9,100 notes/sec with the
 same ~100% share. Later commits should append rows to this table.
+
+## Parallel batch decryption
+
+`parallel_try_compact_note_decryption` splits a top-level batch into one rayon
+chunk per core once the batch has at least 32 outputs per chunk. A batch task
+already running on the pool stays serial, and `BatchRunner::flush` is what
+spreads that task across the pool instead. Ordinary blocks are below the
+threshold, so they stay on one core.
+
+| Change | Cores | Range | notes/sec | decrypt share of scan |
+| --- | --- | --- | --- | --- |
+| parallel chunks | 1 | spam | 7664.3 | 100.0% |
+| parallel chunks | 2 | spam | 14196.8 | 99.8% |
+| parallel chunks | 4 | spam | 28128.6 | 99.9% |
+| parallel chunks | 1 | combined | 7660.5 | 100.1% |
+| parallel chunks | 2 | combined | 14390.5 | 99.4% |
+| parallel chunks | 4 | combined | 27917.0 | 99.3% |
+
+Against the baseline at the same core count, the spam range is 1.05x at one
+core (inside run-to-run noise), 1.89x at two cores, and 3.68x at four cores.
+Ordinary blocks stay near 9,000 notes/sec at every core count because they are
+below the split threshold.
