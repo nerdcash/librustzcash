@@ -2098,27 +2098,44 @@ impl Drop for StagingJob {
 /// Sorts `spends` off the SQLite writer when this target can create a thread.
 ///
 /// `wasm32` (including `wasm32-wasip1`, which CI builds) has no threads:
-/// `std::thread::spawn` panics there. Native targets try `Builder::spawn` and
-/// sort inline if the process cannot create a thread. An empty set does not
+/// `std::thread::spawn` panics there, so those targets sort inline. Native
+/// targets make one `Builder::spawn` attempt. The spend vector stays reachable
+/// if that attempt fails, and is then sorted inline. An empty set does not
 /// start a thread.
 fn start_staging(spends: Vec<StagedSpend>) -> StagingJob {
     if spends.is_empty() {
         return StagingJob::Inline(spends);
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if std::thread::Builder::new()
-        .name("nullifier-stage".into())
-        .spawn(|| ())
-        .is_ok()
     {
-        // The probe consumed no spend data. Moving `spends` into the worker is
-        // safe only because thread creation just succeeded.
-        let handle = std::thread::Builder::new()
+        // One spawn. The vector stays in the mutex until the worker takes it, so
+        // a failed spawn still has the spends and can sort them inline. A probe
+        // thread would itself occupy the last available slot and make this spawn
+        // fail.
+        let held = std::sync::Arc::new(std::sync::Mutex::new(Some(spends)));
+        let for_worker = std::sync::Arc::clone(&held);
+        match std::thread::Builder::new()
             .name("nullifier-stage".into())
-            .spawn(move || stage_surviving_spends(spends))
-            .expect("nullifier staging thread");
-        return StagingJob::Thread(Some(handle));
+            .spawn(move || {
+                let spends = for_worker
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                    .expect("staged spends");
+                stage_surviving_spends(spends)
+            }) {
+            Ok(handle) => StagingJob::Thread(Some(handle)),
+            Err(_) => {
+                let spends = held
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                    .expect("staged spends were not taken");
+                StagingJob::Inline(stage_surviving_spends(spends))
+            }
+        }
     }
+    #[cfg(target_arch = "wasm32")]
     StagingJob::Inline(stage_surviving_spends(spends))
 }
 

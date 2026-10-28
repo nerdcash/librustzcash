@@ -188,11 +188,6 @@ pub(crate) const PRUNING_DEPTH: u32 = 100;
 pub(crate) static NULLIFIER_MAP_WRITE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// A WAL truncation was blocked by a reader after pages were freed. The next
-/// reclamation retries the checkpoint even when the freelist is already empty.
-static WAL_CHECKPOINT_PENDING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 #[cfg(any(test, feature = "test-dependencies"))]
 thread_local! {
     /// When set on this thread, the next `put_blocks` on this thread finishes
@@ -326,6 +321,9 @@ pub struct WalletDb<C, P, CL, R> {
     /// Not persisted. Defaults to `true`, which is the spending-wallet behavior.
     /// A view-only scan does not write checkpoints at all.
     anchor_retention_enabled: bool,
+    /// This wallet still needs a WAL truncation after a reader blocked it.
+    /// Kept on the handle so a scan of a different database cannot clear it.
+    wal_checkpoint_pending: std::sync::atomic::AtomicBool,
     #[cfg(feature = "transparent-inputs")]
     gap_limits: GapLimits,
 }
@@ -637,6 +635,7 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
                 commitment_tree_write_back: true,
                 commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
                 anchor_retention_enabled: true,
+                wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "transparent-inputs")]
                 gap_limits: GapLimits::default(),
             })
@@ -778,6 +777,7 @@ impl<C: Borrow<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             commitment_tree_write_back: true,
             commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
             anchor_retention_enabled: true,
+            wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: GapLimits::default(),
         }
@@ -829,12 +829,17 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletDb<
             drop(stmt);
             // Truncating a WAL database waits on the checkpoint. Remember to
             // retry it even after the freelist is already empty.
-            WAL_CHECKPOINT_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.wal_checkpoint_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        if WAL_CHECKPOINT_PENDING.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .wal_checkpoint_pending
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             let journal: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
             if !journal.eq_ignore_ascii_case("wal") {
-                WAL_CHECKPOINT_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.wal_checkpoint_pending
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 return Ok(());
             }
             // `wal_checkpoint` returns (busy, log frames, checkpointed frames).
@@ -855,7 +860,8 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletDb<
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             }
-            WAL_CHECKPOINT_PENDING.store(still_busy, std::sync::atomic::Ordering::Relaxed);
+            self.wal_checkpoint_pending
+                .store(still_busy, std::sync::atomic::Ordering::Relaxed);
             if still_busy {
                 warn!("wal checkpoint remained busy after spend-map reclamation");
             }
@@ -889,6 +895,9 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             commitment_tree_write_back: self.commitment_tree_write_back,
             commitment_tree_maintenance: self.commitment_tree_maintenance,
             anchor_retention_enabled: self.anchor_retention_enabled,
+            // Reclamation runs on the outer handle after this transaction
+            // commits. This temporary handle does not own that retry.
+            wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
@@ -950,6 +959,7 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             commitment_tree_write_back: self.commitment_tree_write_back,
             commitment_tree_maintenance: self.commitment_tree_maintenance,
             anchor_retention_enabled: self.anchor_retention_enabled,
+            wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };

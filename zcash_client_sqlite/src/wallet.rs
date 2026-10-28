@@ -4589,6 +4589,7 @@ pub(crate) fn truncate_to_height_internal<P: consensus::Parameters>(
             commitment_tree_write_back,
             commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
             anchor_retention_enabled: true,
+            wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: *gap_limits,
         };
