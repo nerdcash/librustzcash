@@ -385,12 +385,14 @@ fn view_only_chain_tip_does_not_walk_back_to_an_incomplete_shard() {
         .network()
         .activation_height(NetworkUpgrade::Sapling)
         .unwrap();
-    let mut tables = vec!["sapling_tree_shards"];
     #[cfg(feature = "orchard")]
-    {
-        tables.push("orchard_tree_shards");
-        tables.push("ironwood_tree_shards");
-    }
+    let tables = [
+        "sapling_tree_shards",
+        "orchard_tree_shards",
+        "ironwood_tree_shards",
+    ];
+    #[cfg(not(feature = "orchard"))]
+    let tables = ["sapling_tree_shards"];
     for wallet in [spending.wallet().conn(), view_only.wallet().conn()] {
         for table in &tables {
             wallet
