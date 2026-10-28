@@ -47,6 +47,12 @@ workspace.
   keys.
 
 ### Changed
+- Spend-map insertion during a scan batch uses the fully-scanned height that the
+  batch produces once it is merged with adjacent scanned ranges. A historic batch
+  that closes the gap up to an already-scanned suffix keeps only the retention
+  window of that suffix, instead of inserting every nullifier in the batch and
+  deleting it again. A batch that still leaves a gap below itself tracks every
+  spend, so a note discovered later in that gap is still matched.
 - `scan_cached_blocks` takes its prior block as `ScanContinuity`. Callers that
   pass `&ChainState` keep the previous spending-wallet behavior. A view-only
   wallet persists the batch without frontiers and without subtree roots.

@@ -444,6 +444,16 @@ mod tests {
     }
 
     #[test]
+    fn tip_first_historic_nullifier_map_stays_bounded() {
+        testing::pool::tip_first_historic_nullifier_map_stays_bounded();
+    }
+
+    #[test]
+    fn bridging_historic_batch_skips_nullifiers_below_the_floor() {
+        testing::pool::bridging_historic_batch_skips_nullifiers_below_the_floor();
+    }
+
+    #[test]
     fn rewind_after_non_contiguous_scan_sapling() {
         testing::pool::rewind_after_non_contiguous_scan::<SaplingPoolTester>()
     }

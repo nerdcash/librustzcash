@@ -1058,6 +1058,124 @@ pub(crate) fn orchard_to_ironwood_self_migration_reports_fee_only_delta() {
     );
 }
 
+/// Tip-first sync: scan a chain-tip range, then backfill history from the tip downward.
+///
+/// Each block carries unrelated Sapling spends. The nullifier map has to remember
+/// those spends until the birthday gap closes, and must then drop back to the
+/// retention window with the freed pages returned to the file.
+pub(crate) fn tip_first_historic_nullifier_map_stays_bounded() {
+    use zcash_client_backend::data_api::ll::wallet::SPEND_MAP_RETENTION_BLOCKS;
+
+    let mut st =
+        TestDsl::with_sapling_birthday_account(TestDbFactory::default(), BlockCache::new())
+            .build::<SaplingPoolTester>();
+    let birthday = st
+        .network()
+        .activation_height(NetworkUpgrade::Sapling)
+        .unwrap();
+
+    const TOTAL: u32 = 1600;
+    const TIP: u32 = 30;
+    const CHUNK: u32 = 100;
+    const SPENDS: usize = 12;
+    for _ in 0..TOTAL {
+        st.generate_next_block_with_unrelated_spends(SPENDS);
+    }
+    let tip = birthday + TOTAL - 1;
+    st.scan_cached_blocks(tip - TIP + 1, TIP as usize);
+
+    let mut end = tip - TIP + 1;
+    let mut max_rows = 0i64;
+    let mut max_pages = 0i64;
+    while end > birthday {
+        let start = if end - birthday > CHUNK {
+            end - CHUNK
+        } else {
+            birthday
+        };
+        st.scan_cached_blocks(start, usize::try_from(end - start).unwrap());
+        let (rows, pages, _, _) = nullifier_map_stats(st.wallet().conn());
+        max_rows = max_rows.max(rows);
+        max_pages = max_pages.max(pages);
+        end = start;
+    }
+
+    // One more frontier-extending block, matching a sync that keeps following the tip
+    // after history connects.
+    st.generate_next_block_with_unrelated_spends(SPENDS);
+    st.scan_cached_blocks(tip + 1, 1);
+    let (final_rows, final_pages, freelist, page_size) = nullifier_map_stats(st.wallet().conn());
+    max_pages = max_pages.max(final_pages);
+
+    let row_bound = i64::from(SPEND_MAP_RETENTION_BLOCKS + 3) * SPENDS as i64;
+    assert!(
+        final_rows <= row_bound,
+        "nullifier_map rows {final_rows} exceeded the retention bound {row_bound}"
+    );
+    assert_eq!(
+        freelist, 0,
+        "freed nullifier-map pages were not reclaimed (pages={final_pages}, rows={final_rows})"
+    );
+    assert!(
+        final_pages * 2 < max_pages,
+        "high-water did not shrink: max_pages={max_pages} final_pages={final_pages} page_size={page_size} max_rows={max_rows} final_rows={final_rows}"
+    );
+    eprintln!(
+        "tip-first high-water max_pages={max_pages} ({:.2} MiB) final_pages={final_pages} ({:.2} MiB) max_rows={max_rows} final_rows={final_rows} page_size={page_size}",
+        (max_pages * page_size) as f64 / (1024.0 * 1024.0),
+        (final_pages * page_size) as f64 / (1024.0 * 1024.0),
+    );
+}
+
+/// One historic batch that starts at the birthday and runs up to an already-scanned
+/// tip must not insert nullifiers the retention window will drop.
+pub(crate) fn bridging_historic_batch_skips_nullifiers_below_the_floor() {
+    use zcash_client_backend::data_api::ll::wallet::SPEND_MAP_RETENTION_BLOCKS;
+
+    let mut st =
+        TestDsl::with_sapling_birthday_account(TestDbFactory::default(), BlockCache::new())
+            .build::<SaplingPoolTester>();
+    let birthday = st
+        .network()
+        .activation_height(NetworkUpgrade::Sapling)
+        .unwrap();
+
+    const TOTAL: u32 = 400;
+    const TIP: u32 = 20;
+    const SPENDS: usize = 10;
+    for _ in 0..TOTAL {
+        st.generate_next_block_with_unrelated_spends(SPENDS);
+    }
+    let tip = birthday + TOTAL - 1;
+    let historic_end = tip - TIP + 1;
+    st.scan_cached_blocks(historic_end, TIP as usize);
+    let (after_tip, _, _, _) = nullifier_map_stats(st.wallet().conn());
+    st.scan_cached_blocks(birthday, usize::try_from(historic_end - birthday).unwrap());
+    let (rows, _, freelist, _) = nullifier_map_stats(st.wallet().conn());
+    let row_bound = i64::from(SPEND_MAP_RETENTION_BLOCKS + 3) * SPENDS as i64;
+    assert!(
+        rows <= row_bound,
+        "bridging batch left {rows} nullifiers (bound {row_bound}, tip had {after_tip})"
+    );
+    assert_eq!(freelist, 0, "bridging batch left {freelist} freelist pages");
+}
+
+fn nullifier_map_stats(conn: &rusqlite::Connection) -> (i64, i64, i64, i64) {
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM nullifier_map", [], |row| row.get(0))
+        .unwrap();
+    let pages: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .unwrap();
+    let freelist: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .unwrap();
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap();
+    (rows, pages, freelist, page_size)
+}
+
 #[cfg(feature = "orchard")]
 pub(crate) fn propose_v5_payment_to_orchard_receiver_is_rejected() {
     zcash_client_backend::data_api::testing::pool::propose_v5_payment_to_orchard_receiver_is_rejected(

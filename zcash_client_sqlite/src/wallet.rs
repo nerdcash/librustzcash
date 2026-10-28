@@ -3711,6 +3711,58 @@ pub(crate) fn fully_scanned_height(
         .flatten())
 }
 
+/// The fully-scanned height if `batch` (end-exclusive) were marked
+/// [`ScanPriority::Scanned`] and merged with adjacent scanned ranges.
+///
+/// `None` when the wallet has no birthday, or when the merged range that covers
+/// the birthday would not include the batch. A historic chunk scanned above a gap
+/// therefore returns the pre-batch frontier (or `None`), while the chunk that
+/// finally touches the birthday returns the end of the already-scanned suffix.
+pub(crate) fn prospective_fully_scanned_height(
+    conn: &rusqlite::Connection,
+    batch: std::ops::Range<BlockHeight>,
+) -> Result<Option<BlockHeight>, rusqlite::Error> {
+    let Some(birthday) = wallet_birthday(conn)? else {
+        return Ok(None);
+    };
+
+    let mut ranges = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT block_range_start, block_range_end
+             FROM scan_queue
+             WHERE priority = :priority
+             ORDER BY block_range_start ASC",
+        )?;
+        let mut rows =
+            stmt.query(named_params![":priority": priority_code(&ScanPriority::Scanned)])?;
+        while let Some(row) = rows.next()? {
+            ranges.push((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?));
+        }
+    }
+
+    if !batch.is_empty() {
+        ranges.push((u32::from(batch.start), u32::from(batch.end)));
+        ranges.sort_unstable();
+    }
+
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some((_, merged_end)) = merged.last_mut()
+            && start <= *merged_end
+        {
+            *merged_end = (*merged_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+
+    let birthday = u32::from(birthday);
+    Ok(merged.into_iter().find_map(|(start, end)| {
+        (start <= birthday && end > birthday).then_some(BlockHeight::from(end - 1))
+    }))
+}
+
 #[tracing::instrument(skip_all)]
 pub(crate) fn block_fully_scanned<P: consensus::Parameters>(
     conn: &rusqlite::Connection,

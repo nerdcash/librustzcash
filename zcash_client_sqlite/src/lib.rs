@@ -785,6 +785,42 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletDb<
             !wallet::maintains_note_commitment_trees(&tx, self.commitment_tree_maintenance)?;
         wallet::get_wallet_snapshot(&tx, &self.params, confirmations_policy, view_only)
     }
+
+    /// Returns spend-map freelist pages to the file so a prune does not leave the
+    /// database at its high-water mark.
+    ///
+    /// No-op unless the database is in `auto_vacuum=INCREMENTAL` mode. Pages that
+    /// still hold a retained nullifier stay allocated; this only truncates pages
+    /// SQLite has already freed.
+    fn reclaim_freed_pages(&self) -> Result<(), SqliteClientError> {
+        let conn = self.conn.borrow();
+        let freelist: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        if freelist == 0 {
+            return Ok(());
+        }
+        let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+        // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. Incremental vacuum is a no-op in
+        // the other modes, and a FULL vacuum here would rewrite the whole file.
+        if mode != 2 {
+            return Ok(());
+        }
+        // Drain the pragma's result rows without assuming a column layout.
+        // `incremental_vacuum` reports leftover freelist pages on some SQLite
+        // builds and an empty row on others.
+        {
+            let mut stmt = conn.prepare("PRAGMA incremental_vacuum")?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+        }
+        let journal: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if journal.eq_ignore_ascii_case("wal") {
+            // A WAL database does not truncate until the WAL is checkpointed.
+            let mut stmt = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+        }
+        Ok(())
+    }
 }
 
 impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
@@ -2180,7 +2216,12 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         from_state: &ChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
-        self.transactionally(|wdb| wdb.put_blocks(from_state, blocks))
+        self.transactionally(|wdb| wdb.put_blocks(from_state, blocks))?;
+        // Spend-map deletes free b-tree pages onto the freelist. Without a vacuum
+        // those pages stay in the file, so a tip-first sync's historic nullifiers
+        // keep the database at its high-water after they have been pruned.
+        self.reclaim_freed_pages()?;
+        Ok(())
     }
 
     fn put_blocks_without_commitment_trees(
@@ -2188,7 +2229,9 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         prior: &CompactChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
-        self.transactionally(|wdb| wdb.put_blocks_without_commitment_trees(prior, blocks))
+        self.transactionally(|wdb| wdb.put_blocks_without_commitment_trees(prior, blocks))?;
+        self.reclaim_freed_pages()?;
+        Ok(())
     }
 
     fn put_received_transparent_utxo(
@@ -3146,6 +3189,14 @@ impl<'a, C: Borrow<rusqlite::Transaction<'a>>, P: consensus::Parameters, CL: Clo
             wallet::block_fully_scanned(self.conn.borrow(), &self.params)?
                 .map(|meta| meta.block_height()),
         )
+    }
+
+    fn prospective_block_fully_scanned_height(
+        &self,
+        batch: Range<BlockHeight>,
+    ) -> Result<Option<BlockHeight>, Self::Error> {
+        wallet::prospective_fully_scanned_height(self.conn.borrow(), batch)
+            .map_err(SqliteClientError::from)
     }
 
     fn select_receiving_address(

@@ -584,6 +584,29 @@ impl WalletMigrator {
     }
 }
 
+fn sqlite_user_table_count(conn: &rusqlite::Connection) -> Result<i64, WalletMigrationError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(WalletMigrationError::from)
+}
+
+/// Switches a database that was created with `auto_vacuum=NONE` over to
+/// incremental mode. The change takes effect on `VACUUM`, which also packs the
+/// file. A database that is already incremental is left alone.
+fn enable_incremental_auto_vacuum(conn: &rusqlite::Connection) -> Result<(), WalletMigrationError> {
+    let mode: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+        .map_err(WalletMigrationError::from)?;
+    if mode == 2 {
+        return Ok(());
+    }
+    conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")
+        .map_err(WalletMigrationError::from)
+}
+
 fn init_wallet_db_internal<
     C: BorrowMut<rusqlite::Connection>,
     P: consensus::Parameters + 'static,
@@ -599,6 +622,16 @@ fn init_wallet_db_internal<
     let seed = seed.map(Rc::new);
 
     verify_sqlite_version_compatibility(wdb.conn.borrow()).map_err(MigratorError::Adapter)?;
+
+    // Incremental auto-vacuum can only be selected before the first table exists.
+    // Spend-map pruning deletes historic nullifiers; without this mode the freed
+    // b-tree pages stay in the file.
+    if sqlite_user_table_count(wdb.conn.borrow()).map_err(MigratorError::Adapter)? == 0 {
+        wdb.conn
+            .borrow()
+            .execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")
+            .map_err(|e| MigratorError::Adapter(WalletMigrationError::from(e)))?;
+    }
 
     // Turn off foreign key enforcement, to ensure that table replacement does not break foreign
     // key references in table definitions.
@@ -657,6 +690,12 @@ fn init_wallet_db_internal<
         .borrow()
         .execute("PRAGMA foreign_keys = ON", [])
         .map_err(|e| MigratorError::Adapter(WalletMigrationError::from(e)))?;
+
+    // A database created before incremental auto-vacuum was selected still has
+    // `auto_vacuum=NONE`. Switching modes takes effect on VACUUM, which also
+    // returns any existing freelist to the caller. Fresh databases already
+    // selected the mode above and skip this.
+    enable_incremental_auto_vacuum(wdb.conn.borrow()).map_err(MigratorError::Adapter)?;
 
     // Now that the migration succeeded, check whether the seed is relevant to the wallet.
     // We can only check this if we have migrated as far as `full_account_ids::MIGRATION_ID`,

@@ -763,6 +763,48 @@ where
         (height, res, nfs)
     }
 
+    /// Creates a fake block at the next height containing only Sapling spends of unrelated
+    /// nullifiers, and inserts it into the cache.
+    ///
+    /// The block adds no note commitments, so the shielded trees do not advance. The spends are
+    /// not wallet notes: scanning records every one of them in the nullifier map when spend
+    /// tracking is enabled for the block.
+    pub fn generate_next_block_with_unrelated_spends(&mut self, spend_count: usize) -> BlockHeight {
+        let pre_activation_block = CachedBlock::none(self.sapling_activation_height() - 1);
+        let (height, prev_hash, sapling_size, orchard_size, ironwood_size, prior) = {
+            let prior_cached_block = self.latest_cached_block().unwrap_or(&pre_activation_block);
+            (
+                prior_cached_block.height() + 1,
+                prior_cached_block.chain_state.block_hash(),
+                prior_cached_block.sapling_end_size,
+                prior_cached_block.orchard_end_size,
+                prior_cached_block.ironwood_end_size,
+                prior_cached_block.clone(),
+            )
+        };
+
+        let mut ctx = fake_compact_tx(&mut self.rng);
+        ctx.index = 0;
+        for _ in 0..spend_count {
+            let mut nf = [0u8; 32];
+            self.rng.fill_bytes(&mut nf);
+            ctx.spends.push(CompactSaplingSpend { nf: nf.to_vec() });
+        }
+
+        let cb = fake_compact_block_from_compact_tx(
+            ctx,
+            height,
+            prev_hash,
+            sapling_size,
+            orchard_size,
+            ironwood_size,
+            &mut self.rng,
+        );
+        self.cache_block(&prior, cb);
+        self.latest_block_height = Some(height);
+        height
+    }
+
     /// Adds a block at the next height containing a single transparent-only transaction that
     /// spends `vin` and creates an output of each `(address, value)` in `vout`, and inserts it
     /// into the cache.

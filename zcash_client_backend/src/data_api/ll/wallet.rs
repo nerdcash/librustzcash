@@ -297,19 +297,19 @@ pub struct PutBlocksRows {
 ///
 /// # Spend tracking
 ///
-/// When a batch extends the wallet's contiguous fully-scanned frontier (i.e.
-/// [`LowLevelWalletRead::block_fully_scanned_height`] equals the `from_state` height, so
-/// every block from the wallet birthday through the previous block has been scanned),
+/// When the batch lies inside the birthday-contiguous range — it extends that frontier,
+/// rescans a block already inside it, or bridges a gap up to an already-scanned suffix —
 /// spend-map insertion is skipped for blocks more than
-/// [`SPEND_MAP_RETENTION_BLOCKS`] below the end of the batch. Under that precondition
-/// the skipped entries are provably unobservable: the spend maps exist to detect
-/// spends observed before the corresponding output's block has been scanned, which cannot
-/// occur below a contiguous frontier — any wallet output spendable in a skipped block was
-/// either received in an already-scanned block (so its spend is detected directly against
-/// the wallet's own nullifiers and outpoints rather than the map) or is received later in
-/// this same ascending batch (so the spend is linked when the receiving transaction is
-/// processed). For every out-of-order range — scanning after a gap, recent-first, or
-/// chain-tip pre-scans — every block's spends are tracked.
+/// [`SPEND_MAP_RETENTION_BLOCKS`] below the end of that contiguous range. Under that
+/// precondition the skipped entries are provably unobservable: the spend maps exist to
+/// detect spends observed before the corresponding output's block has been scanned, which
+/// cannot occur below a contiguous frontier. Any wallet output spendable in a skipped
+/// block was either received in an already-scanned block (so its spend is detected
+/// directly against the wallet's own nullifiers and outpoints rather than the map) or is
+/// received later in this same ascending batch (so the spend is linked when the receiving
+/// transaction is processed). A batch that still leaves a gap below itself — a chain-tip
+/// pre-scan, or a historic chunk that has not yet reached the birthday — tracks every
+/// block's spends, because one of them may spend a note in that gap.
 ///
 /// This governs the shielded nullifier maps and the transparent spend map alike; the
 /// argument above is indifferent to which kind of output identifier is being tracked.
@@ -408,13 +408,28 @@ where
         });
     }
 
-    let spend_tracking_floor = spend_tracking_floor(
-        wallet_db
-            .block_fully_scanned_height()
-            .map_err(PutBlocksError::Storage)?,
-        prior.block_height,
-        blocks.last().map(|block| block.height()),
-    );
+    let batch_end = blocks.last().map(|block| block.height());
+    let current_frontier = wallet_db
+        .block_fully_scanned_height()
+        .map_err(PutBlocksError::Storage)?;
+    // Prefer the frontier this batch will produce once it is merged with adjacent
+    // scanned ranges. A tip-first backfill's last chunk then shares the tip's
+    // retention window instead of failing the pre-batch equality check and inserting
+    // every historic nullifier. A chunk that still leaves a gap falls back to the
+    // pre-batch frontier, which does not cover it, so every spend is tracked.
+    let prospective_frontier = batch_end
+        .map(|last| {
+            wallet_db.prospective_block_fully_scanned_height((prior.block_height + 1)..(last + 1))
+        })
+        .transpose()
+        .map_err(PutBlocksError::Storage)?
+        .flatten();
+    let frontier_for_floor = match (prospective_frontier, batch_end) {
+        (Some(prospective), Some(last)) if prospective >= last => Some(prospective),
+        _ => current_frontier,
+    };
+    let spend_tracking_floor =
+        spend_tracking_floor(frontier_for_floor, prior.block_height, batch_end);
 
     let mut sapling_commitments = vec![];
     #[cfg(feature = "orchard")]
@@ -946,6 +961,12 @@ where
                 &note_positions,
             )
             .map_err(PutBlocksError::Storage)?;
+        // `put_blocks_rows` pruned against the pre-batch frontier. This batch may
+        // have just closed the birthday gap, in which case the merged frontier now
+        // drops the out-of-order suffix that gap required.
+        wallet_db
+            .prune_tracked_spends(PRUNING_DEPTH)
+            .map_err(PutBlocksError::Storage)?;
         drop(_notify);
     }
 
@@ -987,6 +1008,9 @@ where
                 },
                 &rows.note_positions,
             )
+            .map_err(PutBlocksError::Storage)?;
+        wallet_db
+            .prune_tracked_spends(PRUNING_DEPTH)
             .map_err(PutBlocksError::Storage)?;
     }
 
@@ -1995,24 +2019,32 @@ pub const SPEND_MAP_RETENTION_BLOCKS: u32 = 100;
 /// Derives the spend-tracking floor for one [`put_blocks_rows`] batch (see the
 /// "Spend tracking" section of its documentation).
 ///
-/// Returns `Some` only when the batch extends the contiguous fully-scanned frontier
-/// (`fully_scanned == Some(from_state_height)`) and is long enough that a floor above
-/// `from_state_height` retains the full [`SPEND_MAP_RETENTION_BLOCKS`] trailing
-/// window; every out-of-order or short batch derives `None` and tracks fully.
+/// Returns `Some` when `fully_scanned` describes birthday-contiguous coverage that
+/// contains this batch, and that coverage is long enough that a floor above
+/// `from_state_height` retains the full [`SPEND_MAP_RETENTION_BLOCKS`] trailing window.
+///
+/// `fully_scanned == Some(from_state_height)` is a batch that extends the frontier;
+/// the window ends at `batch_end`. `fully_scanned >= batch_end` is a batch already
+/// inside that coverage: a rescan, or a historic batch whose post-merge frontier is
+/// the end of an already-scanned suffix. Any other shape still has a gap below the
+/// batch and returns `None`, so every spend is tracked. A `Some` floor that sits
+/// above the whole batch skips every insert.
 fn spend_tracking_floor(
     fully_scanned: Option<BlockHeight>,
     from_state_height: BlockHeight,
     batch_end: Option<BlockHeight>,
 ) -> Option<BlockHeight> {
-    if fully_scanned == Some(from_state_height) {
-        batch_end.and_then(|last| {
-            let floor =
-                BlockHeight::from(u32::from(last).saturating_sub(SPEND_MAP_RETENTION_BLOCKS));
-            (floor > from_state_height + 1).then_some(floor)
-        })
+    let last = batch_end?;
+    let frontier = fully_scanned?;
+    let window_end = if frontier == from_state_height {
+        last
+    } else if frontier >= last {
+        frontier
     } else {
-        None
-    }
+        return None;
+    };
+    let floor = BlockHeight::from(u32::from(window_end).saturating_sub(SPEND_MAP_RETENTION_BLOCKS));
+    (floor > from_state_height + 1).then_some(floor)
 }
 
 /// Returns whether the spends observed in a block at `block_height` should be inserted into
@@ -2339,9 +2371,10 @@ mod tests {
     };
     use crate::data_api::anchor_retention::{AnchorRetention, AnchorRetentionInterval};
 
-    /// A range scanned after a gap of unscanned history (or below the frontier, or with no
-    /// frontier at all) must track every nullifier: a skipped entry could belong to a note
-    /// in the gap whose spentness would then be undetectable once the gap is scanned.
+    /// A range scanned after a gap of unscanned history, or with no frontier at all, must
+    /// track every nullifier: a skipped entry could belong to a note in the gap whose
+    /// spentness would then be undetectable once the gap is scanned. A frontier that already
+    /// covers the batch is a rescan, and its spends sit below the retention window.
     #[test]
     fn out_of_order_ranges_track_fully() {
         let h = BlockHeight::from;
@@ -2355,11 +2388,34 @@ mod tests {
             spend_tracking_floor(None, h(500_000), Some(h(510_000))),
             None
         );
-        // Frontier above the range start (re-scan below the frontier) ⇒ no floor.
+        // Frontier above the batch, with contiguous coverage through that frontier
+        // (a rescan, or a batch that bridges up to a scanned suffix). The floor is
+        // the frontier's retention window, which sits above this batch, so none of
+        // its spends are inserted.
         assert_eq!(
             spend_tracking_floor(Some(h(600_000)), h(500_000), Some(h(510_000))),
-            None
+            Some(h(600_000u32 - SPEND_MAP_RETENTION_BLOCKS))
         );
+    }
+
+    /// A historic batch that closes the gap up to an already-scanned tip uses the
+    /// tip's retention window, not "track every nullifier".
+    #[test]
+    fn bridging_batch_tracks_only_the_suffix_window() {
+        let h = BlockHeight::from;
+        let tip = h(600_000);
+        let from = h(400_000);
+        let last = h(590_000);
+        let floor = spend_tracking_floor(Some(tip), from, Some(last)).expect("bridge ⇒ floor");
+        assert_eq!(
+            u32::from(tip) - u32::from(floor),
+            SPEND_MAP_RETENTION_BLOCKS
+        );
+        assert!(!should_track_spends(Some(floor), last));
+        assert!(should_track_spends(
+            Some(floor),
+            h(600_000u32 - SPEND_MAP_RETENTION_BLOCKS)
+        ));
     }
 
     /// A batched Orchard build matches `from_iter`, including unaligned ranges and every

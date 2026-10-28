@@ -163,6 +163,21 @@ pub trait LowLevelWalletRead {
         &self,
     ) -> Result<Option<zcash_protocol::consensus::BlockHeight>, Self::Error>;
 
+    /// The fully-scanned height if `batch` (end-exclusive) were marked scanned and
+    /// merged with the adjacent scanned ranges.
+    ///
+    /// `Ok(None)` when that merge would still leave a gap between the wallet birthday
+    /// and the batch, or when the store does not answer. [`wallet::put_blocks_rows`]
+    /// uses this so a historic batch that closes such a gap does not insert spend-map
+    /// rows the retention window is about to drop.
+    fn prospective_block_fully_scanned_height(
+        &self,
+        batch: Range<BlockHeight>,
+    ) -> Result<Option<zcash_protocol::consensus::BlockHeight>, Self::Error> {
+        let _ = batch;
+        Ok(None)
+    }
+
     /// Returns the set of account identifiers for accounts that spent notes and/or UTXOs in the
     /// construction of the given transaction.
     fn get_funding_accounts<T: TxMeta>(
