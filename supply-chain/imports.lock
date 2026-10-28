@@ -183,6 +183,13 @@ user-id = 6289
 user-login = "str4d"
 user-name = "Jack Grigg"
 
+[[publisher.pasta_curves]]
+version = "0.6.1"
+when = "2026-10-09"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
 [[publisher.pczt]]
 version = "0.10.0"
 when = "2026-10-21"
