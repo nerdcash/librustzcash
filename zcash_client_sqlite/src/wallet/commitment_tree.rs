@@ -1736,7 +1736,7 @@ fn stored_shard_root<H: HashSer>(
     conn: &rusqlite::Connection,
     table_prefix: &str,
     shard_index: u64,
-) -> Result<Option<(Option<BlockHeight>, H)>, Error> {
+) -> Result<Option<(BlockHeight, H)>, Error> {
     conn.query_row(
         &format!(
             "SELECT subtree_end_height, root_hash
@@ -1754,16 +1754,20 @@ fn stored_shard_root<H: HashSer>(
     .optional()
     .map_err(Error::Query)?
     .map(|(end, hash)| {
-        let hash = hash.ok_or_else(|| {
-            Error::Serialization(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("subtree root at index {shard_index} has no hash"),
-            ))
-        })?;
+        // A shard row written by tree maintenance can exist before its root hash and end
+        // height are filled in. That is not a stored subtree root, so the caller inserts
+        // rather than matching a prefix.
+        let Some(hash) = hash else {
+            return Ok(None);
+        };
+        let Some(end) = end else {
+            return Ok(None);
+        };
         let root = H::read(Cursor::new(hash)).map_err(Error::Serialization)?;
-        Ok((end.map(BlockHeight::from), root))
+        Ok(Some((BlockHeight::from(end), root)))
     })
     .transpose()
+    .map(Option::flatten)
 }
 
 #[tracing::instrument(skip(conn, roots))]
@@ -1791,7 +1795,7 @@ pub(crate) fn put_shard_roots<
         match stored_shard_root::<H>(conn, table_prefix, index).map_err(ShardTreeError::Storage)? {
             Some((stored_end, stored_hash)) => {
                 let supplied = &roots[matched];
-                if stored_end != Some(supplied.subtree_end_height())
+                if stored_end != supplied.subtree_end_height()
                     || &stored_hash != supplied.root_hash()
                 {
                     return Err(ShardTreeError::Storage(Error::SubtreeRootConflict {
