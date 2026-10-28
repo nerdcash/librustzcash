@@ -188,6 +188,12 @@ pub(crate) const PRUNING_DEPTH: u32 = 100;
 pub(crate) static NULLIFIER_MAP_WRITE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// When set, the next [`WalletWrite::put_blocks`] finishes its database work and
+/// then returns an error so the transaction rolls back. The scan test uses this
+/// to check that a failed batch does not leave staged nullifiers behind.
+pub(crate) static FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The number of blocks to verify ahead when the chain tip is updated.
 pub(crate) const VERIFY_LOOKAHEAD: u32 = 10;
 
@@ -2222,11 +2228,20 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         from_state: &ChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
-        self.transactionally(|wdb| wdb.put_blocks(from_state, blocks))?;
-        // Spend-map deletes free b-tree pages onto the freelist. Without a vacuum
-        // those pages stay in the file, so a tip-first sync's historic nullifiers
-        // keep the database at its high-water after they have been pruned.
-        self.reclaim_freed_pages()?;
+        self.transactionally(|wdb| {
+            wdb.put_blocks(from_state, blocks)?;
+            if FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(SqliteClientError::CorruptedData(
+                    "test rollback after staged spend write".into(),
+                ));
+            }
+            Ok(())
+        })?;
+        // The batch is already committed. Reclamation only returns freed pages;
+        // a lock or I/O error here must not turn a successful scan into a failure.
+        if let Err(err) = self.reclaim_freed_pages() {
+            warn!("failed to reclaim freed spend-map pages: {err}");
+        }
         Ok(())
     }
 
@@ -2236,7 +2251,9 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
         self.transactionally(|wdb| wdb.put_blocks_without_commitment_trees(prior, blocks))?;
-        self.reclaim_freed_pages()?;
+        if let Err(err) = self.reclaim_freed_pages() {
+            warn!("failed to reclaim freed spend-map pages: {err}");
+        }
         Ok(())
     }
 

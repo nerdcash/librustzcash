@@ -454,6 +454,11 @@ mod tests {
     }
 
     #[test]
+    fn staged_nullifier_write_rolls_back_and_retries() {
+        testing::pool::staged_nullifier_write_rolls_back_and_retries();
+    }
+
+    #[test]
     fn bridging_historic_batch_skips_nullifiers_below_the_floor() {
         testing::pool::bridging_historic_batch_skips_nullifiers_below_the_floor();
     }

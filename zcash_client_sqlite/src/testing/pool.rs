@@ -1102,6 +1102,74 @@ pub(crate) fn out_of_order_spend_survives_reopen() {
     );
 }
 
+/// A batch that fails after the staged nullifier write rolls the blocks,
+/// locators, nullifiers, and scan queue back together. The same batch then
+/// commits cleanly, so leftover temporary staging rows do not get in the way.
+pub(crate) fn staged_nullifier_write_rolls_back_and_retries() {
+    let mut st =
+        TestDsl::with_sapling_birthday_account(TestDbFactory::default(), BlockCache::new())
+            .build::<SaplingPoolTester>();
+    let birthday = st
+        .network()
+        .activation_height(NetworkUpgrade::Sapling)
+        .unwrap();
+
+    const BLOCKS: usize = 4;
+    const SPENDS: usize = 3;
+    for _ in 0..BLOCKS {
+        st.generate_next_block_with_unrelated_spends(SPENDS);
+    }
+    let queue_before = scan_queue_rows(st.wallet().conn());
+    assert_eq!(table_count(st.wallet().conn(), "blocks"), 0);
+
+    crate::FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed = st.try_scan_cached_blocks(birthday, BLOCKS);
+    assert!(failed.is_err(), "the injected rollback must fail the scan");
+    assert!(
+        !crate::FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.load(std::sync::atomic::Ordering::SeqCst),
+        "the rollback hook must run once"
+    );
+    assert_eq!(table_count(st.wallet().conn(), "blocks"), 0);
+    assert_eq!(table_count(st.wallet().conn(), "nullifier_map"), 0);
+    assert_eq!(table_count(st.wallet().conn(), "tx_locator_map"), 0);
+    assert_eq!(scan_queue_rows(st.wallet().conn()), queue_before);
+
+    st.scan_cached_blocks(birthday, BLOCKS);
+    assert_eq!(
+        table_count(st.wallet().conn(), "blocks"),
+        i64::try_from(BLOCKS).unwrap()
+    );
+    assert_eq!(
+        table_count(st.wallet().conn(), "nullifier_map"),
+        i64::try_from(BLOCKS * SPENDS).unwrap()
+    );
+    assert_eq!(
+        table_count(st.wallet().conn(), "tx_locator_map"),
+        i64::try_from(BLOCKS).unwrap()
+    );
+}
+
+fn table_count(conn: &rusqlite::Connection, table: &str) -> i64 {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+fn scan_queue_rows(conn: &rusqlite::Connection) -> Vec<(i64, i64, i64)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT block_range_start, block_range_end, priority
+             FROM scan_queue
+             ORDER BY block_range_start",
+        )
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+}
+
 pub(crate) fn tip_first_historic_nullifier_map_stays_bounded() {
     use zcash_client_backend::data_api::ll::wallet::SPEND_MAP_RETENTION_BLOCKS;
 

@@ -5,7 +5,7 @@ use {
 };
 
 use rayon::{
-    iter::{IndexedParallelIterator as _, IntoParallelIterator, ParallelIterator},
+    iter::{IndexedParallelIterator as _, ParallelIterator},
     slice::ParallelSliceMut as _,
 };
 use tracing::{debug, info, trace, warn};
@@ -431,14 +431,16 @@ where
     let spend_tracking_floor =
         spend_tracking_floor(frontier_for_floor, prior.block_height, batch_end);
 
-    // Copy the shielded spends out and build the survivor set on another thread
-    // while this thread writes block and note rows. The set is what must still
-    // be on disk when the batch commits; a crash before that commit scans the
-    // batch again, and a crash after it can still match a spend to a note found
-    // later in a gap.
-    let shielded_spends = snapshot_shielded_spends(&blocks);
+    // Copy only the spends the floor keeps, then sort them on another thread
+    // while this thread writes block and note rows. Sorting stays on that
+    // thread: using the global Rayon pool here can deadlock if the caller is
+    // already its only worker and is blocked in `join`, still holding the
+    // database transaction. The set is what must be on disk when the batch
+    // commits. A crash before that commit scans the batch again, and a crash
+    // after it can still match a spend to a note found later in a gap.
+    let shielded_spends = snapshot_shielded_spends(&blocks, spend_tracking_floor);
     let staging = JoinOnDrop(Some(std::thread::spawn(move || {
-        stage_surviving_spends(shielded_spends, spend_tracking_floor)
+        stage_surviving_spends(shielded_spends)
     })));
 
     let mut sapling_commitments = vec![];
@@ -2108,63 +2110,54 @@ fn push_nullifiers<NF>(
     }
 }
 
-fn snapshot_shielded_spends<A>(blocks: &[ScannedBlock<A>]) -> Vec<Vec<StagedSpend>> {
-    blocks
-        .iter()
-        .map(|block| {
-            let mut spends = Vec::new();
-            push_nullifiers(
-                &mut spends,
-                block.height(),
-                ShieldedPool::Sapling,
-                block.sapling().nullifier_map(),
-                |nf| copy_nullifier(nf.as_ref()),
-            );
-            #[cfg(feature = "orchard")]
-            push_nullifiers(
-                &mut spends,
-                block.height(),
-                ShieldedPool::Orchard,
-                block.orchard().nullifier_map(),
-                |nf| nf.to_bytes(),
-            );
-            #[cfg(feature = "orchard")]
-            push_nullifiers(
-                &mut spends,
-                block.height(),
-                ShieldedPool::Ironwood,
-                block.ironwood().nullifier_map(),
-                |nf| nf.to_bytes(),
-            );
-            spends
-        })
-        .collect()
-}
-
-/// Keeps spends at or above the floor and, for a repeated nullifier, the latest
-/// height. Built away from the SQLite connection.
-fn stage_surviving_spends(
-    blocks: Vec<Vec<StagedSpend>>,
+fn snapshot_shielded_spends<A>(
+    blocks: &[ScannedBlock<A>],
     floor: Option<BlockHeight>,
 ) -> Vec<StagedSpend> {
-    let mut staged: Vec<StagedSpend> = blocks
-        .into_par_iter()
-        .filter(|spends| {
-            spends
-                .first()
-                .is_none_or(|spend| should_track_spends(floor, spend.height))
-        })
-        .flatten()
-        .collect();
-    staged.par_sort_unstable_by(|left, right| {
+    let mut spends = Vec::new();
+    for block in blocks {
+        if !should_track_spends(floor, block.height()) {
+            continue;
+        }
+        push_nullifiers(
+            &mut spends,
+            block.height(),
+            ShieldedPool::Sapling,
+            block.sapling().nullifier_map(),
+            |nf| copy_nullifier(nf.as_ref()),
+        );
+        #[cfg(feature = "orchard")]
+        push_nullifiers(
+            &mut spends,
+            block.height(),
+            ShieldedPool::Orchard,
+            block.orchard().nullifier_map(),
+            |nf| nf.to_bytes(),
+        );
+        #[cfg(feature = "orchard")]
+        push_nullifiers(
+            &mut spends,
+            block.height(),
+            ShieldedPool::Ironwood,
+            block.ironwood().nullifier_map(),
+            |nf| nf.to_bytes(),
+        );
+    }
+    spends
+}
+
+/// For a repeated nullifier, keeps the latest height. Runs on the staging
+/// thread, not the global Rayon pool and not the SQLite connection.
+fn stage_surviving_spends(mut spends: Vec<StagedSpend>) -> Vec<StagedSpend> {
+    spends.sort_unstable_by(|left, right| {
         left.pool
             .cmp(&right.pool)
             .then(left.nf.cmp(&right.nf))
             .then(right.height.cmp(&left.height))
     });
     // `dedup_by` keeps the first of each run. The sort put the greatest height first.
-    staged.dedup_by(|left, right| left.pool == right.pool && left.nf == right.nf);
-    staged
+    spends.dedup_by(|left, right| left.pool == right.pool && left.nf == right.nf);
+    spends
 }
 
 /// Returns whether the checkpoint at `height` should be retained as a durable anchor: anchor
