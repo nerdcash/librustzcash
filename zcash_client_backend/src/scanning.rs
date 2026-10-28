@@ -898,6 +898,14 @@ pub enum ScanError {
         txid: TxId,
         index: usize,
     },
+
+    /// A wallet that maintains note commitment trees was asked to scan from a prior block that
+    /// does not carry frontiers.
+    ///
+    /// View-only scanning accepts height, hash, and end-of-block tree sizes. A spending wallet
+    /// still needs the frontiers in a [`ChainState`](crate::data_api::chain::ChainState) so it
+    /// can append the note commitment trees.
+    CommitmentTreeRequired { at_height: BlockHeight },
 }
 
 impl ScanError {
@@ -913,6 +921,7 @@ impl ScanError {
             TreeSizeOverflow { .. } => false,
             #[cfg(feature = "transparent-inputs")]
             TransparentPrevoutInvalid { .. } => false,
+            CommitmentTreeRequired { .. } => false,
         }
     }
 
@@ -928,6 +937,7 @@ impl ScanError {
             TreeSizeOverflow { at_height, .. } => *at_height,
             #[cfg(feature = "transparent-inputs")]
             TransparentPrevoutInvalid { at_height, .. } => *at_height,
+            CommitmentTreeRequired { at_height } => *at_height,
         }
     }
 }
@@ -1004,6 +1014,12 @@ impl fmt::Display for ScanError {
                 write!(
                     f,
                     "The prevout of transparent input {index} of transaction {txid} at height {at_height} was improperly encoded."
+                )
+            }
+            CommitmentTreeRequired { at_height } => {
+                write!(
+                    f,
+                    "Note commitment tree frontiers are required to scan a spending wallet from height {at_height}"
                 )
             }
         }

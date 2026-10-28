@@ -11,6 +11,20 @@ workspace.
 ## [Unreleased]
 
 ### Added
+- `CompactChainState` and `ScanContinuity`. `scan_cached_blocks` accepts either
+  a `ChainState` or the prior block's height, hash, and end-of-block note
+  commitment tree sizes.
+- `AccountBirthday::from_viewing_parts`, a view-only birthday of height plus
+  hash, including a height below Sapling activation.
+- `CommitmentTreeMaintenance` and `WalletRead::maintains_note_commitment_trees`.
+  View-only scanning applies when every account is `AccountPurpose::ViewOnly`,
+  or when the wallet selects `CommitmentTreeMaintenance::ViewOnly`.
+- `WalletWrite::put_blocks_without_commitment_trees`, which stores received
+  notes, spends, and block metadata without updating a note commitment tree.
+- `WalletWrite::rewind_view_only`, which drops wallet rows above a block
+  identified by height and hash and requeues that range as `Historic`.
+- `Balance::viewed_value`, the observed total of notes a view-only wallet
+  decrypted and has not seen spent. Spending wallets leave it at zero.
 - `WalletWrite::import_account_uivk`, for importing an account from a
   [`UnifiedIncomingViewingKey`].
 - `ScanningKeys::from_account_uivks` and `ScanningKeys::extend`, so wallets can
@@ -22,6 +36,9 @@ workspace.
   keys.
 
 ### Changed
+- `scan_cached_blocks` takes its prior block as `ScanContinuity`. Callers that
+  pass `&ChainState` keep the previous spending-wallet behavior. A view-only
+  wallet persists the batch without frontiers and without subtree roots.
 - `put_blocks` builds note-commitment subtrees in chunks of 32768 leaves instead
   of 1024. `insert_tree` rewrites the frontier shard and prunes checkpoints once
   per chunk, so the smaller chunk repeated that work many times inside one

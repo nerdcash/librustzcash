@@ -246,6 +246,9 @@ pub struct Balance {
     change_pending_confirmation: Zatoshis,
     value_pending_spendability: Zatoshis,
     uneconomic_value: Zatoshis,
+    /// Notes a view-only wallet decrypted and has not seen spent. Spending wallets leave this
+    /// at zero; those notes are classified in the spendable and pending buckets instead.
+    viewed_value: Zatoshis,
 }
 
 impl Balance {
@@ -256,6 +259,7 @@ impl Balance {
         change_pending_confirmation: Zatoshis::ZERO,
         value_pending_spendability: Zatoshis::ZERO,
         uneconomic_value: Zatoshis::ZERO,
+        viewed_value: Zatoshis::ZERO,
     };
 
     fn check_total_adding(&self, value: Zatoshis) -> Result<Zatoshis, BalanceError> {
@@ -263,6 +267,7 @@ impl Balance {
             + self.locked_value
             + self.change_pending_confirmation
             + self.value_pending_spendability
+            + self.viewed_value
             + value)
             .ok_or(BalanceError::Overflow)
     }
@@ -335,12 +340,31 @@ impl Balance {
         Ok(())
     }
 
+    /// Returns notes this view-only wallet decrypted and has not seen spent.
+    ///
+    /// A spending wallet reports this as zero. The same notes are then either
+    /// [`Self::spendable_value`] or [`Self::value_pending_spendability`], depending on whether a
+    /// witness can be built. A view-only wallet has no witness, so spendable stays zero and the
+    /// observed total — received notes minus notes whose nullifier has been seen — is here,
+    /// including notes at or below the ZIP 317 marginal fee.
+    pub fn viewed_value(&self) -> Zatoshis {
+        self.viewed_value
+    }
+
+    /// Adds the specified value to the view-only observed total, checking for overflow.
+    pub fn add_viewed_value(&mut self, value: Zatoshis) -> Result<(), BalanceError> {
+        self.check_total_adding(value)?;
+        self.viewed_value = (self.viewed_value + value).unwrap();
+        Ok(())
+    }
+
     /// Returns the total value of funds represented by this [`Balance`].
     pub fn total(&self) -> Zatoshis {
         (self.spendable_value
             + self.locked_value
             + self.change_pending_confirmation
-            + self.value_pending_spendability)
+            + self.value_pending_spendability
+            + self.viewed_value)
             .expect("Balance cannot overflow MAX_MONEY")
     }
 }
@@ -361,6 +385,7 @@ impl core::ops::Add<Balance> for Balance {
                 .ok_or(BalanceError::Overflow)?,
             uneconomic_value: (self.uneconomic_value + rhs.uneconomic_value)
                 .ok_or(BalanceError::Overflow)?,
+            viewed_value: (self.viewed_value + rhs.viewed_value).ok_or(BalanceError::Overflow)?,
         };
 
         result.check_total_adding(Zatoshis::ZERO)?;
@@ -638,6 +663,30 @@ pub enum AccountPurpose {
     /// received notes.
     Spending { derivation: Option<Zip32Derivation> },
     /// For view-only accounts, the wallet will not track spend information.
+    ///
+    /// One view-only account does not by itself skip note commitment trees. The trees and the
+    /// scan queue are per wallet. See [`CommitmentTreeMaintenance`].
+    ViewOnly,
+}
+
+/// Whether a wallet maintains note commitment trees, witnesses, and ZIP 318 anchor checkpoints
+/// while scanning.
+///
+/// The trees and the scan queue are per database. A wallet that contains any spending account
+/// maintains them. A wallet whose every account is [`AccountPurpose::ViewOnly`], or one that
+/// selects [`Self::ViewOnly`] explicitly, does not: `put_blocks` persists received notes, spends,
+/// nullifiers, transparent outputs, and block metadata without updating a shard tree.
+///
+/// An empty wallet maintains trees. Adding a spending account to a wallet that has already
+/// scanned in view-only mode does not rebuild trees for the blocks already scanned; those blocks
+/// have to be rescanned after the wallet starts maintaining trees. That rescan is the caller's
+/// responsibility.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CommitmentTreeMaintenance {
+    /// Maintain note commitment trees unless every account is [`AccountPurpose::ViewOnly`].
+    #[default]
+    Automatic,
+    /// Do not maintain note commitment trees, regardless of the accounts in the wallet.
     ViewOnly,
 }
 
@@ -2360,6 +2409,15 @@ pub trait WalletRead {
         anchor_retention::AnchorRetentionInterval::ZIP_318
     }
 
+    /// Returns whether scanning this wallet appends note commitment trees.
+    ///
+    /// The default is `true`, which is the spending-wallet behavior. A backend that supports
+    /// view-only scanning overrides this from [`CommitmentTreeMaintenance`] and the purposes of
+    /// the accounts it stores. See [`CommitmentTreeMaintenance`] for when the result is `false`.
+    fn maintains_note_commitment_trees(&self) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
     /// Returns the ZIP 318 pool-migration parameters in force for this wallet on the network that
     /// `params` describe: the specified values, with the anchor bucket grid taken from
     /// [`Self::anchor_retention_interval`].
@@ -3567,6 +3625,26 @@ impl AccountBirthday {
         }
     }
 
+    /// Constructs a birthday for a view-only import from the prior block's height and hash.
+    ///
+    /// The birthday height — the first block to scan — is `prior_height + 1`. `prior_height` may
+    /// be below Sapling activation, where `lightwalletd` `GetTreeState` does not return a tree
+    /// state. The note commitment frontiers are empty and are not a substitute for a
+    /// [`TreeState`]: a view-only scan checks continuity from compact-block metadata
+    /// ([`chain::CompactChainState`](chain::CompactChainState)) rather than by appending these
+    /// frontiers.
+    ///
+    /// Importing this birthday into a wallet that maintains note commitment trees does not
+    /// install a frontier those trees can be appended to. Use [`Self::from_treestate`] for a
+    /// spending account.
+    pub fn from_viewing_parts(
+        prior_height: BlockHeight,
+        prior_hash: BlockHash,
+        recover_until: Option<BlockHeight>,
+    ) -> Self {
+        Self::from_parts(ChainState::empty(prior_height, prior_hash), recover_until)
+    }
+
     /// Constructs a new [`AccountBirthday`] from a [`TreeState`] returned from `lightwalletd`.
     ///
     /// * `treestate`: The tree state corresponding to the last block prior to the wallet's
@@ -4205,6 +4283,24 @@ pub trait WalletWrite:
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error>;
 
+    /// Persists scanned blocks without updating note commitment trees.
+    ///
+    /// Stores received notes, spent-note links, nullifiers for notes this wallet has decrypted,
+    /// transparent outputs, and block hash, height, and time, and advances the scan queue.
+    /// `commitment_tree_position` may be recorded from the compact block's tree sizes;
+    /// `witness_stabilized` stays unset. The call does not write shard, checkpoint, or cap rows
+    /// and does not require [`WalletCommitmentTrees`] to succeed.
+    ///
+    /// `prior` is the block immediately before the first block of `blocks`: its height, hash, and
+    /// end-of-block tree sizes. Each pool's tree size must advance by that block's commitment
+    /// count, and the blocks must be sequential. This is the view-only form of [`Self::put_blocks`].
+    /// Spending wallets continue to use [`Self::put_blocks`].
+    fn put_blocks_without_commitment_trees(
+        &mut self,
+        prior: &chain::CompactChainState,
+        blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error>;
+
     /// Adds a transparent UTXO received by the wallet to the data store.
     fn put_received_transparent_utxo(
         &mut self,
@@ -4335,6 +4431,22 @@ pub trait WalletWrite:
         chain_state: ChainState,
         reset_account_birthdays: HashSet<<Self as WalletRead>::AccountId>,
     ) -> Result<(), RewindError<<Self as WalletRead>::AccountId, <Self as WalletRead>::Error>>;
+
+    /// Rewinds a view-only wallet to `height`, which must be a stored block with `block_hash`.
+    ///
+    /// Deletes blocks, received notes, note spends, transparent outputs, and nullifier-map rows
+    /// above `height`, and requeues `Historic` from the next block through the previous tip.
+    /// Does not require a shard checkpoint and does not reinstall a note commitment frontier.
+    ///
+    /// A hash mismatch is the same conflict a scan reports when a stored block is not the one
+    /// being connected. A wallet that maintains note commitment trees should keep using
+    /// [`Self::truncate_to_height`] or [`Self::truncate_to_chain_state`]; those still rewind a
+    /// spending wallet onto a checkpoint or a frontier.
+    fn rewind_view_only(
+        &mut self,
+        height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> Result<(), <Self as WalletRead>::Error>;
 
     /// Reserves the next `n` available ephemeral addresses for the given account.
     /// This cannot be undone, so as far as possible, errors associated with transaction

@@ -11,12 +11,40 @@ workspace.
 ## [Unreleased]
 
 ### Added
+- `WalletWrite::rewind_view_only`. Given the hash of a stored block, a view-only
+  wallet deletes blocks, received notes, spends, transparent outputs, and
+  nullifier-map rows above that height and requeues `Historic` through the
+  previous tip. It does not need a shard checkpoint and does not reinstall a
+  frontier. A wallet that still maintains note commitment trees is unchanged
+  and this method rejects the rewind.
+- `WalletDb::with_anchor_retention_enabled`. Retention stays on by default, on the
+  ZIP 318 grid. Turning it off stores no durable anchor checkpoints. A view-only
+  scan writes no checkpoints either way.
+- `WalletDb::with_commitment_tree_maintenance` and
+  `WalletDb::set_commitment_tree_maintenance`. `CommitmentTreeMaintenance::ViewOnly`,
+  and `Automatic` when every account is view-only, make `scan_cached_blocks`
+  persist notes and spends without writing note commitment shards, checkpoints,
+  or the cap. An empty wallet and any wallet with a spending account still
+  maintain trees. Adding a spending account after a view-only scan does not
+  rebuild trees for blocks already scanned; those blocks have to be rescanned.
 - `WalletWrite::import_account_uivk` is implemented for `WalletDb`, enabling
   import of incoming-viewing-key-only accounts.
 - `WalletDb::set_commitment_tree_write_back` disables the note-commitment tree
   write-back cache. The cache is enabled by default.
 
 ### Changed
+- `put_sapling_subtree_roots`, `put_orchard_subtree_roots`, and
+  `put_ironwood_subtree_roots` treat an already-stored prefix as a no-op and
+  still write roots past that prefix. `start_index = max_stored_index + 1`
+  remains the incremental update. A root that disagrees with the stored hash
+  or end height at the same index is still an error.
+- `get_wallet_summary` and `get_wallet_snapshot` report a view-only wallet's
+  unspent decrypted notes in `Balance::viewed_value`. Spendable stays zero.
+  A spending wallet's summary is unchanged and `viewed_value` stays zero.
+- A view-only scan marks the scanned range `Scanned` and does not insert
+  `FoundNote` ranges. `update_chain_tip` does not pull the queue back to an
+  incomplete shard. The `Verify` lookahead stays, and the rest of the catch-up
+  is `Historic`.
 - Note-commitment tree updates performed through `WalletDb`'s Sapling, Orchard,
   and Ironwood `with_*_tree_mut` callbacks accumulate shard and checkpoint
   mutations in memory and flush them once per callback. Unchanged shards are
