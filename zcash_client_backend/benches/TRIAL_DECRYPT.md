@@ -101,3 +101,34 @@ baseline and the parallel rows already pay for one GLV ladder per
 Reimplementing it here would fork orchard types. Sapling trial decryption still
 uses Jubjub scalar multiplication from `sapling-crypto`, which has no GLV hook
 in the dependency we link.
+
+## arm64 field arithmetic
+
+Not feasible inside this crate. No notes/sec change.
+
+Trial decryption spends its time in field multiplication inside the curve
+crates, not in code this repository can replace:
+
+* `pasta_curves` 0.6 stores Pallas/Vesta base and scalar fields as private
+  `[u64; 4]` Montgomery elements. `Fq::mul` / `Fp::mul` are inherent
+  `const fn`s (`mul_unreduced` plus `montgomery_reduce`). Point addition and
+  the GLV ladder call those methods directly. The only `target_arch =
+  "aarch64"` code in the crate is a divstep helper in `modinv62.rs` used by
+  inversion, not by multiplication.
+* `jubjub` 0.11 implements its scalar field the same way (`Fr::mul` in
+  `fr.rs`). There is no architecture-specific multiplier. Sapling key
+  agreement multiplies that field.
+* `orchard` and `sapling-crypto` monomorphize on those concrete types. The
+  `ff::Field` trait exposes `mul`, but the implementations are the inherent
+  methods above. There is no feature, function pointer, or associated type
+  that lets a downstream crate swap in another multiplier while still passing
+  an `orchard` note or a Sapling `PreparedIncomingViewingKey`.
+
+The arm64 idea (from gnark-crypto's portable CIOS work, Apache-2.0) is to
+unroll the Montgomery product so the compiler emits a short carry chain.
+That belongs in `pasta_curves` and `jubjub` (and, for Sapling's base field,
+`bls12_381`). A second field type defined here would not be an Orchard or
+Sapling field element, so the existing key-agreement code would not call it.
+
+This host is x86_64, so an arm64 patch could not be timed here even if it
+lived in those crates.
