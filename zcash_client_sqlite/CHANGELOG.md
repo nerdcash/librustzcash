@@ -33,6 +33,11 @@ workspace.
   write-back cache. The cache is enabled by default.
 
 ### Changed
+- `put_sapling_subtree_roots`, `put_orchard_subtree_roots`, and
+  `put_ironwood_subtree_roots` treat an already-stored prefix as a no-op and
+  still write roots past that prefix. `start_index = max_stored_index + 1`
+  remains the incremental update. A root that disagrees with the stored hash
+  or end height at the same index is still an error.
 - `get_wallet_summary` and `get_wallet_snapshot` report a view-only wallet's
   unspent decrypted notes in `Balance::viewed_value`. Spendable stays zero.
   A spending wallet's summary is unchanged and `viewed_value` stays zero.
