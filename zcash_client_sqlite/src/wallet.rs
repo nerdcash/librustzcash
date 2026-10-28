@@ -4863,6 +4863,117 @@ pub(crate) fn truncate_to_chain_state<P: consensus::Parameters, CL, R>(
     Ok(())
 }
 
+/// Deletes view-only wallet rows above `height` and requeues `Historic` from the next block to
+/// the previous tip.
+///
+/// `height` must be a block this wallet stored, and `block_hash` must be that block's hash.
+/// Received notes, note spends, transparent outputs, and nullifier-map rows above `height` are
+/// removed. Sent notes are kept. Note commitment trees are not read or written, and no frontier
+/// is installed.
+///
+/// Returns [`SqliteClientError::BlockConflict`] when a different block is stored at `height`,
+/// and [`SqliteClientError::RequestedRewindInvalid`] when `height` was never scanned or when
+/// this wallet still maintains note commitment trees.
+pub(crate) fn rewind_view_only<P: consensus::Parameters>(
+    conn: &rusqlite::Transaction<'_>,
+    _params: &P,
+    height: BlockHeight,
+    block_hash: BlockHash,
+    commitment_tree_maintenance: CommitmentTreeMaintenance,
+) -> Result<(), SqliteClientError> {
+    if maintains_note_commitment_trees(conn, commitment_tree_maintenance)? {
+        return Err(SqliteClientError::RequestedRewindInvalid {
+            safe_rewind_height: None,
+            requested_height: height,
+        });
+    }
+
+    match get_block_hash(conn, height)? {
+        Some(stored) if stored == block_hash => {}
+        Some(_) => return Err(SqliteClientError::BlockConflict(height)),
+        None => {
+            return Err(SqliteClientError::RequestedRewindInvalid {
+                safe_rewind_height: None,
+                requested_height: height,
+            });
+        }
+    }
+
+    let block_tip = block_height_extrema(conn)?.map(|range| *range.end());
+    let queue_tip = chain_tip_height(conn)?;
+    let tip = block_tip.into_iter().chain(queue_tip).max();
+
+    let delete_received = |notes: &str, spends: &str| -> Result<(), SqliteClientError> {
+        let mined_above = "DELETE FROM {table}
+             WHERE transaction_id IN (
+                 SELECT id_tx FROM transactions WHERE mined_height > :height
+             )";
+        conn.execute(
+            &mined_above.replace("{table}", spends),
+            named_params![":height": u32::from(height)],
+        )?;
+        conn.execute(
+            &mined_above.replace("{table}", notes),
+            named_params![":height": u32::from(height)],
+        )?;
+        Ok(())
+    };
+    delete_received("sapling_received_notes", "sapling_received_note_spends")?;
+    #[cfg(feature = "orchard")]
+    {
+        delete_received("orchard_received_notes", "orchard_received_note_spends")?;
+        delete_received("ironwood_received_notes", "ironwood_received_note_spends")?;
+    }
+
+    conn.execute(
+        "DELETE FROM transparent_received_output_spends
+         WHERE transaction_id IN (
+             SELECT id_tx FROM transactions WHERE mined_height > :height
+         )",
+        named_params![":height": u32::from(height)],
+    )?;
+    conn.execute(
+        "DELETE FROM transparent_received_outputs
+         WHERE transaction_id IN (
+             SELECT id_tx FROM transactions WHERE mined_height > :height
+         )",
+        named_params![":height": u32::from(height)],
+    )?;
+    // Cascades to nullifier_map and transparent_spend_locator_map.
+    conn.execute(
+        "DELETE FROM tx_locator_map WHERE block_height > :height",
+        named_params![":height": u32::from(height)],
+    )?;
+    // Clear the block foreign key before deleting the block rows.
+    conn.execute(
+        "UPDATE transactions
+         SET block = NULL, mined_height = NULL, tx_index = NULL, confirmed_unmined_at_height = NULL
+         WHERE mined_height > :height",
+        named_params![":height": u32::from(height)],
+    )?;
+    conn.execute(
+        "DELETE FROM blocks WHERE height > :height",
+        named_params![":height": u32::from(height)],
+    )?;
+
+    if let Some(tip) = tip
+        && height < tip
+    {
+        let rescan = (height + 1)..(tip + 1);
+        replace_queue_entries::<SqliteClientError>(
+            conn,
+            &rescan,
+            std::iter::once(ScanRange::from_parts(
+                rescan.clone(),
+                ScanPriority::Historic,
+            )),
+            true,
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Rewinds the wallet to the specified chain state, preserving wallet data which has been
 /// confirmed beyond the pruning depth, and resetting the birthday height of specified accounts
 /// to the block following the chain state.

@@ -2243,6 +2243,14 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         result
     }
 
+    fn rewind_view_only(
+        &mut self,
+        height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        self.transactionally(|wdb| wdb.rewind_view_only(height, block_hash))
+    }
+
     #[cfg(feature = "transparent-inputs")]
     fn reserve_next_n_ephemeral_addresses(
         &mut self,
@@ -2942,6 +2950,20 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             &chain_state,
             reset_account_birthdays,
             self.commitment_tree_write_back,
+        )
+    }
+
+    fn rewind_view_only(
+        &mut self,
+        height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        wallet::rewind_view_only(
+            self.conn.0,
+            &self.params,
+            height,
+            block_hash,
+            self.commitment_tree_maintenance,
         )
     }
 

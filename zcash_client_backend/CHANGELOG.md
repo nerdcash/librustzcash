@@ -21,6 +21,8 @@ workspace.
   or when the wallet selects `CommitmentTreeMaintenance::ViewOnly`.
 - `WalletWrite::put_blocks_without_commitment_trees`, which stores received
   notes, spends, and block metadata without updating a note commitment tree.
+- `WalletWrite::rewind_view_only`, which drops wallet rows above a block
+  identified by height and hash and requeues that range as `Historic`.
 - `WalletWrite::import_account_uivk`, for importing an account from a
   [`UnifiedIncomingViewingKey`].
 - `ScanningKeys::from_account_uivks` and `ScanningKeys::extend`, so wallets can

@@ -11,6 +11,12 @@ workspace.
 ## [Unreleased]
 
 ### Added
+- `WalletWrite::rewind_view_only`. Given the hash of a stored block, a view-only
+  wallet deletes blocks, received notes, spends, transparent outputs, and
+  nullifier-map rows above that height and requeues `Historic` through the
+  previous tip. It does not need a shard checkpoint and does not reinstall a
+  frontier. A wallet that still maintains note commitment trees is unchanged
+  and this method rejects the rewind.
 - `WalletDb::with_anchor_retention_enabled`. Retention stays on by default, on the
   ZIP 318 grid. Turning it off stores no durable anchor checkpoints. A view-only
   scan writes no checkpoints either way.

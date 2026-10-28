@@ -4407,6 +4407,22 @@ pub trait WalletWrite:
         reset_account_birthdays: HashSet<<Self as WalletRead>::AccountId>,
     ) -> Result<(), RewindError<<Self as WalletRead>::AccountId, <Self as WalletRead>::Error>>;
 
+    /// Rewinds a view-only wallet to `height`, which must be a stored block with `block_hash`.
+    ///
+    /// Deletes blocks, received notes, note spends, transparent outputs, and nullifier-map rows
+    /// above `height`, and requeues `Historic` from the next block through the previous tip.
+    /// Does not require a shard checkpoint and does not reinstall a note commitment frontier.
+    ///
+    /// A hash mismatch is the same conflict a scan reports when a stored block is not the one
+    /// being connected. A wallet that maintains note commitment trees should keep using
+    /// [`Self::truncate_to_height`] or [`Self::truncate_to_chain_state`]; those still rewind a
+    /// spending wallet onto a checkpoint or a frontier.
+    fn rewind_view_only(
+        &mut self,
+        height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> Result<(), <Self as WalletRead>::Error>;
+
     /// Reserves the next `n` available ephemeral addresses for the given account.
     /// This cannot be undone, so as far as possible, errors associated with transaction
     /// construction should have been reported before calling this method.

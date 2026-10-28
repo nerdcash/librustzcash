@@ -513,3 +513,123 @@ fn spending_wallet_can_disable_anchor_retention() {
         "disabling anchor retention stores no durable anchor"
     );
 }
+
+fn block_hash_at(conn: &Connection, height: BlockHeight) -> BlockHash {
+    let bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT hash FROM blocks WHERE height = ?1",
+            [u32::from(height)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    BlockHash::from_slice(&bytes)
+}
+
+#[test]
+fn view_only_rewind_drops_rows_above_a_matching_hash() {
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(TestDbFactory::default())
+        .with_block_cache(BlockCache::new())
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+    st.wallet_mut()
+        .db_mut()
+        .set_commitment_tree_maintenance(CommitmentTreeMaintenance::ViewOnly);
+
+    let fvk = SaplingPoolTester::test_account_fvk(&st);
+    let (first, _, _) = st.generate_next_block(
+        &fvk,
+        AddressType::DefaultExternal,
+        Zatoshis::const_from_u64(100_000),
+    );
+    let (second, _, _) = st.generate_next_block(
+        &fvk,
+        AddressType::DefaultExternal,
+        Zatoshis::const_from_u64(50_000),
+    );
+    st.scan_cached_blocks(first, 2);
+    assert_eq!(received_notes(st.wallet().conn()), 2);
+
+    let keep = block_hash_at(st.wallet().conn(), first);
+    let caps_before = cap_blobs(st.wallet().conn());
+    // A nullifier observed above the rewind point must go with the block.
+    let locator_height = u32::from(second);
+    st.wallet()
+        .conn()
+        .execute(
+            "INSERT INTO tx_locator_map (block_height, tx_index, txid) VALUES (?1, 7, ?2)",
+            (locator_height, vec![9u8; 32]),
+        )
+        .unwrap();
+    st.wallet()
+        .conn()
+        .execute(
+            "INSERT INTO nullifier_map (spend_pool, nf, block_height, tx_index)
+             VALUES (2, ?1, ?2, 7)",
+            (vec![3u8; 32], locator_height),
+        )
+        .unwrap();
+
+    assert_matches!(
+        st.wallet_mut().rewind_view_only(first, BlockHash([1; 32])),
+        Err(crate::error::SqliteClientError::BlockConflict(_))
+    );
+    assert_eq!(received_notes(st.wallet().conn()), 2);
+
+    st.wallet_mut().rewind_view_only(first, keep).unwrap();
+
+    let conn = st.wallet().conn();
+    assert_eq!(received_notes(conn), 1);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM blocks"), 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM nullifier_map WHERE block_height > ?1",
+            [u32::from(first)],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM tx_locator_map WHERE block_height > ?1",
+            [u32::from(first)],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(cap_blobs(conn), caps_before);
+    assert_eq!(shard_and_checkpoint_rows(conn), 0);
+    let priorities = queue_priorities(conn);
+    assert!(
+        priorities.contains(&ScanPriority::Historic),
+        "rewind queue: {priorities:?}"
+    );
+    assert!(
+        !priorities.contains(&ScanPriority::ChainTip),
+        "rewind queue: {priorities:?}"
+    );
+}
+
+#[test]
+fn spending_wallet_rejects_view_only_rewind() {
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(TestDbFactory::default())
+        .with_block_cache(BlockCache::new())
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+    let fvk = SaplingPoolTester::test_account_fvk(&st);
+    let (height, _, _) = st.generate_next_block(
+        &fvk,
+        AddressType::DefaultExternal,
+        Zatoshis::const_from_u64(100_000),
+    );
+    st.scan_cached_blocks(height, 1);
+    let hash = block_hash_at(st.wallet().conn(), height);
+    assert_matches!(
+        st.wallet_mut().rewind_view_only(height, hash),
+        Err(crate::error::SqliteClientError::RequestedRewindInvalid { .. })
+    );
+    assert_eq!(received_notes(st.wallet().conn()), 1);
+}

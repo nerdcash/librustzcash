@@ -3793,6 +3793,14 @@ impl WalletWrite for MockWalletDb {
         Err(())
     }
 
+    fn rewind_view_only(
+        &mut self,
+        _height: BlockHeight,
+        _block_hash: BlockHash,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        Ok(())
+    }
+
     fn truncate_to_chain_state(
         &mut self,
         _chain_state: ChainState,
