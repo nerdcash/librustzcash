@@ -15,7 +15,7 @@ rust-version.workspace = true
 categories.workspace = true
 
 # Exclude proto files so crates.io consumers don't need protoc.
-exclude = ["*.proto"]
+exclude = ["*.proto", "benches/fixtures/*.pb"]
 
 [package.metadata.cargo-udeps.ignore]
 development = ["zcash_proofs"]
@@ -153,6 +153,7 @@ gumdrop = "0.8"
 incrementalmerkletree = { workspace = true, features = ["test-dependencies"] }
 jubjub.workspace = true
 proptest.workspace = true
+prost.workspace = true
 rand = { workspace = true, features = ["sys_rng"] }
 rand_chacha.workspace = true
 redjubjub.workspace = true
@@ -165,6 +166,9 @@ zcash_keys = { workspace = true, features = ["test-dependencies"] }
 zcash_primitives = { workspace = true, features = ["test-dependencies"] }
 zcash_proofs = { workspace = true, features = ["bundled-prover"] }
 zcash_protocol = { workspace = true, features = ["local-consensus", "test-dependencies"] }
+# The trial-decrypt benchmark hashes its committed compact-block fixtures.
+sha2.workspace = true
+zip32.workspace = true
 
 [features]
 default = ["time/default", "orchard", "zeroize"]
@@ -316,6 +320,11 @@ unstable-spanning-tree = []
 
 [lib]
 bench = false
+
+[[bench]]
+name = "trial_decrypt"
+harness = false
+required-features = ["orchard"]
 
 [badges]
 maintenance = { status = "actively-developed" }

@@ -897,6 +897,120 @@ impl PositionTracker {
     }
 }
 
+/// Trial-decrypts every shielded output in a compact block.
+///
+/// This is only the trial-decryption phase of [`crate::scanning::scan_block`]: nullifier
+/// matching, note-commitment tree updates, and transparent address lookups are not
+/// performed. Both routines decrypt with
+/// `zcash_note_encryption::batch::try_compact_note_decryption` and the same note-encryption
+/// domains, so a benchmark can divide the time spent here by the time spent in
+/// [`crate::scanning::scan_block`] to measure the fraction of a scan that is trial
+/// decryption.
+///
+/// Incoming viewing keys are prepared once per transaction, matching the inline compact
+/// scan path.
+///
+/// Returns the number of outputs that decrypted under at least one scanning key.
+pub fn trial_decrypt_compact_block<P, AccountId, IvkTag>(
+    params: &P,
+    block: &CompactBlock,
+    scanning_keys: &ScanningKeys<AccountId, IvkTag>,
+) -> Result<usize, ScanError>
+where
+    P: consensus::Parameters,
+    IvkTag: Clone,
+{
+    let height = block.height();
+    let zip212 = zip212_enforcement(params, height);
+    let mut decrypted = 0usize;
+
+    for tx in &block.vtx {
+        let txid = tx.txid();
+
+        let sapling_ivks: Vec<_> = scanning_keys
+            .sapling()
+            .values()
+            .map(|key| key.prepare())
+            .collect();
+        let sapling_outputs = tx
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                CompactOutputDescription::try_from(output)
+                    .map(|parsed| (SaplingDomain::new(zip212), parsed))
+                    .map_err(|_| ScanError::EncodingInvalid {
+                        at_height: height,
+                        txid,
+                        pool_type: ShieldedPool::Sapling,
+                        index,
+                    })
+            })
+            .collect::<Result<Vec<_>, ScanError>>()?;
+        decrypted += batch::try_compact_note_decryption(&sapling_ivks, &sapling_outputs)
+            .into_iter()
+            .flatten()
+            .count();
+
+        #[cfg(feature = "orchard")]
+        {
+            let orchard_ivks: Vec<_> = scanning_keys
+                .orchard()
+                .values()
+                .map(|key| key.prepare())
+                .collect();
+            let orchard_outputs = tx
+                .actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let action = CompactAction::try_from(action).map_err(|_| {
+                        ScanError::EncodingInvalid {
+                            at_height: height,
+                            txid,
+                            pool_type: ShieldedPool::Orchard,
+                            index,
+                        }
+                    })?;
+                    Ok((OrchardDomain::for_compact_action(&action), action))
+                })
+                .collect::<Result<Vec<_>, ScanError>>()?;
+            decrypted += batch::try_compact_note_decryption(&orchard_ivks, &orchard_outputs)
+                .into_iter()
+                .flatten()
+                .count();
+
+            let ironwood_ivks: Vec<_> = scanning_keys
+                .ironwood()
+                .values()
+                .map(|key| key.prepare())
+                .collect();
+            let ironwood_outputs = tx
+                .ironwood_actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let action = CompactAction::try_from(action).map_err(|_| {
+                        ScanError::EncodingInvalid {
+                            at_height: height,
+                            txid,
+                            pool_type: ShieldedPool::Ironwood,
+                            index,
+                        }
+                    })?;
+                    Ok((IronwoodDomain::for_compact_action(&action), action))
+                })
+                .collect::<Result<Vec<_>, ScanError>>()?;
+            decrypted += batch::try_compact_note_decryption(&ironwood_ivks, &ironwood_outputs)
+                .into_iter()
+                .flatten()
+                .count();
+        }
+    }
+
+    Ok(decrypted)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1034,6 +1148,59 @@ mod tests {
 
         go(false);
         go(true);
+    }
+
+    #[test]
+    fn trial_decrypt_finds_the_same_notes_as_scan_block() {
+        let network = Network::TestNetwork;
+        let account = AccountId::ZERO;
+        let usk = UnifiedSpendingKey::from_seed(&network, &[0u8; 32], account).expect("Valid USK");
+        let ufvk = usk.to_unified_full_viewing_key();
+        let sapling_dfvk = ufvk.sapling().expect("Sapling key is present").clone();
+        let scanning_keys = ScanningKeys::from_account_ufvks([(account, ufvk)]);
+
+        let cb = fake_compact_block(
+            1u32.into(),
+            BlockHash([0; 32]),
+            Nullifier([0; 32]),
+            &sapling_dfvk,
+            Zatoshis::const_from_u64(5),
+            false,
+            None,
+        );
+
+        let decrypted = super::trial_decrypt_compact_block(&network, &cb, &scanning_keys).unwrap();
+
+        let scanned = scan_block::<_, _, _, Infallible>(
+            &network,
+            cb,
+            &scanning_keys,
+            &SpendIdentifiers::empty(),
+            Some(&BlockMetadata::from_parts(
+                BlockHeight::from(0),
+                BlockHash([0u8; 32]),
+                Some(0),
+                #[cfg(feature = "orchard")]
+                Some(0),
+                #[cfg(feature = "orchard")]
+                Some(0),
+            )),
+            #[cfg(feature = "transparent-inputs")]
+            |_addr| Ok::<_, Infallible>(None),
+        )
+        .unwrap();
+
+        let mut found = 0usize;
+        for tx in scanned.transactions() {
+            found += tx.sapling_outputs().len();
+            #[cfg(feature = "orchard")]
+            {
+                found += tx.orchard_outputs().len();
+                found += tx.ironwood_outputs().len();
+            }
+        }
+        assert_eq!(decrypted, found);
+        assert_eq!(decrypted, 1);
     }
 
     #[cfg(feature = "orchard")]
