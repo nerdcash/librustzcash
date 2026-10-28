@@ -68,7 +68,7 @@ use zcash_client_backend::{
         chain::{BlockSource, ChainState, CommitmentTreeRoot, CompactChainState, ScanContinuity},
         error::{FindAccountForAddressError, LockError, RewindError},
         ll::{
-            self, LowLevelWalletRead, LowLevelWalletWrite, ReceivedSaplingOutput,
+            self, LowLevelWalletRead, LowLevelWalletWrite, ReceivedSaplingOutput, StagedSpend,
             wallet::store_decrypted_tx,
         },
         scanning::{ScanPriority, ScanRange},
@@ -181,6 +181,12 @@ pub mod testing;
 /// consistent with the bound in zcashd, and allows block data deeper than
 /// this delta from the chain tip to be pruned.
 pub(crate) const PRUNING_DEPTH: u32 = 100;
+
+/// Nanoseconds spent writing the nullifier map since the last reset.
+///
+/// The tip-first scan test reads this. It is process-wide.
+pub(crate) static NULLIFIER_MAP_WRITE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// The number of blocks to verify ahead when the chain tip is updated.
 pub(crate) const VERIFY_LOOKAHEAD: u32 = 10;
@@ -3458,6 +3464,10 @@ impl<'a, C: Borrow<rusqlite::Transaction<'a>>, P: consensus::Parameters, CL: Clo
         nfs: &[(TxIndex, TxId, Vec<::sapling::Nullifier>)],
     ) -> Result<(), Self::Error> {
         wallet::insert_nullifier_map(self.conn.borrow(), block_height, ShieldedPool::Sapling, nfs)
+    }
+
+    fn persist_staged_spends(&mut self, spends: &[StagedSpend]) -> Result<(), Self::Error> {
+        wallet::insert_staged_nullifiers(self.conn.borrow(), spends)
     }
 
     #[cfg(feature = "orchard")]

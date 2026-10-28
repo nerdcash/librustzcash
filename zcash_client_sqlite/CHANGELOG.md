@@ -37,6 +37,10 @@ workspace.
   the nullifier map, the freed b-tree pages are returned to the file instead of
   remaining as high-water. A database created without that mode is switched on
   its next migration, which rewrites the file once.
+- A scan batch writes its surviving nullifiers in one ordered insert instead of
+  one statement per spend. Nullifiers that the batch's frontier will drop are
+  not written. Nullifiers a later gap still needs are committed with the batch,
+  so a restart can still match them.
 - `put_sapling_subtree_roots`, `put_orchard_subtree_roots`, and
   `put_ironwood_subtree_roots` treat an already-stored prefix as a no-op and
   still write roots past that prefix. `start_index = max_stored_index + 1`

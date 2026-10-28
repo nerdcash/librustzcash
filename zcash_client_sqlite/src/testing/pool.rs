@@ -1063,6 +1063,45 @@ pub(crate) fn orchard_to_ironwood_self_migration_reports_fee_only_delta() {
 /// Each block carries unrelated Sapling spends. The nullifier map has to remember
 /// those spends until the birthday gap closes, and must then drop back to the
 /// retention window with the freed pages returned to the file.
+/// A spend scanned before its note is committed to the database, not held only
+/// in the scan's memory. Reopening the file is a restart: the note scan that
+/// follows must still observe the spend.
+pub(crate) fn out_of_order_spend_survives_reopen() {
+    use zcash_client_backend::data_api::testing::pool::ShieldedPoolTester;
+    use zcash_client_backend::data_api::{Account as _, testing::AddressType};
+
+    let mut st =
+        TestDsl::with_sapling_birthday_account(TestDbFactory::file_backed(), BlockCache::new())
+            .build::<SaplingPoolTester>();
+    let account = st.test_account().cloned().unwrap();
+    let dfvk = SaplingPoolTester::test_account_fvk(&st);
+    let value = Zatoshis::const_from_u64(50_000);
+    let (received_height, _, nf) =
+        st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
+    let not_our_key = SaplingPoolTester::sk_to_fvk(&SaplingPoolTester::sk(&[0xf5; 32]));
+    let to2 = SaplingPoolTester::fvk_default_address(&not_our_key);
+    let value2 = Zatoshis::const_from_u64(20_000);
+    let (spent_height, _) = st.generate_next_block_spending(&dfvk, (nf, value), to2, value2);
+
+    st.scan_cached_blocks(spent_height, 1);
+
+    let reopened = rusqlite::Connection::open(st.wallet().data_file_path()).unwrap();
+    let persisted: i64 = reopened
+        .query_row("SELECT COUNT(*) FROM nullifier_map", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        persisted > 0,
+        "spend nullifier was not committed; a restart would miss it"
+    );
+    drop(reopened);
+
+    st.scan_cached_blocks(received_height, 1);
+    assert_eq!(
+        st.get_total_balance(account.id()),
+        (value - value2).unwrap()
+    );
+}
+
 pub(crate) fn tip_first_historic_nullifier_map_stays_bounded() {
     use zcash_client_backend::data_api::ll::wallet::SPEND_MAP_RETENTION_BLOCKS;
 
@@ -1082,6 +1121,8 @@ pub(crate) fn tip_first_historic_nullifier_map_stays_bounded() {
         st.generate_next_block_with_unrelated_spends(SPENDS);
     }
     let tip = birthday + TOTAL - 1;
+    crate::NULLIFIER_MAP_WRITE_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let wall_started = std::time::Instant::now();
     st.scan_cached_blocks(tip - TIP + 1, TIP as usize);
 
     let mut end = tip - TIP + 1;
@@ -1120,10 +1161,14 @@ pub(crate) fn tip_first_historic_nullifier_map_stays_bounded() {
         final_pages * 2 < max_pages,
         "high-water did not shrink: max_pages={max_pages} final_pages={final_pages} page_size={page_size} max_rows={max_rows} final_rows={final_rows}"
     );
+    let wall_ns = wall_started.elapsed().as_nanos();
+    let write_ns = crate::NULLIFIER_MAP_WRITE_NS.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!(
-        "tip-first high-water max_pages={max_pages} ({:.2} MiB) final_pages={final_pages} ({:.2} MiB) max_rows={max_rows} final_rows={final_rows} page_size={page_size}",
+        "tip-first high-water max_pages={max_pages} ({:.2} MiB) final_pages={final_pages} ({:.2} MiB) max_rows={max_rows} final_rows={final_rows} page_size={page_size} nullifier_write_ms={:.1} wall_ms={:.1}",
         (max_pages * page_size) as f64 / (1024.0 * 1024.0),
         (final_pages * page_size) as f64 / (1024.0 * 1024.0),
+        write_ns as f64 / 1_000_000.0,
+        wall_ns as f64 / 1_000_000.0,
     );
 }
 

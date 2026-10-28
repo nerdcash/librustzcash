@@ -356,6 +356,25 @@ pub trait LowLevelWalletRead {
 /// to provide standard implementations for certain [`WalletWrite`] trait methods.
 ///
 /// [`WalletWrite`]: super::WalletWrite
+/// One shielded spend to record in the nullifier map.
+///
+/// Scanning builds these in memory, possibly on another thread, and the wallet
+/// writes the whole batch once. Only spends that are still needed for spend
+/// detection at the end of the batch are included.
+#[derive(Clone, Debug)]
+pub struct StagedSpend {
+    /// Block that revealed the nullifier.
+    pub height: BlockHeight,
+    /// Index of the spending transaction within that block.
+    pub tx_index: TxIndex,
+    /// Transaction that revealed the nullifier.
+    pub txid: TxId,
+    /// Shielded pool the nullifier belongs to.
+    pub pool: ShieldedPool,
+    /// Nullifier bytes.
+    pub nf: [u8; 32],
+}
+
 pub trait LowLevelWalletWrite: LowLevelWalletRead {
     /// Add metadata about a block to the wallet data store.
     #[allow(clippy::too_many_arguments)]
@@ -603,6 +622,15 @@ pub trait LowLevelWalletWrite: LowLevelWalletRead {
     /// - `pruning_depth`: The number of blocks below the fully scanned height at which to
     ///   prune tracked spends.
     fn prune_tracked_spends(&mut self, pruning_depth: u32) -> Result<(), Self::Error>;
+
+    /// Writes shielded spends that must still be findable after this batch commits.
+    ///
+    /// The slice is the survivor set for the batch: spends at heights the
+    /// spend-tracking floor did not drop. It is persisted in the same database
+    /// transaction as the blocks, so a crash before commit rolls the blocks and
+    /// the nullifiers back together and the batch is scanned again. A crash
+    /// after commit leaves the nullifiers available for a later scan of a gap.
+    fn persist_staged_spends(&mut self, spends: &[StagedSpend]) -> Result<(), Self::Error>;
 
     /// Records information about a transaction output that your wallet created, from the constituent
     /// properties of that output.

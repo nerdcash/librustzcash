@@ -5,7 +5,7 @@ use {
 };
 
 use rayon::{
-    iter::{IndexedParallelIterator as _, ParallelIterator},
+    iter::{IndexedParallelIterator as _, IntoParallelIterator, ParallelIterator},
     slice::ParallelSliceMut as _,
 };
 use tracing::{debug, info, trace, warn};
@@ -16,8 +16,8 @@ use transparent::{address::TransparentAddress, bundle::OutPoint};
 use zcash_keys::{address::Receiver, encoding::AddressCodec as _};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
-    PoolType, ShieldedPool,
-    consensus::{self, BlockHeight},
+    PoolType, ShieldedPool, TxId,
+    consensus::{self, BlockHeight, TxIndex},
     value::{BalanceError, Zatoshis},
 };
 use zcash_script::solver::ScriptKind;
@@ -34,7 +34,7 @@ use crate::{
     wallet::{Recipient, WalletTransparentOutput},
 };
 
-use super::{LowLevelWalletRead, LowLevelWalletWrite, TxMeta};
+use super::{LowLevelWalletRead, LowLevelWalletWrite, StagedSpend, TxMeta};
 
 #[cfg(feature = "orchard")]
 use crate::data_api::anchor_retention::{AnchorRetentionInterval, PoolMigrationParams};
@@ -431,6 +431,16 @@ where
     let spend_tracking_floor =
         spend_tracking_floor(frontier_for_floor, prior.block_height, batch_end);
 
+    // Copy the shielded spends out and build the survivor set on another thread
+    // while this thread writes block and note rows. The set is what must still
+    // be on disk when the batch commits; a crash before that commit scans the
+    // batch again, and a crash after it can still match a spend to a note found
+    // later in a gap.
+    let shielded_spends = snapshot_shielded_spends(&blocks);
+    let staging = JoinOnDrop(Some(std::thread::spawn(move || {
+        stage_surviving_spends(shielded_spends, spend_tracking_floor)
+    })));
+
     let mut sapling_commitments = vec![];
     #[cfg(feature = "orchard")]
     let mut orchard_commitments = vec![];
@@ -605,24 +615,11 @@ where
             }
         }
 
-        // Insert this block's unmatched nullifiers and transparent prevouts into the spend maps,
-        // unless the height lies below the spend-tracking floor.
+        // Shielded nullifiers are staged off this thread and written once, after
+        // the block rows. Transparent spends stay on this path; they are few
+        // beside the shielded map. Both still honor the spend-tracking floor.
+        #[cfg(feature = "transparent-inputs")]
         if should_track_spends(spend_tracking_floor, block.height()) {
-            wallet_db
-                .track_block_sapling_nullifiers(block.height(), block.sapling().nullifier_map())
-                .map_err(PutBlocksError::Storage)?;
-
-            #[cfg(feature = "orchard")]
-            wallet_db
-                .track_block_orchard_nullifiers(block.height(), block.orchard().nullifier_map())
-                .map_err(PutBlocksError::Storage)?;
-
-            #[cfg(feature = "orchard")]
-            wallet_db
-                .track_block_ironwood_nullifiers(block.height(), block.ironwood().nullifier_map())
-                .map_err(PutBlocksError::Storage)?;
-
-            #[cfg(feature = "transparent-inputs")]
             wallet_db
                 .track_block_transparent_spends(block.height(), block.transparent_spend_map())
                 .map_err(PutBlocksError::Storage)?;
@@ -696,6 +693,11 @@ where
             .map_err(PutBlocksError::GapAddresses)?;
         }
     }
+
+    let staged = staging.join();
+    wallet_db
+        .persist_staged_spends(&staged)
+        .map_err(PutBlocksError::Storage)?;
 
     // Prune the nullifier and transparent spend maps of entries we no longer need.
     wallet_db
@@ -2058,6 +2060,111 @@ fn should_track_spends(
     block_height: BlockHeight,
 ) -> bool {
     spend_tracking_floor.is_none_or(|floor| block_height >= floor)
+}
+
+struct JoinOnDrop<T>(Option<std::thread::JoinHandle<T>>);
+
+impl<T> JoinOnDrop<T> {
+    fn join(mut self) -> T {
+        self.0
+            .take()
+            .expect("staging thread")
+            .join()
+            .expect("nullifier staging")
+    }
+}
+
+impl<T> Drop for JoinOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            // The batch failed before the staged spends were needed. Wait so a
+            // panic in staging is not detached from this thread.
+            let _ = handle.join();
+        }
+    }
+}
+
+fn copy_nullifier(bytes: &[u8]) -> [u8; 32] {
+    bytes.try_into().expect("shielded nullifier is 32 bytes")
+}
+
+fn push_nullifiers<NF>(
+    out: &mut Vec<StagedSpend>,
+    height: BlockHeight,
+    pool: ShieldedPool,
+    nullifiers: &[(TxIndex, TxId, Vec<NF>)],
+    to_bytes: impl Fn(&NF) -> [u8; 32],
+) {
+    for (tx_index, txid, nfs) in nullifiers {
+        for nf in nfs {
+            out.push(StagedSpend {
+                height,
+                tx_index: *tx_index,
+                txid: *txid,
+                pool,
+                nf: to_bytes(nf),
+            });
+        }
+    }
+}
+
+fn snapshot_shielded_spends<A>(blocks: &[ScannedBlock<A>]) -> Vec<Vec<StagedSpend>> {
+    blocks
+        .iter()
+        .map(|block| {
+            let mut spends = Vec::new();
+            push_nullifiers(
+                &mut spends,
+                block.height(),
+                ShieldedPool::Sapling,
+                block.sapling().nullifier_map(),
+                |nf| copy_nullifier(nf.as_ref()),
+            );
+            #[cfg(feature = "orchard")]
+            push_nullifiers(
+                &mut spends,
+                block.height(),
+                ShieldedPool::Orchard,
+                block.orchard().nullifier_map(),
+                |nf| nf.to_bytes(),
+            );
+            #[cfg(feature = "orchard")]
+            push_nullifiers(
+                &mut spends,
+                block.height(),
+                ShieldedPool::Ironwood,
+                block.ironwood().nullifier_map(),
+                |nf| nf.to_bytes(),
+            );
+            spends
+        })
+        .collect()
+}
+
+/// Keeps spends at or above the floor and, for a repeated nullifier, the latest
+/// height. Built away from the SQLite connection.
+fn stage_surviving_spends(
+    blocks: Vec<Vec<StagedSpend>>,
+    floor: Option<BlockHeight>,
+) -> Vec<StagedSpend> {
+    let mut staged: Vec<StagedSpend> = blocks
+        .into_par_iter()
+        .filter(|spends| {
+            spends
+                .first()
+                .is_none_or(|spend| should_track_spends(floor, spend.height))
+        })
+        .flatten()
+        .collect();
+    staged.par_sort_unstable_by(|left, right| {
+        left.pool
+            .cmp(&right.pool)
+            .then(left.nf.cmp(&right.nf))
+            .then(right.height.cmp(&left.height))
+    });
+    // `dedup_by` keeps the first of each run. The sort put the greatest height first.
+    staged.dedup_by(|left, right| left.pool == right.pool && left.nf == right.nf);
+    staged
 }
 
 /// Returns whether the checkpoint at `height` should be retained as a durable anchor: anchor

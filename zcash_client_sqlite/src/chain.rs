@@ -449,6 +449,11 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_spend_survives_reopen() {
+        testing::pool::out_of_order_spend_survives_reopen();
+    }
+
+    #[test]
     fn bridging_historic_batch_skips_nullifiers_below_the_floor() {
         testing::pool::bridging_historic_batch_skips_nullifiers_below_the_floor();
     }

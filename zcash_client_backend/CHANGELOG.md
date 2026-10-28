@@ -11,6 +11,9 @@ workspace.
 ## [Unreleased]
 
 ### Added
+- `ll::StagedSpend` and `LowLevelWalletWrite::persist_staged_spends`, the
+  batch write of shielded spends that must still be findable after the scan
+  batch commits.
 - `scanning::trial_decrypt_compact_block` and
   `scanning::trial_decrypt_compact_block_with_options`, the trial-decryption
   phase of a compact-block scan.
@@ -52,7 +55,9 @@ workspace.
   that closes the gap up to an already-scanned suffix keeps only the retention
   window of that suffix, instead of inserting every nullifier in the batch and
   deleting it again. A batch that still leaves a gap below itself tracks every
-  spend, so a note discovered later in that gap is still matched.
+  spend, so a note discovered later in that gap is still matched. The survivor
+  set is built off the SQLite writer and written once, in the same transaction
+  as the blocks.
 - `scan_cached_blocks` takes its prior block as `ScanContinuity`. Callers that
   pass `&ChainState` keep the previous spending-wallet behavior. A view-only
   wallet persists the batch without frontiers and without subtree roots.
