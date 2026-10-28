@@ -8,8 +8,88 @@ use std::sync::{
 };
 
 use memuse::DynamicUsage;
+use rayon::prelude::{ParallelIterator, ParallelSlice};
 use zcash_note_encryption::{BatchDomain, Domain, ShieldedOutput, batch};
 use zcash_primitives::{block::BlockHash, transaction::TxId};
+
+/// Smallest output slice that is worth running as its own rayon chunk.
+///
+/// Below this, the cost of scheduling a join exceeds the key-agreement work.
+/// A spam transaction is far larger, so a top-level batch still splits once per
+/// core. A batch task that is already running on the pool does not split again.
+const MIN_OUTPUTS_PER_CHUNK: usize = 32;
+
+#[allow(clippy::type_complexity)]
+fn parallel_chunks<D, Output, R>(
+    ivks: &[D::IncomingViewingKey],
+    outputs: &[(D, Output)],
+    decrypt: fn(&[D::IncomingViewingKey], &[(D, Output)]) -> Vec<R>,
+) -> Vec<R>
+where
+    D: BatchDomain + Sync,
+    Output: ShieldedOutput<D> + Sync,
+    D::IncomingViewingKey: Sync,
+    R: Send,
+{
+    let n = outputs.len();
+    let threads = rayon::current_num_threads().max(1);
+    // `BatchRunner` already placed this batch on a pool worker and split it
+    // into one task per core. A nested `par_chunks` would re-split that task
+    // and fight the pool. Top-level callers (compact `scan_block`, the
+    // trial-decrypt benchmark) are not on the pool, so they split here.
+    let chunks = if rayon::current_thread_index().is_some() || threads == 1 {
+        1
+    } else {
+        (n / MIN_OUTPUTS_PER_CHUNK).clamp(1, threads)
+    };
+    if chunks <= 1 {
+        return decrypt(ivks, outputs);
+    }
+    let chunk_len = n.div_ceil(chunks);
+    // `map` + `collect` on an indexed parallel iterator keeps chunk order.
+    // `flat_map` would not, and a shuffled result would be attributed to the
+    // wrong output.
+    let parts: Vec<Vec<R>> = outputs
+        .par_chunks(chunk_len)
+        .map(|chunk| decrypt(ivks, chunk))
+        .collect();
+    parts.into_iter().flatten().collect()
+}
+
+/// Trial-decrypts compact outputs, using every rayon thread when called from
+/// outside the pool and the batch is large enough to split.
+#[allow(clippy::type_complexity)]
+pub(crate) fn parallel_try_compact_note_decryption<D, Output>(
+    ivks: &[D::IncomingViewingKey],
+    outputs: &[(D, Output)],
+) -> Vec<Option<((D::Note, D::Recipient), usize)>>
+where
+    D: BatchDomain + Sync,
+    Output: ShieldedOutput<D> + Sync,
+    D::IncomingViewingKey: Sync,
+    D::Note: Send,
+    D::Recipient: Send,
+{
+    parallel_chunks(ivks, outputs, batch::try_compact_note_decryption)
+}
+
+/// Trial-decrypts full outputs. Same threading policy as
+/// [`parallel_try_compact_note_decryption`].
+#[allow(clippy::type_complexity)]
+pub(crate) fn parallel_try_note_decryption<D, Output>(
+    ivks: &[D::IncomingViewingKey],
+    outputs: &[(D, Output)],
+) -> Vec<Option<((D::Note, D::Recipient, D::Memo), usize)>>
+where
+    D: BatchDomain + Sync,
+    Output: ShieldedOutput<D> + Sync,
+    D::IncomingViewingKey: Sync,
+    D::Memo: Send,
+    D::Note: Send,
+    D::Recipient: Send,
+{
+    parallel_chunks(ivks, outputs, batch::try_note_decryption)
+}
 
 /// A decrypted transaction output.
 pub(crate) struct DecryptedOutput<IvkTag, D: Domain, M> {
@@ -56,7 +136,15 @@ pub(crate) trait Decryptor<D: BatchDomain, Output> {
 #[allow(dead_code)]
 pub(crate) struct FullDecryptor;
 
-impl<D: BatchDomain, Output: ShieldedOutput<D>> Decryptor<D, Output> for FullDecryptor {
+impl<D, Output> Decryptor<D, Output> for FullDecryptor
+where
+    D: BatchDomain + Sync,
+    Output: ShieldedOutput<D> + Sync,
+    D::IncomingViewingKey: Sync,
+    D::Memo: Send,
+    D::Note: Send,
+    D::Recipient: Send,
+{
     type Memo = D::Memo;
 
     fn batch_decrypt<IvkTag: Clone>(
@@ -64,7 +152,7 @@ impl<D: BatchDomain, Output: ShieldedOutput<D>> Decryptor<D, Output> for FullDec
         ivks: &[D::IncomingViewingKey],
         outputs: &[(D, Output)],
     ) -> impl Iterator<Item = Option<DecryptedOutput<IvkTag, D, Self::Memo>>> {
-        batch::try_note_decryption(ivks, outputs)
+        parallel_try_note_decryption(ivks, outputs)
             .into_iter()
             .map(|res| {
                 res.map(|((note, recipient, memo), ivk_idx)| DecryptedOutput {
@@ -80,7 +168,14 @@ impl<D: BatchDomain, Output: ShieldedOutput<D>> Decryptor<D, Output> for FullDec
 /// A decryptor of outputs as encoded in compact blocks.
 pub(crate) struct CompactDecryptor;
 
-impl<D: BatchDomain, Output: ShieldedOutput<D>> Decryptor<D, Output> for CompactDecryptor {
+impl<D, Output> Decryptor<D, Output> for CompactDecryptor
+where
+    D: BatchDomain + Sync,
+    Output: ShieldedOutput<D> + Sync,
+    D::IncomingViewingKey: Sync,
+    D::Note: Send,
+    D::Recipient: Send,
+{
     type Memo = ();
 
     fn batch_decrypt<IvkTag: Clone>(
@@ -88,7 +183,7 @@ impl<D: BatchDomain, Output: ShieldedOutput<D>> Decryptor<D, Output> for Compact
         ivks: &[D::IncomingViewingKey],
         outputs: &[(D, Output)],
     ) -> impl Iterator<Item = Option<DecryptedOutput<IvkTag, D, Self::Memo>>> {
-        batch::try_compact_note_decryption(ivks, outputs)
+        parallel_try_compact_note_decryption(ivks, outputs)
             .into_iter()
             .map(|res| {
                 res.map(|((note, recipient), ivk_idx)| DecryptedOutput {
@@ -365,6 +460,51 @@ where
     fn is_empty(&self) -> bool {
         self.outputs.is_empty()
     }
+
+    /// Splits a large batch into one piece per thread.
+    ///
+    /// Pieces share the same viewing keys. Output indices live on the repliers,
+    /// so decryption results still line up after the pieces run separately.
+    /// Batches smaller than two chunks are returned unchanged.
+    fn split_across_threads(self, threads: usize) -> Vec<Self>
+    where
+        D::IncomingViewingKey: Clone,
+    {
+        let n = self.outputs.len();
+        let tasks = (n / MIN_OUTPUTS_PER_CHUNK).clamp(1, threads.max(1));
+        if tasks == 1 {
+            return vec![self];
+        }
+        let chunk_len = n.div_ceil(tasks);
+        let Self {
+            tags,
+            ivks,
+            mut outputs,
+            mut repliers,
+        } = self;
+        let mut tags = Some(tags);
+        let mut ivks = Some(ivks);
+        let mut parts = Vec::with_capacity(tasks);
+        while !outputs.is_empty() {
+            let take = chunk_len.min(outputs.len());
+            let last = outputs.len() == take;
+            parts.push(Self {
+                tags: if last {
+                    tags.take().expect("tags are moved into the last piece")
+                } else {
+                    tags.as_ref().expect("tags outlive the last piece").clone()
+                },
+                ivks: if last {
+                    ivks.take().expect("ivks are moved into the last piece")
+                } else {
+                    ivks.as_ref().expect("ivks outlive the last piece").clone()
+                },
+                outputs: outputs.drain(..take).collect(),
+                repliers: repliers.drain(..take).collect(),
+            });
+        }
+        parts
+    }
 }
 
 impl<IvkTag, D, Output, Dec> Task for Batch<IvkTag, D, Output, Dec>
@@ -596,7 +736,12 @@ where
         if !self.acc.is_empty() {
             let mut batch = Batch::new(self.acc.tags.clone(), self.acc.ivks.clone());
             mem::swap(&mut batch, &mut self.acc);
-            self.running_tasks.run_task(batch);
+            // One task per core when the batch is large enough. Each task then
+            // decrypts serially, so the pool stays full without nested joins.
+            let threads = rayon::current_num_threads().max(1);
+            for part in batch.split_across_threads(threads) {
+                self.running_tasks.run_task(part);
+            }
         }
     }
 

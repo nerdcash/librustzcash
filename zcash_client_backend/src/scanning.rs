@@ -1067,6 +1067,8 @@ impl<E: std::error::Error + 'static> std::error::Error for ScanBlockError<E> {
     }
 }
 
+pub use compact::trial_decrypt_compact_block;
+
 /// Scans a [`CompactBlock`] with a set of [`ScanningKeys`].
 ///
 /// Returns a vector of [`WalletTx`]s decryptable by any of the given keys. If an output is

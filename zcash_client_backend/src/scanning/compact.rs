@@ -5,7 +5,6 @@ use sapling::note_encryption::{CompactOutputDescription, SaplingDomain};
 use subtle::ConditionallySelectable;
 
 use tracing::{debug, trace, warn};
-use zcash_note_encryption::batch;
 use zcash_primitives::transaction::components::sapling::zip212_enforcement;
 use zcash_protocol::{
     ShieldedPool,
@@ -19,7 +18,7 @@ use super::{
 use crate::{
     data_api::{BlockMetadata, ScannedBlock, ScannedBundles},
     proto::compact_formats::{ChainMetadata, CompactBlock, CompactTx},
-    scan::{Batch, BatchRunner, CompactDecryptor, Tasks},
+    scan::{Batch, BatchRunner, CompactDecryptor, Tasks, parallel_try_compact_note_decryption},
     wallet::{WalletSpend, WalletTx},
 };
 
@@ -472,7 +471,7 @@ where
                 .as_mut()
                 .map(|runners| |txid| runners.sapling.collect_results(cur_hash, txid)),
             |ivks, outputs| {
-                batch::try_compact_note_decryption(ivks, outputs)
+                parallel_try_compact_note_decryption(ivks, outputs)
                     .into_iter()
                     .map(|opt| opt.map(|((note, recipient), i)| ((note, recipient, ()), i)))
                     .collect()
@@ -510,7 +509,7 @@ where
                 .as_mut()
                 .map(|runners| |txid| runners.orchard.collect_results(cur_hash, txid)),
             |ivks, outputs| {
-                batch::try_compact_note_decryption(ivks, outputs)
+                parallel_try_compact_note_decryption(ivks, outputs)
                     .into_iter()
                     .map(|opt| opt.map(|((note, recipient), i)| ((note, recipient, ()), i)))
                     .collect()
@@ -548,7 +547,7 @@ where
                 .as_mut()
                 .map(|runners| |txid| runners.ironwood.collect_results(cur_hash, txid)),
             |ivks, outputs| {
-                batch::try_compact_note_decryption(ivks, outputs)
+                parallel_try_compact_note_decryption(ivks, outputs)
                     .into_iter()
                     .map(|opt| opt.map(|((note, recipient), i)| ((note, recipient, ()), i)))
                     .collect()
@@ -897,6 +896,120 @@ impl PositionTracker {
     }
 }
 
+/// Trial-decrypts every shielded output in a compact block.
+///
+/// This is only the trial-decryption phase of [`crate::scanning::scan_block`]: nullifier
+/// matching, note-commitment tree updates, and transparent address lookups are not
+/// performed. Both routines decrypt with the same parallel batch helper and the same
+/// note-encryption domains, so a benchmark can divide the time spent here by the time
+/// spent in [`crate::scanning::scan_block`] to measure the fraction of a scan that is
+/// trial decryption. A batch large enough to occupy more than one core is split across
+/// the rayon pool when this is called from outside that pool.
+///
+/// Incoming viewing keys are prepared once per transaction, matching the inline compact
+/// scan path.
+///
+/// Returns the number of outputs that decrypted under at least one scanning key.
+pub fn trial_decrypt_compact_block<P, AccountId, IvkTag>(
+    params: &P,
+    block: &CompactBlock,
+    scanning_keys: &ScanningKeys<AccountId, IvkTag>,
+) -> Result<usize, ScanError>
+where
+    P: consensus::Parameters,
+    IvkTag: Clone,
+{
+    let height = block.height();
+    let zip212 = zip212_enforcement(params, height);
+    let mut decrypted = 0usize;
+
+    for tx in &block.vtx {
+        let txid = tx.txid();
+
+        let sapling_ivks: Vec<_> = scanning_keys
+            .sapling()
+            .values()
+            .map(|key| key.prepare())
+            .collect();
+        let sapling_outputs = tx
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                CompactOutputDescription::try_from(output)
+                    .map(|parsed| (SaplingDomain::new(zip212), parsed))
+                    .map_err(|_| ScanError::EncodingInvalid {
+                        at_height: height,
+                        txid,
+                        pool_type: ShieldedPool::Sapling,
+                        index,
+                    })
+            })
+            .collect::<Result<Vec<_>, ScanError>>()?;
+        decrypted += parallel_try_compact_note_decryption(&sapling_ivks, &sapling_outputs)
+            .into_iter()
+            .flatten()
+            .count();
+
+        #[cfg(feature = "orchard")]
+        {
+            let orchard_ivks: Vec<_> = scanning_keys
+                .orchard()
+                .values()
+                .map(|key| key.prepare())
+                .collect();
+            let orchard_outputs = tx
+                .actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let action = CompactAction::try_from(action).map_err(|_| {
+                        ScanError::EncodingInvalid {
+                            at_height: height,
+                            txid,
+                            pool_type: ShieldedPool::Orchard,
+                            index,
+                        }
+                    })?;
+                    Ok((OrchardDomain::for_compact_action(&action), action))
+                })
+                .collect::<Result<Vec<_>, ScanError>>()?;
+            decrypted += parallel_try_compact_note_decryption(&orchard_ivks, &orchard_outputs)
+                .into_iter()
+                .flatten()
+                .count();
+
+            let ironwood_ivks: Vec<_> = scanning_keys
+                .ironwood()
+                .values()
+                .map(|key| key.prepare())
+                .collect();
+            let ironwood_outputs = tx
+                .ironwood_actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let action = CompactAction::try_from(action).map_err(|_| {
+                        ScanError::EncodingInvalid {
+                            at_height: height,
+                            txid,
+                            pool_type: ShieldedPool::Ironwood,
+                            index,
+                        }
+                    })?;
+                    Ok((IronwoodDomain::for_compact_action(&action), action))
+                })
+                .collect::<Result<Vec<_>, ScanError>>()?;
+            decrypted += parallel_try_compact_note_decryption(&ironwood_ivks, &ironwood_outputs)
+                .into_iter()
+                .flatten()
+                .count();
+        }
+    }
+
+    Ok(decrypted)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -914,7 +1027,9 @@ mod tests {
         orchard::{
             keys::Scope,
             note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho},
-            note_encryption::{IronwoodDomain, IronwoodNoteEncryption},
+            note_encryption::{
+                IronwoodDomain, IronwoodNoteEncryption, OrchardDomain, OrchardNoteEncryption,
+            },
             value::NoteValue,
         },
         pasta_curves::{
@@ -1034,6 +1149,225 @@ mod tests {
 
         go(false);
         go(true);
+    }
+
+    #[test]
+    fn trial_decrypt_finds_the_same_notes_as_scan_block() {
+        let network = Network::TestNetwork;
+        let account = AccountId::ZERO;
+        let usk = UnifiedSpendingKey::from_seed(&network, &[0u8; 32], account).expect("Valid USK");
+        let ufvk = usk.to_unified_full_viewing_key();
+        let sapling_dfvk = ufvk.sapling().expect("Sapling key is present").clone();
+        let scanning_keys = ScanningKeys::from_account_ufvks([(account, ufvk)]);
+
+        let cb = fake_compact_block(
+            1u32.into(),
+            BlockHash([0; 32]),
+            Nullifier([0; 32]),
+            &sapling_dfvk,
+            Zatoshis::const_from_u64(5),
+            false,
+            None,
+        );
+
+        let decrypted = super::trial_decrypt_compact_block(&network, &cb, &scanning_keys).unwrap();
+
+        let scanned = scan_block::<_, _, _, Infallible>(
+            &network,
+            cb,
+            &scanning_keys,
+            &SpendIdentifiers::empty(),
+            Some(&BlockMetadata::from_parts(
+                BlockHeight::from(0),
+                BlockHash([0u8; 32]),
+                Some(0),
+                #[cfg(feature = "orchard")]
+                Some(0),
+                #[cfg(feature = "orchard")]
+                Some(0),
+            )),
+            #[cfg(feature = "transparent-inputs")]
+            |_addr| Ok::<_, Infallible>(None),
+        )
+        .unwrap();
+
+        let mut found = 0usize;
+        for tx in scanned.transactions() {
+            found += tx.sapling_outputs().len();
+            #[cfg(feature = "orchard")]
+            {
+                found += tx.orchard_outputs().len();
+                found += tx.ironwood_outputs().len();
+            }
+        }
+        assert_eq!(decrypted, found);
+        assert_eq!(decrypted, 1);
+    }
+
+    /// One owned Orchard or Ironwood note must be found by both trial decryption and
+    /// `scan_block`. Sapling is covered by [`trial_decrypt_finds_the_same_notes_as_scan_block`].
+    #[cfg(feature = "orchard")]
+    fn assert_owned_note_matches_scan(pool: ShieldedPool) {
+        let network = Network::TestNetwork;
+        let account = AccountId::ZERO;
+        let usk = UnifiedSpendingKey::from_seed(&network, &[0u8; 32], account).expect("Valid USK");
+        let ufvk = usk.to_unified_full_viewing_key();
+        let orchard_fvk = ufvk.orchard().expect("Orchard key is present").clone();
+        let scanning_keys = ScanningKeys::from_account_ufvks([(account, ufvk)]);
+
+        let mut rng = UnwrapErr(SysRng);
+        let recipient = orchard_fvk.address_at(0u32, Scope::External);
+        let nf_old =
+            orchard::note::Nullifier::from_bytes(&pallas::Base::random(&mut rng).to_repr())
+                .unwrap();
+        let rho = Rho::from_bytes(&nf_old.to_bytes()).unwrap();
+        let rseed = loop {
+            let mut bytes = [0u8; 32];
+            rng.fill_bytes(&mut bytes);
+            if let Some(rseed) = Option::from(RandomSeed::from_bytes(bytes, &rho)) {
+                break rseed;
+            }
+        };
+        let version = match pool {
+            ShieldedPool::Orchard => NoteVersion::V2,
+            ShieldedPool::Ironwood => NoteVersion::V3,
+            ShieldedPool::Sapling => panic!("Sapling has its own equivalence test"),
+        };
+        let note =
+            Note::from_parts(recipient, NoteValue::from_raw(5), rho, rseed, version).unwrap();
+        let ovk = Some(orchard_fvk.to_ovk(Scope::External));
+        let action = match pool {
+            ShieldedPool::Orchard => {
+                let encryptor = OrchardNoteEncryption::new(ovk, note, [0u8; 512]);
+                let cmx = ExtractedNoteCommitment::from(note.commitment());
+                let enc_ciphertext = encryptor.encrypt_note_plaintext();
+                CompactOrchardAction {
+                    nullifier: nf_old.to_bytes().to_vec(),
+                    cmx: cmx.to_bytes().to_vec(),
+                    ephemeral_key: OrchardDomain::epk_bytes(encryptor.epk()).0.to_vec(),
+                    ciphertext: enc_ciphertext.0[..orchard::note_encryption::COMPACT_NOTE_SIZE]
+                        .to_vec(),
+                }
+            }
+            ShieldedPool::Ironwood => {
+                let encryptor = IronwoodNoteEncryption::new(ovk, note, [0u8; 512]);
+                let cmx = ExtractedNoteCommitment::from(note.commitment());
+                let enc_ciphertext = encryptor.encrypt_note_plaintext();
+                CompactOrchardAction {
+                    nullifier: nf_old.to_bytes().to_vec(),
+                    cmx: cmx.to_bytes().to_vec(),
+                    ephemeral_key: IronwoodDomain::epk_bytes(encryptor.epk()).0.to_vec(),
+                    ciphertext: enc_ciphertext.0[..orchard::note_encryption::COMPACT_NOTE_SIZE]
+                        .to_vec(),
+                }
+            }
+            ShieldedPool::Sapling => unreachable!(),
+        };
+
+        let mut ctx = CompactTx::default();
+        let mut txid = vec![0u8; 32];
+        rng.fill_bytes(&mut txid);
+        ctx.txid = txid;
+        match pool {
+            ShieldedPool::Orchard => ctx.actions.push(action),
+            ShieldedPool::Ironwood => ctx.ironwood_actions.push(action),
+            ShieldedPool::Sapling => unreachable!(),
+        }
+
+        let mut hash = vec![0u8; 32];
+        rng.fill_bytes(&mut hash);
+        let cb = CompactBlock {
+            hash,
+            prev_hash: vec![0u8; 32],
+            height: 1,
+            vtx: vec![ctx],
+            chain_metadata: Some(ChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: u32::from(pool == ShieldedPool::Orchard),
+                ironwood_commitment_tree_size: u32::from(pool == ShieldedPool::Ironwood),
+            }),
+            ..Default::default()
+        };
+
+        let decrypted = super::trial_decrypt_compact_block(&network, &cb, &scanning_keys).unwrap();
+        let scanned = scan_block::<_, _, _, Infallible>(
+            &network,
+            cb,
+            &scanning_keys,
+            &SpendIdentifiers::empty(),
+            Some(&BlockMetadata::from_parts(
+                BlockHeight::from(0),
+                BlockHash([0u8; 32]),
+                Some(0),
+                Some(0),
+                Some(0),
+            )),
+            #[cfg(feature = "transparent-inputs")]
+            |_addr| Ok(None),
+        )
+        .unwrap();
+
+        let mut found = 0usize;
+        for tx in scanned.transactions() {
+            found += tx.sapling_outputs().len();
+            found += tx.orchard_outputs().len();
+            found += tx.ironwood_outputs().len();
+        }
+        assert_eq!(decrypted, 1, "{pool:?}");
+        assert_eq!(found, decrypted, "{pool:?}");
+    }
+
+    #[cfg(feature = "orchard")]
+    #[test]
+    fn trial_decrypt_matches_scan_for_owned_orchard_and_ironwood_notes() {
+        assert_owned_note_matches_scan(ShieldedPool::Orchard);
+        assert_owned_note_matches_scan(ShieldedPool::Ironwood);
+    }
+
+    /// A batch larger than one chunk per core must keep every decrypted note, in order.
+    /// 128 copies of one real output forces the parallel split on any machine with at
+    /// least two cores, and is still correct on one core.
+    #[test]
+    fn trial_decrypt_parallel_chunks_keep_every_note() {
+        let network = Network::TestNetwork;
+        let account = AccountId::ZERO;
+        let usk = UnifiedSpendingKey::from_seed(&network, &[0u8; 32], account).expect("Valid USK");
+        let ufvk = usk.to_unified_full_viewing_key();
+        let sapling_dfvk = ufvk.sapling().expect("Sapling key is present").clone();
+        let scanning_keys = ScanningKeys::from_account_ufvks([(account, ufvk)]);
+
+        let mut cb = fake_compact_block(
+            1u32.into(),
+            BlockHash([0; 32]),
+            Nullifier([0; 32]),
+            &sapling_dfvk,
+            Zatoshis::const_from_u64(5),
+            false,
+            None,
+        );
+        let real = cb.vtx[1].outputs[0].clone();
+        const COPIES: usize = 128;
+        cb.vtx[1].outputs = vec![real; COPIES];
+
+        let decrypted = super::trial_decrypt_compact_block(&network, &cb, &scanning_keys).unwrap();
+        assert_eq!(decrypted, COPIES);
+
+        let scanned = scan_block::<_, _, _, Infallible>(
+            &network,
+            cb,
+            &scanning_keys,
+            &SpendIdentifiers::empty(),
+            None,
+            #[cfg(feature = "transparent-inputs")]
+            |_addr| Ok(None),
+        )
+        .unwrap();
+        let found: usize = scanned
+            .transactions()
+            .iter()
+            .map(|tx| tx.sapling_outputs().len())
+            .sum();
+        assert_eq!(found, COPIES);
     }
 
     #[cfg(feature = "orchard")]
