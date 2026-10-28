@@ -64,7 +64,7 @@ jobs:
 
         include:
           - target: Linux
-            os: ${{ vars.UBUNTU_LARGE_RUNNER || 'ubuntu-latest' }}
+            os: ${{ (github.repository == 'zcash/librustzcash' && vars.UBUNTU_LARGE_RUNNER) || 'ubuntu-latest' }}
 
     env:
       RUSTFLAGS: >-
@@ -128,7 +128,7 @@ jobs:
 
   feature-check:
     name: Check ${{ matrix.state }} test targets
-    runs-on: ${{ vars.UBUNTU_LARGE_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.repository == 'zcash/librustzcash' && vars.UBUNTU_LARGE_RUNNER) || 'ubuntu-latest' }}
     strategy:
       matrix:
         state: >-
@@ -206,7 +206,7 @@ jobs:
           - target: macOS
             os: macOS-latest
           - target: Windows
-            os: ${{ vars.WINDOWS_LARGE_RUNNER || 'windows-latest' }}
+            os: ${{ (github.repository == 'zcash/librustzcash' && vars.WINDOWS_LARGE_RUNNER) || 'windows-latest' }}
 
         exclude:
           - target: macOS
@@ -279,7 +279,7 @@ jobs:
 
         include:
           - target: Linux
-            os: ${{ vars.UBUNTU_LARGE_RUNNER || 'ubuntu-latest' }}
+            os: ${{ (github.repository == 'zcash/librustzcash' && vars.UBUNTU_LARGE_RUNNER) || 'ubuntu-latest' }}
 
           - state: NU7
             rustflags: '--cfg zcash_unstable="nu7"'
@@ -328,7 +328,7 @@ jobs:
   notify-nightly-failure:
     name: Notify Slack of nightly test failure
     needs: test-slow
-    if: ${{ always() && github.event_name == 'schedule' && needs.test-slow.result != 'success' }}
+    if: ${{ always() && github.event_name == 'schedule' && needs.test-slow.result != 'success' && github.repository == 'zcash/librustzcash' }}
     runs-on: ubuntu-latest
     permissions: {}
     env:

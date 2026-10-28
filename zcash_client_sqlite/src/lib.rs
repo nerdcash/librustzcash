@@ -59,13 +59,13 @@ use zcash_client_backend::{
     TransferType,
     data_api::{
         self, Account, AccountBirthday, AccountMeta, AccountPurpose, AccountSource, AddressInfo,
-        BlockMetadata, ChangeReceivers, DecryptedTransaction, InputSource, NoteFilter,
-        NullifierQuery, OutputLockStore, ReceivedNotes, ReceivedTransactionOutput,
-        SAPLING_SHARD_HEIGHT, ScannedBlock, SeedRelevance, SentTransaction, TargetValue,
-        TransactionDataRequest, WalletCommitmentTrees, WalletRead, WalletSummary, WalletWrite,
-        Zip32Derivation,
+        BlockMetadata, ChangeReceivers, CommitmentTreeMaintenance, DecryptedTransaction,
+        InputSource, NoteFilter, NullifierQuery, OutputLockStore, ReceivedNotes,
+        ReceivedTransactionOutput, SAPLING_SHARD_HEIGHT, ScannedBlock, SeedRelevance,
+        SentTransaction, TargetValue, TransactionDataRequest, WalletCommitmentTrees, WalletRead,
+        WalletSummary, WalletWrite, Zip32Derivation,
         anchor_retention::{AnchorRetention, AnchorRetentionInterval},
-        chain::{BlockSource, ChainState, CommitmentTreeRoot},
+        chain::{BlockSource, ChainState, CommitmentTreeRoot, CompactChainState, ScanContinuity},
         error::{FindAccountForAddressError, LockError, RewindError},
         ll::{
             self, LowLevelWalletRead, LowLevelWalletWrite, ReceivedSaplingOutput,
@@ -299,6 +299,13 @@ pub struct WalletDb<C, P, CL, R> {
     /// When set, each `with_*_tree_mut` callback accumulates note-commitment tree mutations in
     /// memory and writes them back once. Not persisted. Defaults to `true`.
     commitment_tree_write_back: bool,
+    /// Whether scanning maintains note commitment trees. Not persisted. Defaults to
+    /// [`CommitmentTreeMaintenance::Automatic`].
+    commitment_tree_maintenance: CommitmentTreeMaintenance,
+    /// When false, scanned checkpoints are not retained on the ZIP 318 anchor grid.
+    /// Not persisted. Defaults to `true`, which is the spending-wallet behavior.
+    /// A view-only scan does not write checkpoints at all.
+    anchor_retention_enabled: bool,
     #[cfg(feature = "transparent-inputs")]
     gap_limits: GapLimits,
 }
@@ -588,6 +595,8 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
                 rng,
                 anchor_retention_interval: AnchorRetentionInterval::default(),
                 commitment_tree_write_back: true,
+                commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
+                anchor_retention_enabled: true,
                 #[cfg(feature = "transparent-inputs")]
                 gap_limits: GapLimits::default(),
             })
@@ -634,6 +643,65 @@ impl<C, P, CL, R> WalletDb<C, P, CL, R> {
     pub fn set_commitment_tree_write_back(&mut self, enabled: bool) {
         self.commitment_tree_write_back = enabled;
     }
+
+    /// Selects whether this wallet maintains note commitment trees while scanning.
+    ///
+    /// Not persisted. [`CommitmentTreeMaintenance::Automatic`] (the default) maintains trees
+    /// unless every account is [`AccountPurpose::ViewOnly`]. [`CommitmentTreeMaintenance::ViewOnly`]
+    /// skips them even if a spending account is present.
+    ///
+    /// Adding a spending account to a database that has already been scanned without trees does
+    /// not rebuild those trees. Rescan the range that should become spendable after switching
+    /// back to [`CommitmentTreeMaintenance::Automatic`] (or after importing the spending account,
+    /// which itself makes [`Automatic`] maintain trees).
+    ///
+    /// [`Automatic`]: CommitmentTreeMaintenance::Automatic
+    pub fn with_commitment_tree_maintenance(mut self, mode: CommitmentTreeMaintenance) -> Self {
+        self.set_commitment_tree_maintenance(mode);
+        self
+    }
+
+    /// Sets note-commitment-tree maintenance on an existing handle. See
+    /// [`Self::with_commitment_tree_maintenance`].
+    pub fn set_commitment_tree_maintenance(&mut self, mode: CommitmentTreeMaintenance) {
+        self.commitment_tree_maintenance = mode;
+    }
+
+    /// Returns the configured note-commitment-tree maintenance mode.
+    ///
+    /// This is the configured mode, not the effective one. A wallet left on
+    /// [`CommitmentTreeMaintenance::Automatic`] still skips trees when every account is
+    /// view-only; [`WalletRead::maintains_note_commitment_trees`] reports that.
+    pub fn commitment_tree_maintenance(&self) -> CommitmentTreeMaintenance {
+        self.commitment_tree_maintenance
+    }
+
+    /// Enables or disables ZIP 318 anchor-checkpoint retention for this handle.
+    ///
+    /// Retention is enabled by default, on [`AnchorRetentionInterval::ZIP_318`] unless
+    /// [`Self::with_anchor_retention_interval`] selected another grid. Disabling it stores no
+    /// durable anchor checkpoints: ordinary scan checkpoints are still created and pruned for a
+    /// spending wallet, but none are exempted for a later pool-migration proof. A wallet that
+    /// disables retention cannot prove a ZIP 318 migration. The setting is not persisted.
+    ///
+    /// A view-only scan does not write note commitment checkpoints whether or not this is set.
+    ///
+    /// [`AnchorRetentionInterval::ZIP_318`]: AnchorRetentionInterval::ZIP_318
+    pub fn with_anchor_retention_enabled(mut self, enabled: bool) -> Self {
+        self.set_anchor_retention_enabled(enabled);
+        self
+    }
+
+    /// Sets whether this handle retains ZIP 318 anchor checkpoints. See
+    /// [`Self::with_anchor_retention_enabled`].
+    pub fn set_anchor_retention_enabled(&mut self, enabled: bool) {
+        self.anchor_retention_enabled = enabled;
+    }
+
+    /// Returns whether this handle retains ZIP 318 anchor checkpoints.
+    pub fn anchor_retention_enabled(&self) -> bool {
+        self.anchor_retention_enabled
+    }
 }
 
 #[cfg(feature = "transparent-inputs")]
@@ -668,6 +736,8 @@ impl<C: Borrow<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             rng,
             anchor_retention_interval: AnchorRetentionInterval::default(),
             commitment_tree_write_back: true,
+            commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
+            anchor_retention_enabled: true,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: GapLimits::default(),
         }
@@ -690,11 +760,10 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletDb<
         &self,
         confirmations_policy: ConfirmationsPolicy,
     ) -> Result<Option<WalletSnapshot<AccountUuid>>, SqliteClientError> {
-        wallet::get_wallet_snapshot(
-            &self.conn.borrow().unchecked_transaction()?,
-            &self.params,
-            confirmations_policy,
-        )
+        let tx = self.conn.borrow().unchecked_transaction()?;
+        let view_only =
+            !wallet::maintains_note_commitment_trees(&tx, self.commitment_tree_maintenance)?;
+        wallet::get_wallet_snapshot(&tx, &self.params, confirmations_policy, view_only)
     }
 }
 
@@ -721,6 +790,8 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             rng: &mut self.rng,
             anchor_retention_interval: self.anchor_retention_interval,
             commitment_tree_write_back: self.commitment_tree_write_back,
+            commitment_tree_maintenance: self.commitment_tree_maintenance,
+            anchor_retention_enabled: self.anchor_retention_enabled,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
@@ -780,6 +851,8 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             rng: &mut self.rng,
             anchor_retention_interval: self.anchor_retention_interval,
             commitment_tree_write_back: self.commitment_tree_write_back,
+            commitment_tree_maintenance: self.commitment_tree_maintenance,
+            anchor_retention_enabled: self.anchor_retention_enabled,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
@@ -1430,11 +1503,15 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletRea
     ) -> Result<Option<WalletSummary<Self::AccountId>>, Self::Error> {
         // This will return a runtime error if we call `get_wallet_summary` from two
         // threads at the same time, as transactions cannot nest.
+        let tx = self.conn.borrow().unchecked_transaction()?;
+        let view_only =
+            !wallet::maintains_note_commitment_trees(&tx, self.commitment_tree_maintenance)?;
         wallet::get_wallet_summary(
-            &self.conn.borrow().unchecked_transaction()?,
+            &tx,
             &self.params,
             confirmations_policy,
             &SubtreeProgressEstimator,
+            view_only,
         )
     }
 
@@ -1444,6 +1521,13 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletRea
 
     fn anchor_retention_interval(&self) -> AnchorRetentionInterval {
         self.anchor_retention_interval
+    }
+
+    fn maintains_note_commitment_trees(&self) -> Result<bool, Self::Error> {
+        wallet::maintains_note_commitment_trees(
+            self.conn.borrow(),
+            self.commitment_tree_maintenance,
+        )
     }
 
     fn get_block_hash(&self, block_height: BlockHeight) -> Result<Option<BlockHash>, Self::Error> {
@@ -2079,6 +2163,14 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         self.transactionally(|wdb| wdb.put_blocks(from_state, blocks))
     }
 
+    fn put_blocks_without_commitment_trees(
+        &mut self,
+        prior: &CompactChainState,
+        blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        self.transactionally(|wdb| wdb.put_blocks_without_commitment_trees(prior, blocks))
+    }
+
     fn put_received_transparent_utxo(
         &mut self,
         _output: &WalletTransparentOutput<<Self as WalletRead>::AccountId>,
@@ -2152,6 +2244,14 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
                 .map_err(|e| RewindError::DataSource(SqliteClientError::from(e)))?;
         }
         result
+    }
+
+    fn rewind_view_only(
+        &mut self,
+        height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        self.transactionally(|wdb| wdb.rewind_view_only(height, block_hash))
     }
 
     #[cfg(feature = "transparent-inputs")]
@@ -2572,7 +2672,12 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
         &mut self,
         tip_height: BlockHeight,
     ) -> Result<(), <Self as WalletRead>::Error> {
-        wallet::scanning::update_chain_tip(self.conn.0, &self.params, tip_height)?;
+        wallet::scanning::update_chain_tip(
+            self.conn.0,
+            &self.params,
+            tip_height,
+            !self.maintains_note_commitment_trees()?,
+        )?;
         Ok(())
     }
 
@@ -2597,6 +2702,26 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
         from_state: &ChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
+        if !self.maintains_note_commitment_trees()? {
+            let prior = ScanContinuity::to_compact(from_state).map_err(|e| {
+                SqliteClientError::CorruptedData(format!(
+                    "view-only scan prior tree size does not fit in u32: {e}"
+                ))
+            })?;
+            return ll::wallet::put_blocks_without_commitment_trees::<
+                _,
+                SqliteClientError,
+                commitment_tree::Error,
+            >(
+                self,
+                #[cfg(feature = "transparent-inputs")]
+                self.gap_limits,
+                &prior,
+                blocks,
+            )
+            .map_err(SqliteClientError::from);
+        }
+
         // Once the NU6.3 (Ironwood) activation height is reached, checkpoints on the anchor
         // retention grids are retained as durable anchors. The activation height is `None` (and so
         // anchor retention is inactive) on networks that do not yet have an assigned NU6.3
@@ -2609,9 +2734,16 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
         // wallet without reapplying a non-default interval must not thereby cause this scan to pass
         // a boundary that migration still needs. Retaining the union costs at most a few extra
         // checkpoints and makes that failure unreachable.
+        // `None` stores no durable anchor checkpoints. That is the view-only default, and the
+        // choice of a spending wallet that will not prove a ZIP 318 migration. The ZIP 318 grid
+        // remains the default when retention is enabled.
         let anchor_retention = self
-            .params
-            .activation_height(consensus::NetworkUpgrade::Nu6_3)
+            .anchor_retention_enabled
+            .then(|| {
+                self.params
+                    .activation_height(consensus::NetworkUpgrade::Nu6_3)
+            })
+            .flatten()
             .map(|from_height| {
                 let committed = pool_migration::orchard_ironwood::active_anchor_bucket_intervals(
                     self.conn.borrow(),
@@ -2632,6 +2764,25 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             from_state,
             blocks,
             anchor_retention.as_ref(),
+        )
+        .map_err(SqliteClientError::from)
+    }
+
+    fn put_blocks_without_commitment_trees(
+        &mut self,
+        prior: &CompactChainState,
+        blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        ll::wallet::put_blocks_without_commitment_trees::<
+            _,
+            SqliteClientError,
+            commitment_tree::Error,
+        >(
+            self,
+            #[cfg(feature = "transparent-inputs")]
+            self.gap_limits,
+            prior,
+            blocks,
         )
         .map_err(SqliteClientError::from)
     }
@@ -2802,6 +2953,20 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             &chain_state,
             reset_account_birthdays,
             self.commitment_tree_write_back,
+        )
+    }
+
+    fn rewind_view_only(
+        &mut self,
+        height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        wallet::rewind_view_only(
+            self.conn.0,
+            &self.params,
+            height,
+            block_hash,
+            self.commitment_tree_maintenance,
         )
     }
 
@@ -3431,11 +3596,16 @@ impl<'a, C: Borrow<rusqlite::Transaction<'a>>, P: consensus::Parameters, CL: Clo
         range: Range<BlockHeight>,
         wallet_note_positions: &[(ShieldedPool, Position)],
     ) -> Result<(), Self::Error> {
+        let extend_witness_ranges = wallet::maintains_note_commitment_trees(
+            self.conn.borrow(),
+            self.commitment_tree_maintenance,
+        )?;
         wallet::scanning::scan_complete(
             self.conn.borrow(),
             &self.params,
             range,
             wallet_note_positions,
+            extend_witness_ranges,
         )
     }
 

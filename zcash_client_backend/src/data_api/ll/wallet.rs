@@ -26,7 +26,9 @@ use crate::{
     TransferType,
     data_api::{
         DecryptedTransaction, SAPLING_SHARD_HEIGHT, ScannedBlock, TransactionStatus,
-        WalletCommitmentTrees, anchor_retention::AnchorRetention, chain::ChainState,
+        WalletCommitmentTrees,
+        anchor_retention::AnchorRetention,
+        chain::{ChainState, CompactChainState},
         ll::ReceivedShieldedOutput,
     },
     wallet::{Recipient, WalletTransparentOutput},
@@ -311,6 +313,43 @@ pub struct PutBlocksRows {
 ///
 /// This governs the shielded nullifier maps and the transparent spend map alike; the
 /// argument above is indifferent to which kind of output identifier is being tracked.
+/// Height and end-of-block note commitment tree sizes of the block before a `put_blocks` batch.
+///
+/// Spending scans fill this from a [`ChainState`]'s frontiers. View-only scans fill it from the
+/// compact-block sizes, which is the same comparison `put_blocks_rows` has always made.
+struct PriorTreeContinuity {
+    block_height: BlockHeight,
+    sapling_tree_size: u64,
+    #[cfg(feature = "orchard")]
+    orchard_tree_size: u64,
+    #[cfg(feature = "orchard")]
+    ironwood_tree_size: u64,
+}
+
+impl PriorTreeContinuity {
+    fn from_chain_state(state: &ChainState) -> Self {
+        Self {
+            block_height: state.block_height(),
+            sapling_tree_size: state.final_sapling_tree().tree_size(),
+            #[cfg(feature = "orchard")]
+            orchard_tree_size: state.final_orchard_tree().tree_size(),
+            #[cfg(feature = "orchard")]
+            ironwood_tree_size: state.final_ironwood_tree().tree_size(),
+        }
+    }
+
+    fn from_compact(state: &CompactChainState) -> Self {
+        Self {
+            block_height: state.block_height(),
+            sapling_tree_size: u64::from(state.sapling_tree_size()),
+            #[cfg(feature = "orchard")]
+            orchard_tree_size: u64::from(state.orchard_tree_size()),
+            #[cfg(feature = "orchard")]
+            ironwood_tree_size: u64::from(state.ironwood_tree_size()),
+        }
+    }
+}
+
 pub fn put_blocks_rows<DbT, SE, TE>(
     wallet_db: &mut DbT,
     #[cfg(feature = "transparent-inputs")] gap_limits: GapLimits,
@@ -321,29 +360,50 @@ where
     DbT: PutBlocksRowsDbT<SE, <DbT as LowLevelWalletRead>::AccountRef>,
     DbT::TxRef: Eq + Hash,
 {
+    put_blocks_rows_from_sizes(
+        wallet_db,
+        #[cfg(feature = "transparent-inputs")]
+        gap_limits,
+        &PriorTreeContinuity::from_chain_state(from_state),
+        blocks,
+        true,
+    )
+}
+
+fn put_blocks_rows_from_sizes<DbT, SE, TE>(
+    wallet_db: &mut DbT,
+    #[cfg(feature = "transparent-inputs")] gap_limits: GapLimits,
+    prior: &PriorTreeContinuity,
+    blocks: Vec<ScannedBlock<<DbT as LowLevelWalletRead>::AccountId>>,
+    record_commitments: bool,
+) -> Result<PutBlocksRows, PutBlocksError<SE, TE>>
+where
+    DbT: PutBlocksRowsDbT<SE, <DbT as LowLevelWalletRead>::AccountRef>,
+    DbT::TxRef: Eq + Hash,
+{
     if blocks.is_empty() {
         return Ok(PutBlocksRows::default());
     }
 
     let initial_block = blocks.first().expect("blocks is known to be nonempty");
-    let mut initial_block_sequential = from_state.block_height() + 1 == initial_block.height();
+    let mut initial_block_sequential = prior.block_height + 1 == initial_block.height();
     {
-        initial_block_sequential &= from_state.final_sapling_tree().tree_size()
+        initial_block_sequential &= prior.sapling_tree_size
             + u64::try_from(initial_block.sapling().commitments().len()).unwrap()
             == u64::from(initial_block.sapling().final_tree_size());
     }
     #[cfg(feature = "orchard")]
     {
-        initial_block_sequential &= from_state.final_orchard_tree().tree_size()
+        initial_block_sequential &= prior.orchard_tree_size
             + u64::try_from(initial_block.orchard().commitments().len()).unwrap()
             == u64::from(initial_block.orchard().final_tree_size());
-        initial_block_sequential &= from_state.final_ironwood_tree().tree_size()
+        initial_block_sequential &= prior.ironwood_tree_size
             + u64::try_from(initial_block.ironwood().commitments().len()).unwrap()
             == u64::from(initial_block.ironwood().final_tree_size());
     }
     if !initial_block_sequential {
         return Err(PutBlocksError::NonSequentialBlocks {
-            prev_height: from_state.block_height(),
+            prev_height: prior.block_height,
             block_height: initial_block.height(),
         });
     }
@@ -352,7 +412,7 @@ where
         wallet_db
             .block_fully_scanned_height()
             .map_err(PutBlocksError::Storage)?,
-        from_state.block_height(),
+        prior.block_height,
         blocks.last().map(|block| block.height()),
     );
 
@@ -596,11 +656,13 @@ where
                 .collect::<Vec<_>>()
         );
 
-        sapling_commitments.extend(block_commitments.sapling.into_iter().map(Some));
-        #[cfg(feature = "orchard")]
-        orchard_commitments.extend(block_commitments.orchard.into_iter().map(Some));
-        #[cfg(feature = "orchard")]
-        ironwood_commitments.extend(block_commitments.ironwood.into_iter().map(Some));
+        if record_commitments {
+            sapling_commitments.extend(block_commitments.sapling.into_iter().map(Some));
+            #[cfg(feature = "orchard")]
+            orchard_commitments.extend(block_commitments.orchard.into_iter().map(Some));
+            #[cfg(feature = "orchard")]
+            ironwood_commitments.extend(block_commitments.ironwood.into_iter().map(Some));
+        }
     }
 
     #[cfg(feature = "transparent-inputs")]
@@ -884,6 +946,47 @@ where
             )
             .map_err(PutBlocksError::Storage)?;
         drop(_notify);
+    }
+
+    Ok(())
+}
+
+/// Persists scanned blocks without updating note commitment trees.
+///
+/// This is the row stage of [`put_blocks`] plus [`LowLevelWalletWrite::notify_scan_complete`].
+/// It does not call `with_*_tree_mut` and does not require [`WalletCommitmentTrees`]. Continuity
+/// is the prior block's height and end-of-block tree sizes: each pool's size must advance by
+/// the first block's commitment count, and the blocks must be sequential.
+pub fn put_blocks_without_commitment_trees<DbT, SE, TE>(
+    wallet_db: &mut DbT,
+    #[cfg(feature = "transparent-inputs")] gap_limits: GapLimits,
+    prior: &CompactChainState,
+    blocks: Vec<ScannedBlock<<DbT as LowLevelWalletRead>::AccountId>>,
+) -> Result<(), PutBlocksError<SE, TE>>
+where
+    DbT: PutBlocksRowsDbT<SE, <DbT as LowLevelWalletRead>::AccountRef>,
+    DbT::TxRef: Eq + Hash,
+{
+    let prior_sizes = PriorTreeContinuity::from_compact(prior);
+    let rows = put_blocks_rows_from_sizes(
+        wallet_db,
+        #[cfg(feature = "transparent-inputs")]
+        gap_limits,
+        &prior_sizes,
+        blocks,
+        false,
+    )?;
+
+    if let Some(last_scanned_height) = rows.last_scanned_height {
+        wallet_db
+            .notify_scan_complete(
+                Range {
+                    start: prior_sizes.block_height + 1,
+                    end: last_scanned_height + 1,
+                },
+                &rows.note_positions,
+            )
+            .map_err(PutBlocksError::Storage)?;
     }
 
     Ok(())
