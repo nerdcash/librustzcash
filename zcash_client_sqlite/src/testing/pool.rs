@@ -12,7 +12,7 @@ use crate::{
 use zcash_client_backend::data_api::{
     WalletWrite,
     anchor_retention::AnchorRetentionInterval,
-    chain::{ChainState, error::Error},
+    chain::{self, ChainState, error::Error},
     testing::{
         AddressType,
         pool::{InputTrust, ShieldedPoolTester, dsl::TestDsl},
@@ -1056,6 +1056,298 @@ pub(crate) fn orchard_to_ironwood_self_migration_reports_fee_only_delta() {
         TestDbFactory::default(),
         BlockCache::new(),
     );
+}
+
+/// Tip-first sync: scan a chain-tip range, then backfill history from the tip downward.
+///
+/// Each block carries unrelated Sapling spends. The nullifier map has to remember
+/// those spends until the birthday gap closes, and must then drop back to the
+/// retention window with the freed pages returned to the file.
+/// A spend scanned before its note is committed to the database, not held only
+/// in the scan's memory. Reopening the file is a restart: the note scan that
+/// follows must still observe the spend.
+pub(crate) fn out_of_order_spend_survives_reopen() {
+    use zcash_client_backend::data_api::testing::pool::ShieldedPoolTester;
+    use zcash_client_backend::data_api::{Account as _, testing::AddressType};
+
+    let mut st =
+        TestDsl::with_sapling_birthday_account(TestDbFactory::file_backed(), BlockCache::new())
+            .build::<SaplingPoolTester>();
+    let account = st.test_account().cloned().unwrap();
+    let dfvk = SaplingPoolTester::test_account_fvk(&st);
+    let value = Zatoshis::const_from_u64(50_000);
+    let (received_height, _, nf) =
+        st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
+    let not_our_key = SaplingPoolTester::sk_to_fvk(&SaplingPoolTester::sk(&[0xf5; 32]));
+    let to2 = SaplingPoolTester::fvk_default_address(&not_our_key);
+    let value2 = Zatoshis::const_from_u64(20_000);
+    let (spent_height, _) = st.generate_next_block_spending(&dfvk, (nf, value), to2, value2);
+
+    st.scan_cached_blocks(spent_height, 1);
+
+    let reopened = rusqlite::Connection::open(st.wallet().data_file_path()).unwrap();
+    let persisted: i64 = reopened
+        .query_row("SELECT COUNT(*) FROM nullifier_map", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        persisted > 0,
+        "spend nullifier was not committed; a restart would miss it"
+    );
+    drop(reopened);
+
+    st.scan_cached_blocks(received_height, 1);
+    assert_eq!(
+        st.get_total_balance(account.id()),
+        (value - value2).unwrap()
+    );
+}
+
+/// A batch that fails after the staged nullifier write rolls the blocks,
+/// locators, nullifiers, and scan queue back together. The same batch then
+/// commits cleanly, so leftover temporary staging rows do not get in the way.
+pub(crate) fn staged_nullifier_write_rolls_back_and_retries() {
+    let mut st =
+        TestDsl::with_sapling_birthday_account(TestDbFactory::default(), BlockCache::new())
+            .build::<SaplingPoolTester>();
+    let birthday = st
+        .network()
+        .activation_height(NetworkUpgrade::Sapling)
+        .unwrap();
+
+    const BLOCKS: usize = 4;
+    const SPENDS: usize = 3;
+    for _ in 0..BLOCKS {
+        st.generate_next_block_with_unrelated_spends(SPENDS);
+    }
+    let queue_before = scan_queue_rows(st.wallet().conn());
+    assert_eq!(table_count(st.wallet().conn(), "blocks"), 0);
+
+    crate::FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.with(|flag| flag.set(true));
+    let failed = st.try_scan_cached_blocks(birthday, BLOCKS);
+    assert!(failed.is_err(), "the injected rollback must fail the scan");
+    assert!(
+        !crate::FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.with(|flag| flag.get()),
+        "the rollback hook must run once"
+    );
+    assert_eq!(table_count(st.wallet().conn(), "blocks"), 0);
+    assert_eq!(table_count(st.wallet().conn(), "nullifier_map"), 0);
+    assert_eq!(table_count(st.wallet().conn(), "tx_locator_map"), 0);
+    assert_eq!(scan_queue_rows(st.wallet().conn()), queue_before);
+
+    st.scan_cached_blocks(birthday, BLOCKS);
+    assert_eq!(
+        table_count(st.wallet().conn(), "blocks"),
+        i64::try_from(BLOCKS).unwrap()
+    );
+    assert_eq!(
+        table_count(st.wallet().conn(), "nullifier_map"),
+        i64::try_from(BLOCKS * SPENDS).unwrap()
+    );
+    assert_eq!(
+        table_count(st.wallet().conn(), "tx_locator_map"),
+        i64::try_from(BLOCKS).unwrap()
+    );
+}
+
+fn table_count(conn: &rusqlite::Connection, table: &str) -> i64 {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+fn scan_queue_rows(conn: &rusqlite::Connection) -> Vec<(i64, i64, i64)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT block_range_start, block_range_end, priority
+             FROM scan_queue
+             ORDER BY block_range_start",
+        )
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+}
+
+pub(crate) fn tip_first_historic_nullifier_map_stays_bounded() {
+    use zcash_client_backend::data_api::ll::wallet::SPEND_MAP_RETENTION_BLOCKS;
+
+    let mut st =
+        TestDsl::with_sapling_birthday_account(TestDbFactory::default(), BlockCache::new())
+            .build::<SaplingPoolTester>();
+    let birthday = st
+        .network()
+        .activation_height(NetworkUpgrade::Sapling)
+        .unwrap();
+
+    const TOTAL: u32 = 1600;
+    const TIP: u32 = 30;
+    const CHUNK: u32 = 100;
+    const SPENDS: usize = 12;
+    for _ in 0..TOTAL {
+        st.generate_next_block_with_unrelated_spends(SPENDS);
+    }
+    let tip = birthday + TOTAL - 1;
+    crate::NULLIFIER_MAP_WRITE_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let wall_started = std::time::Instant::now();
+    st.scan_cached_blocks(tip - TIP + 1, TIP as usize);
+
+    let mut end = tip - TIP + 1;
+    let mut max_rows = 0i64;
+    let mut max_pages = 0i64;
+    while end > birthday {
+        let start = if end - birthday > CHUNK {
+            end - CHUNK
+        } else {
+            birthday
+        };
+        st.scan_cached_blocks(start, usize::try_from(end - start).unwrap());
+        let (rows, pages, _, _) = nullifier_map_stats(st.wallet().conn());
+        max_rows = max_rows.max(rows);
+        max_pages = max_pages.max(pages);
+        end = start;
+    }
+
+    // One more frontier-extending block, matching a sync that keeps following the tip
+    // after history connects.
+    st.generate_next_block_with_unrelated_spends(SPENDS);
+    st.scan_cached_blocks(tip + 1, 1);
+    let (final_rows, final_pages, freelist, page_size) = nullifier_map_stats(st.wallet().conn());
+    max_pages = max_pages.max(final_pages);
+
+    let row_bound = i64::from(SPEND_MAP_RETENTION_BLOCKS + 3) * SPENDS as i64;
+    assert!(
+        final_rows <= row_bound,
+        "nullifier_map rows {final_rows} exceeded the retention bound {row_bound}"
+    );
+    assert_eq!(
+        freelist, 0,
+        "freed nullifier-map pages were not reclaimed (pages={final_pages}, rows={final_rows})"
+    );
+    assert!(
+        final_pages * 2 < max_pages,
+        "high-water did not shrink: max_pages={max_pages} final_pages={final_pages} page_size={page_size} max_rows={max_rows} final_rows={final_rows}"
+    );
+    let wall_ns = wall_started.elapsed().as_nanos();
+    let write_ns = crate::NULLIFIER_MAP_WRITE_NS.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "tip-first high-water max_pages={max_pages} ({:.2} MiB) final_pages={final_pages} ({:.2} MiB) max_rows={max_rows} final_rows={final_rows} page_size={page_size} nullifier_write_ms={:.1} wall_ms={:.1}",
+        (max_pages * page_size) as f64 / (1024.0 * 1024.0),
+        (final_pages * page_size) as f64 / (1024.0 * 1024.0),
+        write_ns as f64 / 1_000_000.0,
+        wall_ns as f64 / 1_000_000.0,
+    );
+}
+
+/// One historic batch that starts at the birthday and runs up to an already-scanned
+/// tip must not insert nullifiers the retention window will drop.
+pub(crate) fn bridging_historic_batch_skips_nullifiers_below_the_floor() {
+    use zcash_client_backend::data_api::ll::wallet::SPEND_MAP_RETENTION_BLOCKS;
+
+    let mut st =
+        TestDsl::with_sapling_birthday_account(TestDbFactory::default(), BlockCache::new())
+            .build::<SaplingPoolTester>();
+    let birthday = st
+        .network()
+        .activation_height(NetworkUpgrade::Sapling)
+        .unwrap();
+
+    const TOTAL: u32 = 400;
+    const TIP: u32 = 20;
+    const SPENDS: usize = 10;
+    for _ in 0..TOTAL {
+        st.generate_next_block_with_unrelated_spends(SPENDS);
+    }
+    let tip = birthday + TOTAL - 1;
+    let historic_end = tip - TIP + 1;
+    st.scan_cached_blocks(historic_end, TIP as usize);
+    let (after_tip, _, _, _) = nullifier_map_stats(st.wallet().conn());
+    st.scan_cached_blocks(birthday, usize::try_from(historic_end - birthday).unwrap());
+    let (rows, _, freelist, _) = nullifier_map_stats(st.wallet().conn());
+    let row_bound = i64::from(SPEND_MAP_RETENTION_BLOCKS + 3) * SPENDS as i64;
+    assert!(
+        rows <= row_bound,
+        "bridging batch left {rows} nullifiers (bound {row_bound}, tip had {after_tip})"
+    );
+    assert_eq!(freelist, 0, "bridging batch left {freelist} freelist pages");
+}
+
+/// Gap chunks commit every nullifier. The batch that closes the gap is composed
+/// inside `transactionally`, so it does not use the connection-level `put_blocks`
+/// wrapper. Pruned pages still have to be reclaimed after that outer commit.
+pub(crate) fn transactionally_scoped_scan_reclaims_nullifier_pages() {
+    use zcash_client_backend::data_api::ll::wallet::SPEND_MAP_RETENTION_BLOCKS;
+
+    let mut st =
+        TestDsl::with_sapling_birthday_account(TestDbFactory::default(), BlockCache::new())
+            .build::<SaplingPoolTester>();
+    let birthday = st
+        .network()
+        .activation_height(NetworkUpgrade::Sapling)
+        .unwrap();
+
+    const TOTAL: u32 = 400;
+    const TIP: u32 = 20;
+    const CHUNK: u32 = 100;
+    const SPENDS: usize = 20;
+    for _ in 0..TOTAL {
+        st.generate_next_block_with_unrelated_spends(SPENDS);
+    }
+    let tip = birthday + TOTAL - 1;
+    st.scan_cached_blocks(tip - TIP + 1, TIP as usize);
+
+    let mut end = tip - TIP + 1;
+    let mut max_pages = 0i64;
+    while end - birthday > CHUNK {
+        let start = end - CHUNK;
+        st.scan_cached_blocks(start, usize::try_from(end - start).unwrap());
+        let (_, pages, _, _) = nullifier_map_stats(st.wallet().conn());
+        max_pages = max_pages.max(pages);
+        end = start;
+    }
+
+    let from_state = st.prior_chain_state(birthday);
+    let limit = usize::try_from(end - birthday).unwrap();
+    st.with_block_source_and_wallet(|blocks, network, wallet| {
+        wallet.db_mut().transactionally(|wdb| {
+            chain::scan_cached_blocks(network, blocks, wdb, birthday, &from_state, limit).map_err(
+                |err| SqliteClientError::CorruptedData(format!("transaction-scoped scan: {err}")),
+            )
+        })
+    })
+    .unwrap();
+
+    let (rows, final_pages, freelist, _) = nullifier_map_stats(st.wallet().conn());
+    let row_bound = i64::from(SPEND_MAP_RETENTION_BLOCKS + 3) * SPENDS as i64;
+    assert!(
+        rows <= row_bound,
+        "transaction-scoped bridging scan left {rows} nullifiers (bound {row_bound})"
+    );
+    assert!(
+        final_pages < max_pages,
+        "bridging batch did not shrink the file: max_pages={max_pages} final_pages={final_pages} freelist={freelist}"
+    );
+    assert_eq!(
+        freelist, 0,
+        "transaction-scoped scan left {freelist} freelist pages (max_pages={max_pages} final_pages={final_pages} rows={rows})"
+    );
+}
+
+fn nullifier_map_stats(conn: &rusqlite::Connection) -> (i64, i64, i64, i64) {
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM nullifier_map", [], |row| row.get(0))
+        .unwrap();
+    let pages: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .unwrap();
+    let freelist: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .unwrap();
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap();
+    (rows, pages, freelist, page_size)
 }
 
 #[cfg(feature = "orchard")]

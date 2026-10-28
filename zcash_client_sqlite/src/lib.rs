@@ -68,7 +68,7 @@ use zcash_client_backend::{
         chain::{BlockSource, ChainState, CommitmentTreeRoot, CompactChainState, ScanContinuity},
         error::{FindAccountForAddressError, LockError, RewindError},
         ll::{
-            self, LowLevelWalletRead, LowLevelWalletWrite, ReceivedSaplingOutput,
+            self, LowLevelWalletRead, LowLevelWalletWrite, ReceivedSaplingOutput, StagedSpend,
             wallet::store_decrypted_tx,
         },
         scanning::{ScanPriority, ScanRange},
@@ -181,6 +181,21 @@ pub mod testing;
 /// consistent with the bound in zcashd, and allows block data deeper than
 /// this delta from the chain tip to be pruned.
 pub(crate) const PRUNING_DEPTH: u32 = 100;
+
+/// Nanoseconds spent writing the nullifier map since the last reset.
+///
+/// The tip-first scan test reads this. It is process-wide.
+pub(crate) static NULLIFIER_MAP_WRITE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(test, feature = "test-dependencies"))]
+thread_local! {
+    /// When set on this thread, the next `put_blocks` on this thread finishes
+    /// its database work and then returns an error so the transaction rolls
+    /// back. Other threads do not see it.
+    pub(crate) static FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 /// The number of blocks to verify ahead when the chain tip is updated.
 pub(crate) const VERIFY_LOOKAHEAD: u32 = 10;
@@ -306,6 +321,13 @@ pub struct WalletDb<C, P, CL, R> {
     /// Not persisted. Defaults to `true`, which is the spending-wallet behavior.
     /// A view-only scan does not write checkpoints at all.
     anchor_retention_enabled: bool,
+    /// This wallet still needs a WAL truncation after a reader blocked it.
+    /// Kept on the handle so a scan of a different database cannot clear it.
+    wal_checkpoint_pending: std::sync::atomic::AtomicBool,
+    /// A scan on this handle freed spend-map pages. Set on a transaction-scoped
+    /// handle; the outer `transactionally` helpers read it after commit and
+    /// reclaim. Connection-level scans reclaim themselves.
+    spend_map_reclaim_requested: std::sync::atomic::AtomicBool,
     #[cfg(feature = "transparent-inputs")]
     gap_limits: GapLimits,
 }
@@ -617,6 +639,8 @@ impl<P, CL, R> WalletDb<rusqlite::Connection, P, CL, R> {
                 commitment_tree_write_back: true,
                 commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
                 anchor_retention_enabled: true,
+                wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
+                spend_map_reclaim_requested: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "transparent-inputs")]
                 gap_limits: GapLimits::default(),
             })
@@ -758,9 +782,105 @@ impl<C: Borrow<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             commitment_tree_write_back: true,
             commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
             anchor_retention_enabled: true,
+            wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
+            spend_map_reclaim_requested: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: GapLimits::default(),
         }
+    }
+
+    /// Returns spend-map freelist pages to the file so a prune does not leave the
+    /// database at its high-water mark.
+    ///
+    /// No-op unless the database is in `auto_vacuum=INCREMENTAL` mode. Pages that
+    /// still hold a retained nullifier stay allocated; this only truncates pages
+    /// SQLite has already freed.
+    fn reclaim_freed_pages(&self) -> Result<(), SqliteClientError> {
+        let conn = self.conn.borrow();
+        let freelist: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+        // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. Incremental vacuum is a no-op in
+        // the other modes, and a FULL vacuum here would rewrite the whole file.
+        if mode == 2 && freelist > 0 {
+            // Drain the pragma's result rows without assuming a column layout.
+            // `incremental_vacuum` reports leftover freelist pages on some SQLite
+            // builds and an empty row on others.
+            let mut stmt = conn.prepare("PRAGMA incremental_vacuum")?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+            drop(rows);
+            drop(stmt);
+            // Truncating a WAL database waits on the checkpoint. Remember to
+            // retry it even after the freelist is already empty.
+            self.wal_checkpoint_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self
+            .wal_checkpoint_pending
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let journal: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+            if !journal.eq_ignore_ascii_case("wal") {
+                self.wal_checkpoint_pending
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+            // `wal_checkpoint` returns (busy, log frames, checkpointed frames).
+            // busy != 0 means a reader blocked the truncation. The attempt runs
+            // on a separate connection so a caller-installed busy handler on
+            // this one is left alone. The flag stays set and a later scan retries.
+            // A busy result does not fail the scan that already committed.
+            let busy = wal_checkpoint_truncate_nowait(conn)?;
+            self.wal_checkpoint_pending
+                .store(busy != 0, std::sync::atomic::Ordering::Relaxed);
+            if busy != 0 {
+                warn!("wal checkpoint remained busy after spend-map reclamation");
+            }
+        }
+        Ok(())
+    }
+
+    /// Services a reclamation request from a scan that ran inside the transaction
+    /// that just committed. Errors are logged: the scan data is already durable.
+    fn reclaim_freed_pages_if_requested(&self, requested: bool) {
+        if !requested {
+            return;
+        }
+        if let Err(err) = self.reclaim_freed_pages() {
+            warn!("failed to reclaim freed spend-map pages: {err}");
+        }
+    }
+}
+
+/// One `wal_checkpoint(TRUNCATE)` that does not wait on, or replace, the busy
+/// handler of `conn`.
+///
+/// A new rusqlite connection waits 5 seconds inside that handler. Changing
+/// `PRAGMA busy_timeout` on `conn` would also discard a callback installed with
+/// [`rusqlite::Connection::busy_handler`]. The checkpoint therefore uses another
+/// connection to the same file, with the handler turned off. An in-memory
+/// database has no separate file; the attempt then runs on `conn` and keeps
+/// whatever handler the caller installed.
+fn wal_checkpoint_truncate_nowait(conn: &rusqlite::Connection) -> Result<i64, rusqlite::Error> {
+    if let Some(path) = conn.path().filter(|path| !path.is_empty()) {
+        let maintenance = rusqlite::Connection::open(path)?;
+        maintenance.busy_timeout(std::time::Duration::ZERO)?;
+        return maintenance.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0));
+    }
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+}
+
+impl<C, P, CL, R> WalletDb<C, P, CL, R> {
+    /// Asks the handle that owns the connection to return freed spend-map pages
+    /// after the surrounding transaction commits.
+    fn request_spend_map_reclaim(&self) {
+        self.spend_map_reclaim_requested
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn take_spend_map_reclaim_request(&self) -> bool {
+        self.spend_map_reclaim_requested
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -812,11 +932,19 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             commitment_tree_write_back: self.commitment_tree_write_back,
             commitment_tree_maintenance: self.commitment_tree_maintenance,
             anchor_retention_enabled: self.anchor_retention_enabled,
+            // The checkpoint retry stays on the outer handle. This temporary
+            // handle only records that a scan freed pages.
+            wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
+            spend_map_reclaim_requested: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
         let result = f(&mut wdb)?;
+        let reclaim = wdb.take_spend_map_reclaim_request();
         tx.commit()?;
+        // The batch is already committed. Reclamation only returns freed pages;
+        // a lock or I/O error here must not turn a successful scan into a failure.
+        self.reclaim_freed_pages_if_requested(reclaim);
         Ok(result)
     }
 
@@ -873,13 +1001,17 @@ impl<C: BorrowMut<rusqlite::Connection>, P, CL, R> WalletDb<C, P, CL, R> {
             commitment_tree_write_back: self.commitment_tree_write_back,
             commitment_tree_maintenance: self.commitment_tree_maintenance,
             anchor_retention_enabled: self.anchor_retention_enabled,
+            wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
+            spend_map_reclaim_requested: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         };
         // Both handles hold shared references to the same transaction, so aliasing is fine.
         let ext = ExtensionTransaction { conn: &tx };
         let result = f(&mut wdb, &ext)?;
+        let reclaim = wdb.take_spend_map_reclaim_request();
         tx.commit()?;
+        self.reclaim_freed_pages_if_requested(reclaim);
         Ok(result)
     }
 
@@ -2180,7 +2312,22 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         from_state: &ChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
-        self.transactionally(|wdb| wdb.put_blocks(from_state, blocks))
+        self.transactionally(|wdb| -> Result<(), SqliteClientError> {
+            wdb.put_blocks(from_state, blocks)?;
+            #[cfg(any(test, feature = "test-dependencies"))]
+            if FAIL_NEXT_PUT_BLOCKS_BEFORE_COMMIT.with(|flag| flag.replace(false)) {
+                return Err(SqliteClientError::CorruptedData(
+                    "test rollback after staged spend write".into(),
+                ));
+            }
+            Ok(())
+        })?;
+        // The batch is already committed. Reclamation only returns freed pages;
+        // a lock or I/O error here must not turn a successful scan into a failure.
+        if let Err(err) = self.reclaim_freed_pages() {
+            warn!("failed to reclaim freed spend-map pages: {err}");
+        }
+        Ok(())
     }
 
     fn put_blocks_without_commitment_trees(
@@ -2188,7 +2335,11 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         prior: &CompactChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
-        self.transactionally(|wdb| wdb.put_blocks_without_commitment_trees(prior, blocks))
+        self.transactionally(|wdb| wdb.put_blocks_without_commitment_trees(prior, blocks))?;
+        if let Err(err) = self.reclaim_freed_pages() {
+            warn!("failed to reclaim freed spend-map pages: {err}");
+        }
+        Ok(())
     }
 
     fn put_received_transparent_utxo(
@@ -2728,7 +2879,7 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
                     "view-only scan prior tree size does not fit in u32: {e}"
                 ))
             })?;
-            return ll::wallet::put_blocks_without_commitment_trees::<
+            ll::wallet::put_blocks_without_commitment_trees::<
                 _,
                 SqliteClientError,
                 commitment_tree::Error,
@@ -2739,7 +2890,9 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
                 &prior,
                 blocks,
             )
-            .map_err(SqliteClientError::from);
+            .map_err(SqliteClientError::from)?;
+            self.request_spend_map_reclaim();
+            return Ok(());
         }
 
         // Once the NU6.3 (Ironwood) activation height is reached, checkpoints on the anchor
@@ -2795,6 +2948,7 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
         if let Some((start, end)) = mined_link {
             wallet::link_mined_transactions(self.conn.0, start, end)?;
         }
+        self.request_spend_map_reclaim();
         Ok(())
     }
 
@@ -2823,6 +2977,7 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
         if let Some((start, end)) = mined_link {
             wallet::link_mined_transactions(self.conn.0, start, end)?;
         }
+        self.request_spend_map_reclaim();
         Ok(())
     }
 
@@ -3148,6 +3303,14 @@ impl<'a, C: Borrow<rusqlite::Transaction<'a>>, P: consensus::Parameters, CL: Clo
         )
     }
 
+    fn prospective_block_fully_scanned_height(
+        &self,
+        batch: Range<BlockHeight>,
+    ) -> Result<Option<BlockHeight>, Self::Error> {
+        wallet::prospective_fully_scanned_height(self.conn.borrow(), batch)
+            .map_err(SqliteClientError::from)
+    }
+
     fn select_receiving_address(
         &self,
         account: Self::AccountId,
@@ -3407,6 +3570,10 @@ impl<'a, C: Borrow<rusqlite::Transaction<'a>>, P: consensus::Parameters, CL: Clo
         nfs: &[(TxIndex, TxId, Vec<::sapling::Nullifier>)],
     ) -> Result<(), Self::Error> {
         wallet::insert_nullifier_map(self.conn.borrow(), block_height, ShieldedPool::Sapling, nfs)
+    }
+
+    fn persist_staged_spends(&mut self, spends: &[StagedSpend]) -> Result<(), Self::Error> {
+        wallet::insert_staged_nullifiers(self.conn.borrow(), spends)
     }
 
     #[cfg(feature = "orchard")]
@@ -4593,7 +4760,7 @@ extern crate assert_matches;
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     use secrecy::{ExposeSecret, Secret, SecretVec};
     use uuid::Uuid;
@@ -4644,6 +4811,102 @@ mod tests {
         std::collections::BTreeSet,
         zcash_client_backend::data_api::TransactionDataRequest,
     };
+
+    thread_local! {
+        static RECLAIM_BUSY_HANDLER_CALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn reclaim_probe_busy_handler(_: i32) -> bool {
+        RECLAIM_BUSY_HANDLER_CALLED.with(|called| called.set(true));
+        false
+    }
+
+    #[test]
+    fn wal_checkpoint_reclaim_does_not_block_on_a_reader() {
+        use std::sync::atomic::Ordering;
+
+        use zcash_protocol::consensus::BlockHeight;
+
+        use crate::{
+            WalletDb,
+            testing::db::{test_clock, test_rng},
+        };
+
+        let network = LocalNetwork {
+            overwinter: Some(BlockHeight::from_u32(1)),
+            sapling: Some(BlockHeight::from_u32(2)),
+            blossom: Some(BlockHeight::from_u32(3)),
+            heartwood: Some(BlockHeight::from_u32(4)),
+            canopy: Some(BlockHeight::from_u32(5)),
+            nu5: Some(BlockHeight::from_u32(6)),
+            nu6: Some(BlockHeight::from_u32(7)),
+            nu6_1: Some(BlockHeight::from_u32(8)),
+            nu6_2: Some(BlockHeight::from_u32(9)),
+            nu6_3: Some(BlockHeight::from_u32(10)),
+            nu7: None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
+        };
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = WalletDb::for_path(file.path(), network, test_clock(), test_rng()).unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TABLE reclaim_probe (x INTEGER);
+                 INSERT INTO reclaim_probe VALUES (1);",
+            )
+            .unwrap();
+        let before: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            before > 0,
+            "the connection should start with a busy handler"
+        );
+
+        let reader = rusqlite::Connection::open(file.path()).unwrap();
+        reader.busy_timeout(Duration::ZERO).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT x FROM reclaim_probe;")
+            .unwrap();
+
+        db.conn
+            .busy_handler(Some(reclaim_probe_busy_handler))
+            .unwrap();
+        RECLAIM_BUSY_HANDLER_CALLED.with(|called| called.set(false));
+
+        db.wal_checkpoint_pending.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        db.reclaim_freed_pages().unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a blocked checkpoint waited {elapsed:?}"
+        );
+        assert!(
+            db.wal_checkpoint_pending.load(Ordering::Relaxed),
+            "a blocked checkpoint must stay pending for a later scan"
+        );
+
+        drop(reader);
+        db.reclaim_freed_pages().unwrap();
+        assert!(
+            !db.wal_checkpoint_pending.load(Ordering::Relaxed),
+            "the checkpoint should finish once the reader is gone"
+        );
+
+        // The checkpoint must not have replaced the handler with a bare timeout.
+        let blocker = rusqlite::Connection::open(file.path()).unwrap();
+        blocker.busy_timeout(Duration::ZERO).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let write = db.conn.execute("INSERT INTO reclaim_probe VALUES (2)", []);
+        assert!(write.is_err(), "the exclusive lock should block the insert");
+        assert!(
+            RECLAIM_BUSY_HANDLER_CALLED.with(|called| called.get()),
+            "reclamation replaced the caller-installed busy handler"
+        );
+        drop(blocker);
+    }
 
     #[test]
     fn get_wallet_recover_until_is_max_across_accounts() {

@@ -356,21 +356,22 @@ pub struct BatchResult<IvkTag> {
 }
 
 fn shielded_outputs_of_transaction(tx: &Transaction) -> usize {
+    // `Transaction` exposes Orchard and Ironwood bundles whether or not this
+    // crate was built with the `orchard` feature. The sandblast threshold counts
+    // outputs, not notes this wallet can decrypt, so it has to see every bundle.
     let sapling = tx
         .sapling_bundle()
         .map(|bundle| bundle.shielded_outputs().len())
         .unwrap_or(0);
-    #[cfg(feature = "orchard")]
     let orchard = tx
         .orchard_bundle()
         .map(|bundle| bundle.actions().len())
-        .unwrap_or(0)
-        + tx.ironwood_bundle()
-            .map(|bundle| bundle.actions().len())
-            .unwrap_or(0);
-    #[cfg(not(feature = "orchard"))]
-    let orchard = 0;
-    sapling + orchard
+        .unwrap_or(0);
+    let ironwood = tx
+        .ironwood_bundle()
+        .map(|bundle| bundle.actions().len())
+        .unwrap_or(0);
+    sapling + orchard + ironwood
 }
 
 /// Decrypts a block with a set of [`ScanningKeys`].

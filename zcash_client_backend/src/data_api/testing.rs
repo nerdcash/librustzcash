@@ -763,6 +763,48 @@ where
         (height, res, nfs)
     }
 
+    /// Creates a fake block at the next height containing only Sapling spends of unrelated
+    /// nullifiers, and inserts it into the cache.
+    ///
+    /// The block adds no note commitments, so the shielded trees do not advance. The spends are
+    /// not wallet notes: scanning records every one of them in the nullifier map when spend
+    /// tracking is enabled for the block.
+    pub fn generate_next_block_with_unrelated_spends(&mut self, spend_count: usize) -> BlockHeight {
+        let pre_activation_block = CachedBlock::none(self.sapling_activation_height() - 1);
+        let (height, prev_hash, sapling_size, orchard_size, ironwood_size, prior) = {
+            let prior_cached_block = self.latest_cached_block().unwrap_or(&pre_activation_block);
+            (
+                prior_cached_block.height() + 1,
+                prior_cached_block.chain_state.block_hash(),
+                prior_cached_block.sapling_end_size,
+                prior_cached_block.orchard_end_size,
+                prior_cached_block.ironwood_end_size,
+                prior_cached_block.clone(),
+            )
+        };
+
+        let mut ctx = fake_compact_tx(&mut self.rng);
+        ctx.index = 0;
+        for _ in 0..spend_count {
+            let mut nf = [0u8; 32];
+            self.rng.fill_bytes(&mut nf);
+            ctx.spends.push(CompactSaplingSpend { nf: nf.to_vec() });
+        }
+
+        let cb = fake_compact_block_from_compact_tx(
+            ctx,
+            height,
+            prev_hash,
+            sapling_size,
+            orchard_size,
+            ironwood_size,
+            &mut self.rng,
+        );
+        self.cache_block(&prior, cb);
+        self.latest_block_height = Some(height);
+        height
+    }
+
     /// Adds a block at the next height containing a single transparent-only transaction that
     /// spends `vin` and creates an output of each `(address, value)` in `vout`, and inserts it
     /// into the cache.
@@ -1085,6 +1127,32 @@ where
     <DbT as WalletRead>::AccountId:
         std::fmt::Debug + ConditionallySelectable + Default + Send + Sync + 'static,
 {
+    /// Chain state of the cached block immediately below `from_height`.
+    ///
+    /// This is the prior block [`scan_cached_blocks`] expects. When the cache has
+    /// nothing below `from_height`, the result is the empty pre-shielded state.
+    pub fn prior_chain_state(&self, from_height: BlockHeight) -> ChainState {
+        self.latest_cached_block_below_height(from_height)
+            .map(|block| block.chain_state().clone())
+            .unwrap_or_else(|| CachedBlock::none(from_height - 1).chain_state().clone())
+    }
+
+    /// Calls `body` with this state's block source, network, and wallet.
+    ///
+    /// The references are disjoint, so `body` can open a transaction on the wallet
+    /// and still read the block source. A scan that goes through that
+    /// transaction-scoped handle does not use the connection-level `put_blocks`.
+    pub fn with_block_source_and_wallet<R>(
+        &mut self,
+        body: impl FnOnce(&Cache::BlockSource, &ParamsT, &mut DbT) -> R,
+    ) -> R {
+        body(
+            self.cache.block_source(),
+            &self.network,
+            &mut self.wallet_data,
+        )
+    }
+
     /// Invokes [`scan_cached_blocks`] with the given arguments, expecting success.
     pub fn scan_cached_blocks(&mut self, from_height: BlockHeight, limit: usize) -> ScanSummary {
         let result = self.try_scan_cached_blocks(from_height, limit);

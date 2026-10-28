@@ -163,6 +163,21 @@ pub trait LowLevelWalletRead {
         &self,
     ) -> Result<Option<zcash_protocol::consensus::BlockHeight>, Self::Error>;
 
+    /// The fully-scanned height if `batch` (end-exclusive) were marked scanned and
+    /// merged with the adjacent scanned ranges.
+    ///
+    /// `Ok(None)` when that merge would still leave a gap between the wallet birthday
+    /// and the batch, or when the store does not answer. [`wallet::put_blocks_rows`]
+    /// uses this so a historic batch that closes such a gap does not insert spend-map
+    /// rows the retention window is about to drop.
+    fn prospective_block_fully_scanned_height(
+        &self,
+        batch: Range<BlockHeight>,
+    ) -> Result<Option<zcash_protocol::consensus::BlockHeight>, Self::Error> {
+        let _ = batch;
+        Ok(None)
+    }
+
     /// Returns the set of account identifiers for accounts that spent notes and/or UTXOs in the
     /// construction of the given transaction.
     fn get_funding_accounts<T: TxMeta>(
@@ -335,6 +350,100 @@ pub trait LowLevelWalletRead {
         &self,
         account_id: Self::AccountRef,
     ) -> Result<Option<Self::Account>, Self::Error>;
+}
+
+/// A shielded nullifier tagged with the pool it belongs to.
+///
+/// The pool and the nullifier are one value, so a caller cannot persist a
+/// Sapling nullifier under an Orchard pool code. Bytes are produced only when
+/// the row is written.
+#[derive(Clone, Debug)]
+pub enum StagedNullifier {
+    /// A Sapling nullifier.
+    Sapling(::sapling::Nullifier),
+    /// An Orchard nullifier.
+    #[cfg(feature = "orchard")]
+    Orchard(::orchard::note::Nullifier),
+    /// An Ironwood nullifier.
+    #[cfg(feature = "orchard")]
+    Ironwood(::orchard::note::Nullifier),
+}
+
+impl StagedNullifier {
+    /// The pool this nullifier belongs to.
+    pub fn pool(&self) -> ShieldedPool {
+        match self {
+            Self::Sapling(_) => ShieldedPool::Sapling,
+            #[cfg(feature = "orchard")]
+            Self::Orchard(_) => ShieldedPool::Orchard,
+            #[cfg(feature = "orchard")]
+            Self::Ironwood(_) => ShieldedPool::Ironwood,
+        }
+    }
+
+    /// The 32-byte nullifier stored in `nullifier_map`.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        match self {
+            Self::Sapling(nf) => {
+                let bytes = nf.as_ref();
+                let mut out = [0u8; 32];
+                out.copy_from_slice(bytes);
+                out
+            }
+            #[cfg(feature = "orchard")]
+            Self::Orchard(nf) | Self::Ironwood(nf) => nf.to_bytes(),
+        }
+    }
+}
+
+/// One shielded spend to record in the nullifier map.
+///
+/// Scanning builds these in memory and the wallet writes the whole batch once.
+/// Only spends that are still needed for spend detection at the end of the
+/// batch are included. Fields stay private so the nullifier cannot be separated
+/// from its pool.
+#[derive(Clone, Debug)]
+pub struct StagedSpend {
+    height: BlockHeight,
+    tx_index: TxIndex,
+    txid: TxId,
+    nullifier: StagedNullifier,
+}
+
+impl StagedSpend {
+    pub(crate) fn new(
+        height: BlockHeight,
+        tx_index: TxIndex,
+        txid: TxId,
+        nullifier: StagedNullifier,
+    ) -> Self {
+        Self {
+            height,
+            tx_index,
+            txid,
+            nullifier,
+        }
+    }
+
+    /// Block that revealed the nullifier.
+    pub fn height(&self) -> BlockHeight {
+        self.height
+    }
+
+    /// Index of the spending transaction within that block.
+    pub fn tx_index(&self) -> TxIndex {
+        self.tx_index
+    }
+
+    /// Transaction that revealed the nullifier.
+    pub fn txid(&self) -> TxId {
+        self.txid
+    }
+
+    /// Pool-tagged nullifier.
+    pub fn nullifier(&self) -> &StagedNullifier {
+        &self.nullifier
+    }
 }
 
 /// A capability trait that provides low-level wallet write operations. These operations are used
@@ -588,6 +697,15 @@ pub trait LowLevelWalletWrite: LowLevelWalletRead {
     /// - `pruning_depth`: The number of blocks below the fully scanned height at which to
     ///   prune tracked spends.
     fn prune_tracked_spends(&mut self, pruning_depth: u32) -> Result<(), Self::Error>;
+
+    /// Writes shielded spends that must still be findable after this batch commits.
+    ///
+    /// The slice is the survivor set for the batch: spends at heights the
+    /// spend-tracking floor did not drop. It is persisted in the same database
+    /// transaction as the blocks, so a crash before commit rolls the blocks and
+    /// the nullifiers back together and the batch is scanned again. A crash
+    /// after commit leaves the nullifiers available for a later scan of a gap.
+    fn persist_staged_spends(&mut self, spends: &[StagedSpend]) -> Result<(), Self::Error>;
 
     /// Records information about a transaction output that your wallet created, from the constituent
     /// properties of that output.

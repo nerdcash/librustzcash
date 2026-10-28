@@ -444,6 +444,31 @@ mod tests {
     }
 
     #[test]
+    fn tip_first_historic_nullifier_map_stays_bounded() {
+        testing::pool::tip_first_historic_nullifier_map_stays_bounded();
+    }
+
+    #[test]
+    fn out_of_order_spend_survives_reopen() {
+        testing::pool::out_of_order_spend_survives_reopen();
+    }
+
+    #[test]
+    fn staged_nullifier_write_rolls_back_and_retries() {
+        testing::pool::staged_nullifier_write_rolls_back_and_retries();
+    }
+
+    #[test]
+    fn bridging_historic_batch_skips_nullifiers_below_the_floor() {
+        testing::pool::bridging_historic_batch_skips_nullifiers_below_the_floor();
+    }
+
+    #[test]
+    fn transactionally_scoped_scan_reclaims_nullifier_pages() {
+        testing::pool::transactionally_scoped_scan_reclaims_nullifier_pages();
+    }
+
+    #[test]
     fn rewind_after_non_contiguous_scan_sapling() {
         testing::pool::rewind_after_non_contiguous_scan::<SaplingPoolTester>()
     }

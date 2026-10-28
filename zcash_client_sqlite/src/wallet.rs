@@ -3711,6 +3711,58 @@ pub(crate) fn fully_scanned_height(
         .flatten())
 }
 
+/// The fully-scanned height if `batch` (end-exclusive) were marked
+/// [`ScanPriority::Scanned`] and merged with adjacent scanned ranges.
+///
+/// `None` when the wallet has no birthday, or when the merged range that covers
+/// the birthday would not include the batch. A historic chunk scanned above a gap
+/// therefore returns the pre-batch frontier (or `None`), while the chunk that
+/// finally touches the birthday returns the end of the already-scanned suffix.
+pub(crate) fn prospective_fully_scanned_height(
+    conn: &rusqlite::Connection,
+    batch: std::ops::Range<BlockHeight>,
+) -> Result<Option<BlockHeight>, rusqlite::Error> {
+    let Some(birthday) = wallet_birthday(conn)? else {
+        return Ok(None);
+    };
+
+    let mut ranges = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT block_range_start, block_range_end
+             FROM scan_queue
+             WHERE priority = :priority
+             ORDER BY block_range_start ASC",
+        )?;
+        let mut rows =
+            stmt.query(named_params![":priority": priority_code(&ScanPriority::Scanned)])?;
+        while let Some(row) = rows.next()? {
+            ranges.push((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?));
+        }
+    }
+
+    if !batch.is_empty() {
+        ranges.push((u32::from(batch.start), u32::from(batch.end)));
+        ranges.sort_unstable();
+    }
+
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some((_, merged_end)) = merged.last_mut()
+            && start <= *merged_end
+        {
+            *merged_end = (*merged_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+
+    let birthday = u32::from(birthday);
+    Ok(merged.into_iter().find_map(|(start, end)| {
+        (start <= birthday && end > birthday).then_some(BlockHeight::from(end - 1))
+    }))
+}
+
 #[tracing::instrument(skip_all)]
 pub(crate) fn block_fully_scanned<P: consensus::Parameters>(
     conn: &rusqlite::Connection,
@@ -4537,6 +4589,8 @@ pub(crate) fn truncate_to_height_internal<P: consensus::Parameters>(
             commitment_tree_write_back,
             commitment_tree_maintenance: CommitmentTreeMaintenance::Automatic,
             anchor_retention_enabled: true,
+            wal_checkpoint_pending: std::sync::atomic::AtomicBool::new(false),
+            spend_map_reclaim_requested: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "transparent-inputs")]
             gap_limits: *gap_limits,
         };
@@ -6155,6 +6209,21 @@ pub(crate) fn insert_nullifier_map<N: AsRef<[u8]>>(
     spend_pool: ShieldedPool,
     new_entries: &[(TxIndex, TxId, Vec<N>)],
 ) -> Result<(), SqliteClientError> {
+    let started = std::time::Instant::now();
+    let result = insert_nullifier_map_inner(conn, block_height, spend_pool, new_entries);
+    crate::NULLIFIER_MAP_WRITE_NS.fetch_add(
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    result
+}
+
+fn insert_nullifier_map_inner<N: AsRef<[u8]>>(
+    conn: &rusqlite::Transaction<'_>,
+    block_height: BlockHeight,
+    spend_pool: ShieldedPool,
+    new_entries: &[(TxIndex, TxId, Vec<N>)],
+) -> Result<(), SqliteClientError> {
     let mut stmt_insert_nullifier_mapping = conn.prepare_cached(
         "INSERT INTO nullifier_map
         (spend_pool, nf, block_height, tx_index)
@@ -6179,6 +6248,115 @@ pub(crate) fn insert_nullifier_map<N: AsRef<[u8]>>(
             stmt_insert_nullifier_mapping.execute(nf_args)?;
         }
     }
+
+    Ok(())
+}
+
+/// Writes a batch of shielded spends that must survive the commit.
+///
+/// Rows are loaded into an unindexed temporary table, then copied into
+/// `tx_locator_map` and `nullifier_map` in nullifier order. That keeps the
+/// unique index append-mostly instead of splitting it once per spend, and it
+/// checks locator conflicts once for the batch.
+pub(crate) fn insert_staged_nullifiers(
+    conn: &rusqlite::Transaction<'_>,
+    spends: &[zcash_client_backend::data_api::ll::StagedSpend],
+) -> Result<(), SqliteClientError> {
+    let started = std::time::Instant::now();
+    let result = if spends.is_empty() {
+        Ok(())
+    } else {
+        insert_staged_nullifiers_inner(conn, spends)
+    };
+    crate::NULLIFIER_MAP_WRITE_NS.fetch_add(
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    result
+}
+
+fn insert_staged_nullifiers_inner(
+    conn: &rusqlite::Transaction<'_>,
+    spends: &[zcash_client_backend::data_api::ll::StagedSpend],
+) -> Result<(), SqliteClientError> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS zcash_staged_nullifier (
+            spend_pool INTEGER NOT NULL,
+            nf BLOB NOT NULL,
+            block_height INTEGER NOT NULL,
+            tx_index INTEGER NOT NULL,
+            txid BLOB NOT NULL
+        );
+        DELETE FROM zcash_staged_nullifier;",
+    )?;
+
+    {
+        let mut insert = conn.prepare_cached(
+            "INSERT INTO zcash_staged_nullifier
+                (spend_pool, nf, block_height, tx_index, txid)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for spend in spends {
+            let nf = spend.nullifier().to_bytes();
+            insert.execute(params![
+                pool_code(PoolType::Shielded(spend.nullifier().pool())),
+                &nf[..],
+                u32::from(spend.height()),
+                u16::from(spend.tx_index()),
+                spend.txid().as_ref(),
+            ])?;
+        }
+    }
+
+    let conflict = conn
+        .query_row(
+            "SELECT 1
+             FROM (
+                 SELECT DISTINCT block_height, tx_index, txid
+                 FROM zcash_staged_nullifier
+             ) AS s
+             JOIN tx_locator_map AS t
+               ON (t.block_height = s.block_height AND t.tx_index = s.tx_index)
+               OR t.txid = s.txid
+             WHERE NOT (
+                 t.block_height = s.block_height
+                 AND t.tx_index = s.tx_index
+                 AND t.txid = s.txid
+             )
+             LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if conflict.is_some() {
+        return Err(SqliteClientError::DbError(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(
+                "UNIQUE constraint failed: tx_locator_map.block_height, tx_locator_map.tx_index"
+                    .into(),
+            ),
+        )));
+    }
+
+    conn.execute_batch(
+        "INSERT INTO tx_locator_map (block_height, tx_index, txid)
+         SELECT DISTINCT s.block_height, s.tx_index, s.txid
+         FROM zcash_staged_nullifier AS s
+         WHERE NOT EXISTS (
+             SELECT 1 FROM tx_locator_map AS t
+             WHERE t.block_height = s.block_height
+               AND t.tx_index = s.tx_index
+               AND t.txid = s.txid
+         );
+         INSERT INTO nullifier_map (spend_pool, nf, block_height, tx_index)
+         SELECT spend_pool, nf, block_height, tx_index
+         FROM zcash_staged_nullifier
+         ORDER BY spend_pool, nf
+         ON CONFLICT (spend_pool, nf) DO UPDATE
+         SET block_height = excluded.block_height,
+             tx_index = excluded.tx_index;
+         DELETE FROM zcash_staged_nullifier;",
+    )?;
 
     Ok(())
 }
