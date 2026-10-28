@@ -31,19 +31,19 @@ The spam range is inside the 2022–2023 sandblasting window. Block 1,820,000 wa
 mined on 2022-09-24; 33 of the 50 blocks contain a transaction with more than 50
 shielded outputs. The ordinary range is outside that window.
 
-`scripts/trial-decrypt-bench.sh` runs the benchmark at 1 core, half the host, and
-every core (`RAYON_NUM_THREADS`). The scanner this benchmark was added against
-decrypts on the calling thread, so those three rows match until a later change
-uses the rayon pool.
+`scripts/trial-decrypt-bench.sh` runs the benchmark at 1 core, half the logical
+CPU count, and every core (`RAYON_NUM_THREADS`). The scanner this benchmark was
+added against decrypts on the calling thread, so those three rows match until a
+later change uses the rayon pool.
 
 `decrypt share` is the ratio of two independent medians. When trial decryption
 is essentially the whole scan, noise can put the ratio a fraction above 1.
 
 ## Baseline
 
-Measured on the bench profile (release optimizations) of this commit, on a
-4-core x86_64 host. N is half the host, 2 cores. The three core counts agree,
-because this scanner does not use rayon.
+Measured with the bench profile (release optimizations). The rows are
+`RAYON_NUM_THREADS` of 1, 2, and 4. The three counts agree, because this
+scanner does not use rayon.
 
 | Change | Cores | Range | notes/sec | decrypt share of scan |
 | --- | --- | --- | --- | --- |
