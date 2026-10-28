@@ -621,6 +621,10 @@ pub(crate) fn add_account<P: consensus::Parameters>(
         gap_limits,
         birthday.prior_chain_state(),
         std::iter::once(account_uuid).collect(),
+        // Account import builds no `WalletDb` handle, so it cannot see a caller's
+        // `set_commitment_tree_write_back` choice. The cache is the default and writes the
+        // same rows as the immediate store.
+        true,
     ) {
         Ok(()) => {}
         Err(RewindError::DataSource(e)) => return Err(e),
@@ -2697,7 +2701,7 @@ impl ProgressEstimator for SubtreeProgressEstimator {
     }
 }
 
-fn next_subtree_index<H: HashSer, const SHARD_HEIGHT: u8>(
+fn next_subtree_index<H: HashSer + Clone, const SHARD_HEIGHT: u8>(
     tx: &rusqlite::Transaction,
     table_prefix: &'static str,
 ) -> Result<u64, SqliteClientError> {
@@ -4267,6 +4271,7 @@ pub(crate) fn truncate_to_height<P: consensus::Parameters>(
     params: &P,
     #[cfg(feature = "transparent-inputs")] gap_limits: &GapLimits,
     max_height: BlockHeight,
+    commitment_tree_write_back: bool,
 ) -> Result<BlockHeight, SqliteClientError> {
     let truncation_height = select_truncation_height(conn, max_height)?;
     truncate_to_height_internal(
@@ -4276,6 +4281,7 @@ pub(crate) fn truncate_to_height<P: consensus::Parameters>(
         gap_limits,
         truncation_height,
         truncation_height,
+        commitment_tree_write_back,
     )
 }
 
@@ -4444,6 +4450,7 @@ pub(crate) fn truncate_to_height_internal<P: consensus::Parameters>(
     #[cfg(feature = "transparent-inputs")] gap_limits: &GapLimits,
     truncation_height: BlockHeight,
     rescan_floor: BlockHeight,
+    commitment_tree_write_back: bool,
 ) -> Result<BlockHeight, SqliteClientError> {
     let last_scanned_height = conn.query_row("SELECT MAX(height) FROM blocks", [], |row| {
         let h = row.get::<_, Option<u32>>(0)?;
@@ -4504,6 +4511,7 @@ pub(crate) fn truncate_to_height_internal<P: consensus::Parameters>(
             // Truncation removes checkpoints; it never establishes them, so no anchor retention
             // decision is made through this handle and the interval is immaterial.
             anchor_retention_interval: AnchorRetentionInterval::default(),
+            commitment_tree_write_back,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: *gap_limits,
         };
@@ -4738,6 +4746,7 @@ pub(crate) fn truncate_to_chain_state<P: consensus::Parameters, CL, R>(
                         &wdb.gap_limits,
                         h,
                         h,
+                        wdb.commitment_tree_write_back,
                     )
                     .map(|_| ());
                 } else {
@@ -4765,6 +4774,7 @@ pub(crate) fn truncate_to_chain_state<P: consensus::Parameters, CL, R>(
                         &wdb.gap_limits,
                         min_checkpoint_height,
                         min_checkpoint_height,
+                        wdb.commitment_tree_write_back,
                     )?;
                 } else {
                     // There are no checkpoints in either table; just continue.
@@ -4841,6 +4851,7 @@ pub(crate) fn truncate_to_chain_state<P: consensus::Parameters, CL, R>(
         &wdb.gap_limits,
         target_height,
         target_height,
+        wdb.commitment_tree_write_back,
     )?;
 
     assert_eq!(truncated_height, target_height);
@@ -4897,6 +4908,7 @@ pub(crate) fn rewind_to_chain_state<P: consensus::Parameters>(
     #[cfg(feature = "transparent-inputs")] gap_limits: &GapLimits,
     chain_state: &ChainState,
     reset_account_birthdays: HashSet<AccountUuid>,
+    commitment_tree_write_back: bool,
 ) -> Result<(), RewindError<AccountUuid, SqliteClientError>> {
     // Load every account's birthday so we can validate `reset_account_birthdays` against the
     // wallet's accounts and check whether at least one existing birthday is at or below the
@@ -5002,6 +5014,7 @@ pub(crate) fn rewind_to_chain_state<P: consensus::Parameters>(
             gap_limits,
             truncation_height,
             target_height,
+            commitment_tree_write_back,
         )
         .map_err(RewindError::DataSource)?;
     }

@@ -2,12 +2,14 @@
 
 use rusqlite::{self, OptionalExtension, named_params};
 use std::{
-    collections::BTreeSet,
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
     error, fmt,
     io::{self, Cursor},
     marker::PhantomData,
     num::NonZeroU32,
     ops::Range,
+    rc::Rc,
     sync::Arc,
 };
 
@@ -112,10 +114,18 @@ impl error::Error for Error {
 }
 
 /// An implementation of [`ShardStore`] backed by an SQLite database.
+///
+/// When [`Self::enable_write_back`] is used, shard and checkpoint mutations stay
+/// in memory until [`Self::flush_write_back`] or the store is dropped. Reads of shards
+/// that have not been modified are served from SQLite and are not rewritten, so a flush
+/// persists the same rows an immediate store would have left.
 pub struct SqliteShardStore<C, H, const SHARD_HEIGHT: u8> {
     pub(crate) conn: C,
     table_prefix: &'static str,
     _hash_type: PhantomData<H>,
+    write_back: Option<RefCell<ShardWriteBack<H>>>,
+    /// Receives a flush error from [`Drop`] when the caller cannot flush explicitly.
+    flush_report: Option<Rc<RefCell<Result<(), Error>>>>,
 }
 
 impl<C, H, const SHARD_HEIGHT: u8> SqliteShardStore<C, H, SHARD_HEIGHT> {
@@ -129,11 +139,353 @@ impl<C, H, const SHARD_HEIGHT: u8> SqliteShardStore<C, H, SHARD_HEIGHT> {
             conn,
             table_prefix,
             _hash_type: PhantomData,
+            write_back: None,
+            flush_report: None,
         })
     }
 }
 
-impl<'conn, 'a: 'conn, H: HashSer, const SHARD_HEIGHT: u8> ShardStore
+/// In-memory overlay for one note-commitment tree update.
+///
+/// Shards stay on disk until a read or a write touches them. Checkpoints, the cap, and the
+/// retained-checkpoint set are small and are loaded up front so pruning and anchor retention see
+/// the same state the immediate store would. A flush writes only the rows that actually changed,
+/// through the same SQL helpers the immediate store uses.
+struct ShardWriteBack<H> {
+    /// `None` means a read proved the shard is absent. A later [`ShardStore::put_shard`] replaces
+    /// that with `Some`.
+    shards: BTreeMap<u64, Option<LocatedPrunableTree<H>>>,
+    dirty_shards: BTreeSet<u64>,
+    /// SQL rows at or above this index are deleted on flush. A shard inserted after the truncate
+    /// is still visible from `shards` and is not hidden by this watermark.
+    truncate_from: Option<u64>,
+    cap: PrunableTree<H>,
+    cap_dirty: bool,
+    checkpoints: BTreeMap<BlockHeight, Checkpoint>,
+    /// Checkpoint ids that existed in SQLite when the cache was enabled.
+    loaded_ids: BTreeSet<BlockHeight>,
+    dirty_checkpoints: BTreeSet<BlockHeight>,
+    removed_checkpoints: BTreeSet<BlockHeight>,
+    retained: BTreeSet<BlockHeight>,
+    initial_retained: BTreeSet<BlockHeight>,
+}
+
+/// Sort key matching `ORDER BY position` (NULLs first) with `checkpoint_id` as the tie break.
+///
+/// `checkpoint_id` is the integer primary key, so it is the rowid. Within one batch, new
+/// checkpoints are inserted in id order and an update reinserts the same id, so this matches the
+/// rowid order SQLite uses when positions tie.
+fn checkpoint_order(id: BlockHeight, checkpoint: &Checkpoint) -> (u8, u64, u32) {
+    match checkpoint.tree_state() {
+        TreeState::Empty => (0, 0, u32::from(id)),
+        TreeState::AtPosition(position) => (1, u64::from(position), u32::from(id)),
+    }
+}
+
+impl<H: HashSer + Clone> ShardWriteBack<H> {
+    fn load(conn: &rusqlite::Transaction<'_>, table_prefix: &'static str) -> Result<Self, Error> {
+        let cap = get_cap(conn, table_prefix)?;
+        let mut checkpoints = BTreeMap::new();
+        let count = checkpoint_count(conn, table_prefix)?;
+        with_checkpoints(conn, table_prefix, count, |id, checkpoint| {
+            checkpoints.insert(*id, checkpoint.clone());
+            Ok(())
+        })?;
+        let loaded_ids = checkpoints.keys().copied().collect();
+        let retained = retained_checkpoints(conn, table_prefix)?;
+        Ok(Self {
+            shards: BTreeMap::new(),
+            dirty_shards: BTreeSet::new(),
+            truncate_from: None,
+            cap,
+            cap_dirty: false,
+            checkpoints,
+            loaded_ids,
+            dirty_checkpoints: BTreeSet::new(),
+            removed_checkpoints: BTreeSet::new(),
+            retained: retained.clone(),
+            initial_retained: retained,
+        })
+    }
+
+    fn get_shard(
+        &mut self,
+        conn: &rusqlite::Connection,
+        table_prefix: &'static str,
+        shard_root: Address,
+    ) -> Result<Option<LocatedPrunableTree<H>>, Error> {
+        let index = shard_root.index();
+        if let Some(hit) = self.shards.get(&index) {
+            return Ok(hit.clone());
+        }
+        if self.truncate_from.is_some_and(|from| index >= from) {
+            self.shards.insert(index, None);
+            return Ok(None);
+        }
+        let loaded = get_shard(conn, table_prefix, shard_root)?;
+        self.shards.insert(index, loaded.clone());
+        Ok(loaded)
+    }
+
+    fn shard_roots(
+        &self,
+        conn: &rusqlite::Connection,
+        table_prefix: &'static str,
+        shard_root_level: Level,
+    ) -> Result<Vec<Address>, Error> {
+        let mut indexes = get_shard_roots(conn, table_prefix, shard_root_level)?
+            .into_iter()
+            .map(|addr| addr.index())
+            .filter(|index| self.truncate_from.is_none_or(|from| *index < from))
+            .collect::<BTreeSet<_>>();
+        for (index, shard) in &self.shards {
+            if shard.is_some() {
+                indexes.insert(*index);
+            } else {
+                indexes.remove(index);
+            }
+        }
+        Ok(indexes
+            .into_iter()
+            .map(|index| Address::from_parts(shard_root_level, index))
+            .collect())
+    }
+
+    fn put_shard(&mut self, subtree: LocatedPrunableTree<H>) {
+        let index = subtree.root_addr().index();
+        self.shards.insert(index, Some(subtree));
+        self.dirty_shards.insert(index);
+    }
+
+    fn truncate_shards(&mut self, shard_index: u64) {
+        self.shards.split_off(&shard_index);
+        self.dirty_shards.retain(|index| *index < shard_index);
+        self.truncate_from = Some(
+            self.truncate_from
+                .map_or(shard_index, |from| from.min(shard_index)),
+        );
+    }
+
+    fn add_checkpoint(
+        &mut self,
+        checkpoint_id: BlockHeight,
+        checkpoint: Checkpoint,
+    ) -> Result<(), Error> {
+        if let Some(extant) = self.checkpoints.get(&checkpoint_id) {
+            if extant.tree_state() != checkpoint.tree_state() {
+                return Err(Error::CheckpointConflict {
+                    checkpoint_id,
+                    checkpoint,
+                    extant_tree_state: extant.tree_state(),
+                    extant_marks_removed: None,
+                });
+            }
+            if extant.marks_removed() != checkpoint.marks_removed() {
+                return Err(Error::CheckpointConflict {
+                    checkpoint_id,
+                    checkpoint,
+                    extant_tree_state: extant.tree_state(),
+                    extant_marks_removed: Some(extant.marks_removed().clone()),
+                });
+            }
+            return Ok(());
+        }
+        self.removed_checkpoints.remove(&checkpoint_id);
+        self.checkpoints.insert(checkpoint_id, checkpoint);
+        self.dirty_checkpoints.insert(checkpoint_id);
+        Ok(())
+    }
+
+    fn update_checkpoint_with<F>(
+        &mut self,
+        checkpoint_id: BlockHeight,
+        update: F,
+    ) -> Result<bool, Error>
+    where
+        F: FnOnce(&mut Checkpoint) -> Result<(), Error>,
+    {
+        let Some(mut checkpoint) = self.checkpoints.get(&checkpoint_id).cloned() else {
+            return Ok(false);
+        };
+        update(&mut checkpoint)?;
+        self.removed_checkpoints.remove(&checkpoint_id);
+        self.checkpoints.insert(checkpoint_id, checkpoint);
+        self.dirty_checkpoints.insert(checkpoint_id);
+        Ok(true)
+    }
+
+    fn remove_checkpoint(&mut self, checkpoint_id: BlockHeight) {
+        if self.checkpoints.remove(&checkpoint_id).is_some() {
+            self.dirty_checkpoints.remove(&checkpoint_id);
+            if self.loaded_ids.contains(&checkpoint_id) {
+                self.removed_checkpoints.insert(checkpoint_id);
+            }
+        }
+    }
+
+    fn truncate_checkpoints_retaining(&mut self, checkpoint_id: BlockHeight) {
+        let mut higher = self.checkpoints.split_off(&checkpoint_id);
+        if let Some(kept) = higher.remove(&checkpoint_id) {
+            if kept.marks_removed().is_empty() {
+                self.checkpoints.insert(checkpoint_id, kept);
+            } else {
+                self.checkpoints.insert(
+                    checkpoint_id,
+                    Checkpoint::from_parts(kept.tree_state(), BTreeSet::new()),
+                );
+                self.dirty_checkpoints.insert(checkpoint_id);
+                self.removed_checkpoints.remove(&checkpoint_id);
+            }
+        }
+        for (id, _) in higher {
+            self.dirty_checkpoints.remove(&id);
+            if self.loaded_ids.contains(&id) {
+                self.removed_checkpoints.insert(id);
+            }
+        }
+    }
+
+    fn checkpoints_in_position_order(&self, limit: usize) -> Vec<(BlockHeight, Checkpoint)> {
+        let mut pairs = self
+            .checkpoints
+            .iter()
+            .map(|(id, checkpoint)| (*id, checkpoint.clone()))
+            .collect::<Vec<_>>();
+        pairs.sort_by_key(|(id, checkpoint)| checkpoint_order(*id, checkpoint));
+        pairs.truncate(limit);
+        pairs
+    }
+
+    fn flush(
+        self,
+        conn: &rusqlite::Transaction<'_>,
+        table_prefix: &'static str,
+    ) -> Result<(), Error> {
+        tracing::debug!(
+            shards = self.dirty_shards.len(),
+            truncate = self.truncate_from.is_some(),
+            checkpoints = self.dirty_checkpoints.len(),
+            removed_checkpoints = self.removed_checkpoints.len(),
+            cap = self.cap_dirty,
+            "flushing commitment tree write-back cache"
+        );
+
+        if let Some(index) = self.truncate_from {
+            truncate_shards(conn, table_prefix, index)?;
+        }
+        for index in &self.dirty_shards {
+            if let Some(Some(shard)) = self.shards.get(index) {
+                put_shard(conn, table_prefix, shard.clone())?;
+            }
+        }
+        if self.cap_dirty {
+            put_cap(conn, table_prefix, self.cap)?;
+        }
+        for id in &self.removed_checkpoints {
+            remove_checkpoint(conn, table_prefix, *id)?;
+        }
+        let mut dirty_ids = self.dirty_checkpoints.iter().copied().collect::<Vec<_>>();
+        dirty_ids.sort();
+        for id in dirty_ids {
+            if self.removed_checkpoints.contains(&id) {
+                continue;
+            }
+            let Some(checkpoint) = self.checkpoints.get(&id).cloned() else {
+                continue;
+            };
+            // An id that already has a row cannot be inserted again when its marks changed:
+            // `add_checkpoint` treats that as a conflict. Delete the old row first. The id is the
+            // primary key, so the replacement keeps the same rowid.
+            if self.loaded_ids.contains(&id) {
+                remove_checkpoint(conn, table_prefix, id)?;
+            }
+            add_checkpoint(conn, table_prefix, id, checkpoint)?;
+        }
+        for id in self.initial_retained.difference(&self.retained) {
+            remove_retained_checkpoint(conn, table_prefix, *id)?;
+        }
+        for id in self.retained.difference(&self.initial_retained) {
+            add_retained_checkpoint(conn, table_prefix, *id)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'conn, 'a: 'conn, H: HashSer + Clone, const SHARD_HEIGHT: u8>
+    SqliteShardStore<&'a rusqlite::Transaction<'conn>, H, SHARD_HEIGHT>
+{
+    /// Start serving this store from memory.
+    ///
+    /// Reads of shards that this batch does not touch still come from SQLite. Calling this twice
+    /// keeps the cache already in use. [`Self::flush_write_back`] writes the changes and returns
+    /// the store to immediate mode.
+    pub(crate) fn enable_write_back(&mut self) -> Result<(), Error> {
+        if self.write_back.is_some() {
+            return Ok(());
+        }
+        self.write_back = Some(RefCell::new(ShardWriteBack::load(
+            self.conn,
+            self.table_prefix,
+        )?));
+        Ok(())
+    }
+
+    /// Where a [`WriteBackOnDrop`] guard should record a flush failure.
+    pub(crate) fn set_flush_report(&mut self, report: Rc<RefCell<Result<(), Error>>>) {
+        self.flush_report = Some(report);
+    }
+
+    /// Flush this cache when the returned guard drops.
+    ///
+    /// The guard holds no borrow, so a tree callback can run while it is alive. Drop it after the
+    /// callback returns and before committing.
+    pub(crate) fn flush_on_drop(&mut self) -> WriteBackOnDrop<'conn, 'a, H, SHARD_HEIGHT> {
+        WriteBackOnDrop { store: self }
+    }
+
+    /// Persist cached changes and disable the cache.
+    ///
+    /// A second call is a no-op. On error the caller must roll back the transaction: a partial
+    /// flush is not a consistent tree, and the cache has been dropped.
+    pub(crate) fn flush_write_back(&mut self) -> Result<(), Error> {
+        let Some(cache) = self.write_back.take() else {
+            return Ok(());
+        };
+        cache.into_inner().flush(self.conn, self.table_prefix)
+    }
+}
+
+/// Flushes a transaction-backed [`SqliteShardStore`] when dropped.
+///
+/// `WalletCommitmentTrees` callbacks borrow the tree for a lifetime that the borrow checker will
+/// not treat as finished until the callback's result is no longer in scope. This guard flushes
+/// through a pointer so that flush does not need a second borrow of the tree.
+pub(crate) struct WriteBackOnDrop<'conn, 'a: 'conn, H: HashSer + Clone, const SHARD_HEIGHT: u8> {
+    store: *mut SqliteShardStore<&'a rusqlite::Transaction<'conn>, H, SHARD_HEIGHT>,
+}
+
+impl<'conn, 'a: 'conn, H: HashSer + Clone, const SHARD_HEIGHT: u8> Drop
+    for WriteBackOnDrop<'conn, 'a, H, SHARD_HEIGHT>
+{
+    fn drop(&mut self) {
+        if self.store.is_null() {
+            return;
+        }
+        // SAFETY: `flush_on_drop` borrows the store just long enough to take this pointer, and the
+        // caller keeps the store alive until this guard drops. The guard is dropped only after the
+        // tree callback has returned, so nothing else holds a reference to the store.
+        let store = unsafe { &mut *self.store };
+        if store.write_back.is_none() {
+            return;
+        }
+        let flushed = store.flush_write_back();
+        if let (Some(report), Err(err)) = (&store.flush_report, flushed) {
+            *report.borrow_mut() = Err(err);
+        }
+    }
+}
+
+impl<'conn, 'a: 'conn, H: HashSer + Clone, const SHARD_HEIGHT: u8> ShardStore
     for SqliteShardStore<&'a rusqlite::Transaction<'conn>, H, SHARD_HEIGHT>
 {
     type H = H;
@@ -144,38 +496,93 @@ impl<'conn, 'a: 'conn, H: HashSer, const SHARD_HEIGHT: u8> ShardStore
         &self,
         shard_root: Address,
     ) -> Result<Option<LocatedPrunableTree<Self::H>>, Self::Error> {
+        if let Some(cache) = &self.write_back {
+            return cache
+                .borrow_mut()
+                .get_shard(self.conn, self.table_prefix, shard_root);
+        }
         get_shard(self.conn, self.table_prefix, shard_root)
     }
 
     fn last_shard(&self) -> Result<Option<LocatedPrunableTree<Self::H>>, Self::Error> {
-        last_shard(self.conn, self.table_prefix, Self::SHARD_ROOT_LEVEL)
+        let Some(cache) = &self.write_back else {
+            return last_shard(self.conn, self.table_prefix, Self::SHARD_ROOT_LEVEL);
+        };
+        let roots =
+            cache
+                .borrow()
+                .shard_roots(self.conn, self.table_prefix, Self::SHARD_ROOT_LEVEL)?;
+        let Some(addr) = roots.last().copied() else {
+            return Ok(None);
+        };
+        if let Some(hit) = cache.borrow().shards.get(&addr.index()) {
+            return Ok(hit.clone());
+        }
+        // `last_shard` reads `shard_data` only. `get_shard` also overlays `root_hash`, and the
+        // tree appends to whatever `last_shard` returned, so a cache miss must match that read.
+        // A truncate can hide a higher on-disk shard, which the SQL helper would still return.
+        if cache.borrow().truncate_from.is_some() {
+            read_shard_data(self.conn, self.table_prefix, addr)
+        } else {
+            last_shard(self.conn, self.table_prefix, Self::SHARD_ROOT_LEVEL)
+        }
     }
 
     fn put_shard(&mut self, subtree: LocatedPrunableTree<Self::H>) -> Result<(), Self::Error> {
+        if let Some(cache) = &self.write_back {
+            cache.borrow_mut().put_shard(subtree);
+            return Ok(());
+        }
         put_shard(self.conn, self.table_prefix, subtree)
     }
 
     fn get_shard_roots(&self) -> Result<Vec<Address>, Self::Error> {
+        if let Some(cache) = &self.write_back {
+            return cache.borrow().shard_roots(
+                self.conn,
+                self.table_prefix,
+                Self::SHARD_ROOT_LEVEL,
+            );
+        }
         get_shard_roots(self.conn, self.table_prefix, Self::SHARD_ROOT_LEVEL)
     }
 
     fn truncate_shards(&mut self, shard_index: u64) -> Result<(), Self::Error> {
+        if let Some(cache) = &self.write_back {
+            cache.borrow_mut().truncate_shards(shard_index);
+            return Ok(());
+        }
         truncate_shards(self.conn, self.table_prefix, shard_index)
     }
 
     fn get_cap(&self) -> Result<PrunableTree<Self::H>, Self::Error> {
+        if let Some(cache) = &self.write_back {
+            return Ok(cache.borrow().cap.clone());
+        }
         get_cap(self.conn, self.table_prefix)
     }
 
     fn put_cap(&mut self, cap: PrunableTree<Self::H>) -> Result<(), Self::Error> {
+        if let Some(cache) = &self.write_back {
+            let mut cache = cache.borrow_mut();
+            cache.cap = cap;
+            cache.cap_dirty = true;
+            return Ok(());
+        }
         put_cap(self.conn, self.table_prefix, cap)
     }
 
     fn min_checkpoint_id(&self) -> Result<Option<Self::CheckpointId>, Self::Error> {
+        if let Some(cache) = &self.write_back {
+            return Ok(cache.borrow().checkpoints.keys().next().copied());
+        }
         min_checkpoint_id(self.conn, self.table_prefix)
     }
 
     fn max_checkpoint_id(&self) -> Result<Option<Self::CheckpointId>, Self::Error> {
+        if let Some(cache) = &self.write_back {
+            return Ok(cache.borrow().checkpoints.keys().next_back().copied());
+        }
         max_checkpoint_id(self.conn, self.table_prefix)
     }
 
@@ -184,10 +591,16 @@ impl<'conn, 'a: 'conn, H: HashSer, const SHARD_HEIGHT: u8> ShardStore
         checkpoint_id: Self::CheckpointId,
         checkpoint: Checkpoint,
     ) -> Result<(), Self::Error> {
+        if let Some(cache) = &self.write_back {
+            return cache.borrow_mut().add_checkpoint(checkpoint_id, checkpoint);
+        }
         add_checkpoint(self.conn, self.table_prefix, checkpoint_id, checkpoint)
     }
 
     fn checkpoint_count(&self) -> Result<usize, Self::Error> {
+        if let Some(cache) = &self.write_back {
+            return Ok(cache.borrow().checkpoints.len());
+        }
         checkpoint_count(self.conn, self.table_prefix)
     }
 
@@ -195,6 +608,15 @@ impl<'conn, 'a: 'conn, H: HashSer, const SHARD_HEIGHT: u8> ShardStore
         &self,
         checkpoint_depth: usize,
     ) -> Result<Option<(Self::CheckpointId, Checkpoint)>, Self::Error> {
+        if let Some(cache) = &self.write_back {
+            return Ok(cache
+                .borrow()
+                .checkpoints
+                .iter()
+                .rev()
+                .nth(checkpoint_depth)
+                .map(|(id, checkpoint)| (*id, checkpoint.clone())));
+        }
         get_checkpoint_at_depth(self.conn, self.table_prefix, checkpoint_depth)
             .map_err(Error::Query)
     }
@@ -203,20 +625,39 @@ impl<'conn, 'a: 'conn, H: HashSer, const SHARD_HEIGHT: u8> ShardStore
         &self,
         checkpoint_id: &Self::CheckpointId,
     ) -> Result<Option<Checkpoint>, Self::Error> {
+        if let Some(cache) = &self.write_back {
+            return Ok(cache.borrow().checkpoints.get(checkpoint_id).cloned());
+        }
         get_checkpoint(self.conn, self.table_prefix, *checkpoint_id)
     }
 
-    fn with_checkpoints<F>(&mut self, limit: usize, callback: F) -> Result<(), Self::Error>
+    fn with_checkpoints<F>(&mut self, limit: usize, mut callback: F) -> Result<(), Self::Error>
     where
         F: FnMut(&Self::CheckpointId, &Checkpoint) -> Result<(), Self::Error>,
     {
+        if let Some(cache) = &self.write_back {
+            // Snapshot first. Pruning calls back into the store, and the callback must not run
+            // while the cache `RefCell` is borrowed.
+            let pairs = cache.borrow().checkpoints_in_position_order(limit);
+            for (id, checkpoint) in &pairs {
+                callback(id, checkpoint)?;
+            }
+            return Ok(());
+        }
         with_checkpoints(self.conn, self.table_prefix, limit, callback)
     }
 
-    fn for_each_checkpoint<F>(&self, limit: usize, callback: F) -> Result<(), Self::Error>
+    fn for_each_checkpoint<F>(&self, limit: usize, mut callback: F) -> Result<(), Self::Error>
     where
         F: FnMut(&Self::CheckpointId, &Checkpoint) -> Result<(), Self::Error>,
     {
+        if let Some(cache) = &self.write_back {
+            let pairs = cache.borrow().checkpoints_in_position_order(limit);
+            for (id, checkpoint) in &pairs {
+                callback(id, checkpoint)?;
+            }
+            return Ok(());
+        }
         with_checkpoints(self.conn, self.table_prefix, limit, callback)
     }
 
@@ -228,10 +669,33 @@ impl<'conn, 'a: 'conn, H: HashSer, const SHARD_HEIGHT: u8> ShardStore
     where
         F: Fn(&mut Checkpoint) -> Result<(), Self::Error>,
     {
+        if let Some(cache) = &self.write_back {
+            // Apply `update` to a copy before publishing it, matching the SQL helper. The copy is
+            // updated outside the `RefCell` borrow so a callback that re-enters the store cannot
+            // deadlock on it.
+            let mut checkpoint = {
+                let borrowed = cache.borrow();
+                let Some(checkpoint) = borrowed.checkpoints.get(checkpoint_id).cloned() else {
+                    return Ok(false);
+                };
+                checkpoint
+            };
+            update(&mut checkpoint)?;
+            return cache
+                .borrow_mut()
+                .update_checkpoint_with(*checkpoint_id, |slot| {
+                    *slot = checkpoint;
+                    Ok(())
+                });
+        }
         update_checkpoint_with(self.conn, self.table_prefix, *checkpoint_id, update)
     }
 
     fn remove_checkpoint(&mut self, checkpoint_id: &Self::CheckpointId) -> Result<(), Self::Error> {
+        if let Some(cache) = &self.write_back {
+            cache.borrow_mut().remove_checkpoint(*checkpoint_id);
+            return Ok(());
+        }
         remove_checkpoint(self.conn, self.table_prefix, *checkpoint_id)
     }
 
@@ -239,6 +703,10 @@ impl<'conn, 'a: 'conn, H: HashSer, const SHARD_HEIGHT: u8> ShardStore
         &mut self,
         checkpoint_id: Self::CheckpointId,
     ) -> Result<(), Self::Error> {
+        if let Some(cache) = &self.write_back {
+            cache.borrow_mut().retained.insert(checkpoint_id);
+            return Ok(());
+        }
         add_retained_checkpoint(self.conn, self.table_prefix, checkpoint_id)
     }
 
@@ -246,10 +714,17 @@ impl<'conn, 'a: 'conn, H: HashSer, const SHARD_HEIGHT: u8> ShardStore
         &mut self,
         checkpoint_id: &Self::CheckpointId,
     ) -> Result<(), Self::Error> {
+        if let Some(cache) = &self.write_back {
+            cache.borrow_mut().retained.remove(checkpoint_id);
+            return Ok(());
+        }
         remove_retained_checkpoint(self.conn, self.table_prefix, *checkpoint_id)
     }
 
     fn retained_checkpoints(&self) -> Result<BTreeSet<Self::CheckpointId>, Self::Error> {
+        if let Some(cache) = &self.write_back {
+            return Ok(cache.borrow().retained.clone());
+        }
         retained_checkpoints(self.conn, self.table_prefix)
     }
 
@@ -257,6 +732,12 @@ impl<'conn, 'a: 'conn, H: HashSer, const SHARD_HEIGHT: u8> ShardStore
         &mut self,
         checkpoint_id: &Self::CheckpointId,
     ) -> Result<(), Self::Error> {
+        if let Some(cache) = &self.write_back {
+            cache
+                .borrow_mut()
+                .truncate_checkpoints_retaining(*checkpoint_id);
+            return Ok(());
+        }
         truncate_checkpoints_retaining(self.conn, self.table_prefix, *checkpoint_id)
     }
 }
@@ -466,6 +947,35 @@ pub(crate) fn get_shard<H: HashSer>(
         } else {
             Ok(located_tree)
         }
+    })
+    .transpose()
+}
+
+/// Reads one shard the way [`last_shard`] does: `shard_data` only, with no `root_hash` overlay.
+fn read_shard_data<H: HashSer>(
+    conn: &rusqlite::Connection,
+    table_prefix: &'static str,
+    shard_root: Address,
+) -> Result<Option<LocatedPrunableTree<H>>, Error> {
+    conn.query_row(
+        &format!(
+            "SELECT shard_data
+             FROM {table_prefix}_tree_shards
+             WHERE shard_index = :shard_index"
+        ),
+        named_params![":shard_index": shard_root.index()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()
+    .map_err(Error::Query)?
+    .map(|shard_data| {
+        let shard_tree = read_shard(&mut Cursor::new(shard_data)).map_err(Error::Serialization)?;
+        LocatedPrunableTree::from_parts(shard_root, shard_tree).map_err(|addr| {
+            Error::Serialization(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Tree contained invalid data at address {addr:?}"),
+            ))
+        })
     })
     .transpose()
 }
@@ -2211,5 +2721,471 @@ mod tests {
 
         assert_eq!(witnesses.len(), 1);
         assert_eq!(witnesses[0].root(note_leaf), expected_root);
+    }
+
+    /// Logical dump of the tree, note, and block tables. Blobs are hex. `account_id` is omitted
+    /// because account UUIDs are random and are not part of the tree.
+    fn dump_wallet_trees(conn: &rusqlite::Connection) -> String {
+        let mut tables = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table'
+                 AND (name LIKE '%tree_%' OR name LIKE '%received_note%' OR name = 'blocks')
+                 ORDER BY name",
+            )
+            .unwrap();
+        let names = tables
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut out = String::new();
+        for name in names {
+            let mut info = conn
+                .prepare(&format!("PRAGMA table_info(\"{name}\")"))
+                .unwrap();
+            let columns = info
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let projected = columns
+                .into_iter()
+                .filter(|(column, _)| column != "account_id")
+                .map(|(column, ty)| {
+                    let quoted = format!("\"{column}\"");
+                    let selected = if ty.to_ascii_uppercase().contains("BLOB") {
+                        format!("hex({quoted})")
+                    } else {
+                        quoted.clone()
+                    };
+                    (selected, quoted)
+                })
+                .collect::<Vec<_>>();
+            if projected.is_empty() {
+                continue;
+            }
+            let order = projected
+                .iter()
+                .take(3)
+                .map(|(_, quoted)| quoted.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {} FROM \"{name}\" ORDER BY {order}",
+                projected
+                    .iter()
+                    .map(|(selected, _)| selected.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            out.push_str(&name);
+            out.push('\n');
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let width = projected.len();
+                for index in 0..width {
+                    if index > 0 {
+                        out.push('\t');
+                    }
+                    match row.get_ref(index).unwrap() {
+                        rusqlite::types::ValueRef::Null => out.push_str("NULL"),
+                        rusqlite::types::ValueRef::Integer(value) => {
+                            out.push_str(&value.to_string())
+                        }
+                        rusqlite::types::ValueRef::Real(value) => out.push_str(&value.to_string()),
+                        rusqlite::types::ValueRef::Text(value) => {
+                            out.push_str(&String::from_utf8_lossy(value))
+                        }
+                        rusqlite::types::ValueRef::Blob(value) => out.push_str(&hex::encode(value)),
+                    }
+                }
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    fn assert_same_dump(immediate: &str, write_back: &str) {
+        if immediate == write_back {
+            return;
+        }
+        for (index, (left, right)) in immediate.lines().zip(write_back.lines()).enumerate() {
+            if left != right {
+                panic!(
+                    "wallet dump mismatch at line {index}:\n  immediate: {left}\n  write-back: {right}"
+                );
+            }
+        }
+        panic!(
+            "wallet dump length mismatch (immediate {} lines, write-back {} lines)",
+            immediate.lines().count(),
+            write_back.lines().count()
+        );
+    }
+
+    fn migrated_tree_file() -> (tempfile::NamedTempFile, rusqlite::Connection) {
+        let data_file = tempfile::NamedTempFile::new().unwrap();
+        let mut db_data = WalletDb::for_path(
+            data_file.path(),
+            Network::TestNetwork,
+            test_clock(),
+            test_rng(),
+        )
+        .unwrap();
+        WalletMigrator::new().init_or_migrate(&mut db_data).unwrap();
+        // Drop the migrating connection before the tests open their own.
+        drop(db_data);
+        let conn = rusqlite::Connection::open(data_file.path()).unwrap();
+        (data_file, conn)
+    }
+
+    fn drive_shard_phase1<S>(tree: &mut ShardTree<S, 6, 3>)
+    where
+        S: ShardStore<H = String, CheckpointId = BlockHeight>,
+    {
+        tree.insert_frontier(
+            incrementalmerkletree::frontier::Frontier::<String, 6>::empty(),
+            Retention::Checkpoint {
+                id: BlockHeight::from(0),
+                marking: Marking::None,
+            },
+        )
+        .unwrap();
+        for i in 1..=40u32 {
+            let marking = if i % 4 == 0 {
+                Marking::Marked
+            } else {
+                Marking::None
+            };
+            tree.append(
+                format!("leaf-{i}"),
+                Retention::Checkpoint {
+                    id: BlockHeight::from(i),
+                    marking,
+                },
+            )
+            .unwrap();
+            if i % 10 == 0 {
+                tree.ensure_retained(BlockHeight::from(i)).unwrap();
+            }
+        }
+    }
+
+    fn drive_shard_phase2<S>(tree: &mut ShardTree<S, 6, 3>)
+    where
+        S: ShardStore<H = String, CheckpointId = BlockHeight>,
+    {
+        assert!(
+            tree.remove_mark(Position::from(3), Some(&BlockHeight::from(40)))
+                .unwrap()
+        );
+        assert!(tree.truncate_to_checkpoint(&BlockHeight::from(20)).unwrap());
+        for i in 41..=50u32 {
+            tree.append(
+                format!("leaf-{i}"),
+                Retention::Checkpoint {
+                    id: BlockHeight::from(i),
+                    marking: Marking::None,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    /// The write-back cache and the immediate SQLite store leave the same shard, cap, checkpoint,
+    /// mark, and anchor-retention rows, including across a rewind and a second batch.
+    #[test]
+    fn write_back_matches_immediate_shard_store() {
+        let prefix = SaplingPoolTester::TABLES_PREFIX;
+        let (_immediate_file, immediate_conn) = migrated_tree_file();
+        let mut immediate = ShardTree::new(
+            SqliteShardStore::<_, String, 3>::from_connection(immediate_conn, prefix).unwrap(),
+            8,
+        );
+        let (_write_back_file, mut write_back_conn) = migrated_tree_file();
+
+        drive_shard_phase1(&mut immediate);
+        {
+            let tx = write_back_conn.transaction().unwrap();
+            let mut store = SqliteShardStore::<_, String, 3>::from_connection(&tx, prefix).unwrap();
+            store.enable_write_back().unwrap();
+            let mut tree = ShardTree::new(store, 8);
+            drive_shard_phase1(&mut tree);
+            tree.store_mut().flush_write_back().unwrap();
+            drop(tree);
+            tx.commit().unwrap();
+        }
+        assert_same_dump(
+            &dump_wallet_trees(&immediate.store().conn),
+            &dump_wallet_trees(&write_back_conn),
+        );
+
+        drive_shard_phase2(&mut immediate);
+        {
+            let tx = write_back_conn.transaction().unwrap();
+            let mut store = SqliteShardStore::<_, String, 3>::from_connection(&tx, prefix).unwrap();
+            store.enable_write_back().unwrap();
+            let mut tree = ShardTree::new(store, 8);
+            drive_shard_phase2(&mut tree);
+            tree.store_mut().flush_write_back().unwrap();
+            drop(tree);
+            tx.commit().unwrap();
+        }
+        assert_same_dump(
+            &dump_wallet_trees(&immediate.store().conn),
+            &dump_wallet_trees(&write_back_conn),
+        );
+    }
+
+    /// Dropping a write-back batch without committing leaves the on-disk tree untouched.
+    #[test]
+    fn write_back_rollback_leaves_shard_store_unchanged() {
+        let prefix = SaplingPoolTester::TABLES_PREFIX;
+        let (file, mut conn) = migrated_tree_file();
+        {
+            let tx = conn.transaction().unwrap();
+            let mut store = SqliteShardStore::<_, String, 3>::from_connection(&tx, prefix).unwrap();
+            store.enable_write_back().unwrap();
+            let mut tree = ShardTree::new(store, 8);
+            drive_shard_phase1(&mut tree);
+            tree.store_mut().flush_write_back().unwrap();
+            drop(tree);
+            tx.commit().unwrap();
+        }
+        let committed = dump_wallet_trees(&conn);
+        drop(conn);
+
+        {
+            let mut conn = rusqlite::Connection::open(file.path()).unwrap();
+            let tx = conn.transaction().unwrap();
+            let mut store = SqliteShardStore::<_, String, 3>::from_connection(&tx, prefix).unwrap();
+            store.enable_write_back().unwrap();
+            let mut tree: ShardTree<_, 6, 3> = ShardTree::new(store, 8);
+            // Mutate the cache, then abandon the transaction before flush or commit.
+            tree.append(
+                "cancelled".to_string(),
+                Retention::Checkpoint {
+                    id: BlockHeight::from(100),
+                    marking: Marking::None,
+                },
+            )
+            .unwrap();
+            drop(tree);
+            drop(tx);
+        }
+
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        assert_same_dump(&committed, &dump_wallet_trees(&conn));
+    }
+
+    /// A tree callback that fails after mutating the cache does not commit those mutations.
+    #[test]
+    fn write_back_callback_error_rolls_back() {
+        use crate::testing::{BlockCache, db::TestDbFactory};
+        use zcash_client_backend::data_api::{WalletCommitmentTrees, testing::TestBuilder};
+        use zcash_primitives::block::BlockHash;
+
+        let mut st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_block_cache(BlockCache::new())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+        let before = dump_wallet_trees(st.wallet().conn());
+
+        #[derive(Debug)]
+        struct Cancelled;
+        impl From<ShardTreeError<super::Error>> for Cancelled {
+            fn from(err: ShardTreeError<super::Error>) -> Self {
+                panic!("tree update failed before the intentional cancel: {err:?}");
+            }
+        }
+
+        let result: Result<(), Cancelled> = st.wallet_mut().with_sapling_tree_mut(|tree| {
+            tree.ensure_retained(BlockHeight::from(1_000_000))?;
+            Err(Cancelled)
+        });
+        assert!(result.is_err());
+        assert_same_dump(&before, &dump_wallet_trees(st.wallet().conn()));
+    }
+
+    /// Scanning, spending, rewinding, and rescanning on the write-back cache produces the same
+    /// commitment trees, notes, witnesses, and checkpoints as the immediate store.
+    #[test]
+    fn write_back_matches_immediate_wallet_scan() {
+        use crate::testing::{BlockCache, db::TestDb, db::TestDbFactory};
+        use zcash_client_backend::data_api::{
+            WalletWrite,
+            testing::{
+                AddressType, TestBuilder, TestState, pool::ShieldedPoolTester,
+                sapling::SaplingPoolTester,
+            },
+        };
+        use zcash_primitives::block::BlockHash;
+        use zcash_protocol::{local_consensus::LocalNetwork, value::Zatoshis};
+
+        fn fresh(write_back: bool) -> TestState<BlockCache, TestDb, LocalNetwork> {
+            let mut st = TestBuilder::new()
+                .with_data_store_factory(TestDbFactory::default())
+                .with_block_cache(BlockCache::new())
+                .with_account_from_sapling_activation(BlockHash([0; 32]))
+                .build();
+            st.wallet_mut()
+                .db_mut()
+                .set_commitment_tree_write_back(write_back);
+            st
+        }
+
+        fn scan_from(
+            st: &mut TestState<BlockCache, TestDb, LocalNetwork>,
+            start: BlockHeight,
+            count: u32,
+        ) {
+            let mut scanned = 0u32;
+            while scanned < count {
+                let chunk = (count - scanned).min(30);
+                let height = BlockHeight::from(u32::from(start) + scanned);
+                st.scan_cached_blocks(height, usize::try_from(chunk).unwrap());
+                scanned += chunk;
+            }
+        }
+
+        fn drive(st: &mut TestState<BlockCache, TestDb, LocalNetwork>) {
+            let dfvk = SaplingPoolTester::test_account_fvk(st);
+            let value = Zatoshis::const_from_u64(10_000);
+            let mut first = None;
+            let mut last_nf = None;
+            // More blocks than `PRUNING_DEPTH` (100), so checkpoint pruning runs.
+            for _ in 0..105 {
+                let (height, _, nf) =
+                    st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
+                first.get_or_insert(height);
+                last_nf = Some(nf);
+            }
+            let start = first.expect("generated a block");
+            scan_from(st, start, 105);
+
+            let recipient = SaplingPoolTester::fvk_default_address(&SaplingPoolTester::sk_to_fvk(
+                &SaplingPoolTester::sk(&[0xf5; 32]),
+            ));
+            let (spend_height, _) = st.generate_next_block_spending(
+                &dfvk,
+                (last_nf.expect("received a note"), value),
+                recipient,
+                Zatoshis::const_from_u64(4_000),
+            );
+            st.scan_cached_blocks(spend_height, 1);
+
+            let rewind = BlockHeight::from(u32::from(spend_height) - 5);
+            st.wallet_mut().truncate_to_height(rewind).unwrap();
+            let rescan = u32::from(spend_height) - u32::from(rewind);
+            scan_from(st, BlockHeight::from(u32::from(rewind) + 1), rescan);
+
+            for _ in 0..3 {
+                let (height, _, _) =
+                    st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
+                st.scan_cached_blocks(height, 1);
+            }
+        }
+
+        let mut immediate = fresh(false);
+        let mut cached = fresh(true);
+        drive(&mut immediate);
+        drive(&mut cached);
+        assert_same_dump(
+            &dump_wallet_trees(immediate.wallet().conn()),
+            &dump_wallet_trees(cached.wallet().conn()),
+        );
+    }
+
+    /// One `insert_tree` per shard must persist the same rows as one `insert_tree` per leaf.
+    ///
+    /// `put_blocks` builds note-commitment subtrees in parallel and inserts each one. Pruning
+    /// runs at the end of every insert, so a small chunk rewrites the frontier shard once per
+    /// chunk. A chunk the size of a shard does that once. The flushed rows have to match.
+    #[test]
+    fn shard_sized_chunks_match_per_leaf_insert() {
+        use incrementalmerkletree::frontier::Frontier;
+        use zcash_client_backend::data_api::ll::wallet::{build_subtrees, update_tree};
+
+        fn apply(chunk: usize) -> String {
+            let (_file, conn) = migrated_tree_file();
+            let store = SqliteShardStore::<_, String, 3>::from_connection(
+                conn,
+                SaplingPoolTester::TABLES_PREFIX,
+            )
+            .unwrap();
+            let mut tree = ShardTree::<_, 6, 3>::new(store, 4);
+            let mut leaves = (1..=40u32)
+                .map(|i| {
+                    Some((
+                        format!("leaf-{i}"),
+                        Retention::Checkpoint {
+                            id: BlockHeight::from(i),
+                            marking: if i % 4 == 0 {
+                                Marking::Marked
+                            } else {
+                                Marking::None
+                            },
+                        },
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let subtrees = build_subtrees::<String, 3>(Position::from(0), &mut leaves, chunk);
+            update_tree(
+                "chunk",
+                &Frontier::<String, 6>::empty(),
+                BlockHeight::from(0),
+                &mut tree,
+                None,
+                subtrees.into_iter(),
+                #[cfg(feature = "orchard")]
+                std::iter::empty(),
+            )
+            .unwrap();
+            dump_wallet_trees(&tree.store().conn)
+        }
+
+        let per_leaf = apply(1);
+        assert_same_dump(&per_leaf, &apply(2));
+        assert_same_dump(&per_leaf, &apply(8));
+        assert_same_dump(&per_leaf, &apply(64));
+
+        let (_file, conn) = migrated_tree_file();
+        let store = SqliteShardStore::<_, String, 3>::from_connection(
+            conn,
+            SaplingPoolTester::TABLES_PREFIX,
+        )
+        .unwrap();
+        let mut tree = ShardTree::<_, 6, 3>::new(store, 4);
+        let leaves = (1..=40u32)
+            .map(|i| {
+                (
+                    format!("leaf-{i}"),
+                    Retention::Checkpoint {
+                        id: BlockHeight::from(i),
+                        marking: if i % 4 == 0 {
+                            Marking::Marked
+                        } else {
+                            Marking::None
+                        },
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        tree.insert_frontier(
+            Frontier::<String, 6>::empty(),
+            Retention::Checkpoint {
+                id: BlockHeight::from(0),
+                marking: Marking::Reference,
+            },
+        )
+        .unwrap();
+        tree.batch_insert(Position::from(0), leaves.into_iter())
+            .unwrap();
+        assert_same_dump(&per_leaf, &dump_wallet_trees(&tree.store().conn));
     }
 }
