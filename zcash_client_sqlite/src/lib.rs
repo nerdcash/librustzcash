@@ -2799,6 +2799,10 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
         prior: &CompactChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
+        let mined_link = blocks
+            .last()
+            .map(|block| (prior.block_height() + 1, block.height() + 1));
+
         ll::wallet::put_blocks_without_commitment_trees::<
             _,
             SqliteClientError,
@@ -2810,7 +2814,12 @@ impl<P: consensus::Parameters, CL: Clock, R: Rng> WalletWrite
             prior,
             blocks,
         )
-        .map_err(SqliteClientError::from)
+        .map_err(SqliteClientError::from)?;
+
+        if let Some((start, end)) = mined_link {
+            wallet::link_mined_transactions(self.conn.0, start, end)?;
+        }
+        Ok(())
     }
 
     fn put_received_transparent_utxo(

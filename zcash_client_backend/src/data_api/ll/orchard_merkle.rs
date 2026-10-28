@@ -93,7 +93,10 @@ fn hash_to_point(
     message[K + MERKLE_BITS..].copy_from_slice(&field_bits(&right.to_bytes()));
 
     let mut acc = CtOption::new(q, 1.into());
-    for chunk in message.chunks_exact(K) {
+    // `MESSAGE_BITS` is a multiple of `K`, so Sinsemilla's padding step adds no bits.
+    let (chunks, remainder) = message.as_chunks::<K>();
+    debug_assert!(remainder.is_empty());
+    for chunk in chunks {
         let mut index = 0usize;
         for (bit, flag) in chunk.iter().enumerate() {
             if *flag {

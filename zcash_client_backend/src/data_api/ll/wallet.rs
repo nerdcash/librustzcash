@@ -1793,10 +1793,12 @@ struct CombineLog {
 
 #[cfg(feature = "orchard")]
 thread_local! {
-    static ORCHARD_COMBINES: std::cell::RefCell<CombineLog> = std::cell::RefCell::new(CombineLog {
-        next_id: 0,
-        combines: Vec::new(),
-    });
+    static ORCHARD_COMBINES: std::cell::RefCell<CombineLog> = const {
+        std::cell::RefCell::new(CombineLog {
+            next_id: 0,
+            combines: Vec::new(),
+        })
+    };
 }
 
 #[cfg(feature = "orchard")]
