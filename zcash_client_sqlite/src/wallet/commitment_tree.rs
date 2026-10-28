@@ -635,15 +635,10 @@ impl<'conn, 'a: 'conn, H: HashSer + Clone, const SHARD_HEIGHT: u8> ShardStore
     where
         F: FnMut(&Self::CheckpointId, &Checkpoint) -> Result<(), Self::Error>,
     {
-        if self.write_back.is_some() {
+        if let Some(cache) = &self.write_back {
             // Snapshot first. Pruning calls back into the store, and the callback must not run
             // while the cache `RefCell` is borrowed.
-            let pairs = self
-                .write_back
-                .as_ref()
-                .expect("write-back is enabled")
-                .borrow()
-                .checkpoints_in_position_order(limit);
+            let pairs = cache.borrow().checkpoints_in_position_order(limit);
             for (id, checkpoint) in &pairs {
                 callback(id, checkpoint)?;
             }
@@ -674,26 +669,19 @@ impl<'conn, 'a: 'conn, H: HashSer + Clone, const SHARD_HEIGHT: u8> ShardStore
     where
         F: Fn(&mut Checkpoint) -> Result<(), Self::Error>,
     {
-        if self.write_back.is_some() {
+        if let Some(cache) = &self.write_back {
             // Apply `update` to a copy before publishing it, matching the SQL helper. The copy is
             // updated outside the `RefCell` borrow so a callback that re-enters the store cannot
             // deadlock on it.
             let mut checkpoint = {
-                let cache = self
-                    .write_back
-                    .as_ref()
-                    .expect("write-back is enabled")
-                    .borrow();
-                let Some(checkpoint) = cache.checkpoints.get(checkpoint_id).cloned() else {
+                let borrowed = cache.borrow();
+                let Some(checkpoint) = borrowed.checkpoints.get(checkpoint_id).cloned() else {
                     return Ok(false);
                 };
                 checkpoint
             };
             update(&mut checkpoint)?;
-            return self
-                .write_back
-                .as_ref()
-                .expect("write-back is enabled")
+            return cache
                 .borrow_mut()
                 .update_checkpoint_with(*checkpoint_id, |slot| {
                     *slot = checkpoint;

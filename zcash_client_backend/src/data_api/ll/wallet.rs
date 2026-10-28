@@ -2321,7 +2321,7 @@ mod tests {
                 format!("n{i}"),
                 Retention::Checkpoint {
                     id: BlockHeight::from(i),
-                    marking: if i % 7 == 0 {
+                    marking: if i.is_multiple_of(7) {
                         Marking::Marked
                     } else {
                         Marking::None
