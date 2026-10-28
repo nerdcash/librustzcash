@@ -11,9 +11,8 @@ workspace.
 ## [Unreleased]
 
 ### Added
-- `scanning::trial_decrypt_compact_block` and
-  `scanning::trial_decrypt_compact_block_with_options`, the trial-decryption
-  phase of a compact-block scan.
+- `scanning::trial_decrypt_compact_block`, the trial-decryption phase of a
+  compact-block scan.
 - `CompactChainState` and `ScanContinuity`. `scan_cached_blocks` accepts either
   a `ChainState` or the prior block's height, hash, and end-of-block note
   commitment tree sizes.
