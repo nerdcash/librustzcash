@@ -184,14 +184,18 @@ fn time_decrypt(keys: &ScanningKeys<u32, (u32, zip32::Scope)>, blocks: &[Compact
 }
 
 fn time_scan(keys: &ScanningKeys<u32, (u32, zip32::Scope)>, blocks: &[CompactBlock]) -> u128 {
+    // `scan_block` takes ownership. Copy the protobufs before the timer so
+    // `scan_ns` is the scan itself, not the fixture clone. Trial decryption
+    // borrows the same blocks.
+    let owned: Vec<CompactBlock> = blocks.to_vec();
     let spends = SpendIdentifiers::empty();
     let start = Instant::now();
     let mut txs = 0usize;
-    for block in blocks {
+    for block in owned {
         let height = block.height;
         let scanned = scan_block::<_, _, _, std::convert::Infallible>(
             &MAIN_NETWORK,
-            block.clone(),
+            block,
             keys,
             &spends,
             None,

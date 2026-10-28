@@ -47,12 +47,13 @@ because this scanner does not use rayon.
 
 | Change | Cores | Range | notes/sec | decrypt share of scan |
 | --- | --- | --- | --- | --- |
-| baseline | 1 | spam | 7677.7 | 99.5% |
-| baseline | 2 | spam | 7609.2 | 100.1% |
-| baseline | 4 | spam | 7679.8 | 99.8% |
-| baseline | 1 | combined | 7578.9 | 100.5% |
-| baseline | 2 | combined | 7671.6 | 99.9% |
-| baseline | 4 | combined | 7657.1 | 99.8% |
+| baseline | 1 | spam | 7321.4 | 101.4% |
+| baseline | 2 | spam | 7519.1 | 99.5% |
+| baseline | 4 | spam | 7646.2 | 99.9% |
+| baseline | 1 | combined | 7503.0 | 98.5% |
+| baseline | 2 | combined | 7469.1 | 99.7% |
+| baseline | 4 | combined | 7639.1 | 99.7% |
 
-Ordinary blocks alone (206 notes) ran at about 8,900–9,100 notes/sec with the
+The fixture copy that `scan_block` requires happens before the scan timer.
+Ordinary blocks alone (206 notes) ran at about 8,600–9,100 notes/sec with the
 same ~100% share. Later commits should append rows to this table.
