@@ -74,6 +74,12 @@ corez.workspace = true
 workspace = true
 features = ["pre-zip-212"]
 
+# This crate always depends on `orchard`, which uses `pasta_curves`. Request the
+# aarch64 assembly backend here so every build that includes this crate gets it.
+# The feature stays off on x86-64; that backend has no portable fallback.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+pasta_curves = { workspace = true, features = ["asm"] }
+
 [dev-dependencies]
 bls12_381.workspace = true
 criterion.workspace = true

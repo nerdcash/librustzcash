@@ -142,6 +142,12 @@ webpki-roots = { workspace = true, optional = true }
 # - Boilerplate
 getset.workspace = true
 
+# `pasta_curves` 0.6.1 assembly has no runtime CPU probe. Enable it only on
+# aarch64, where the instructions are baseline. x86-64 stays on the portable
+# backend so binaries do not fault on CPUs without BMI2 and ADX.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+pasta_curves = { workspace = true, optional = true, features = ["asm"] }
+
 [build-dependencies]
 tonic-prost-build.workspace = true
 which.workspace = true

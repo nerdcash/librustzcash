@@ -74,7 +74,12 @@ sapling = { package = "sapling-crypto", version = "0.9", default-features = fals
 
 # - Orchard
 orchard = { version = "0.16", default-features = false }
-pasta_curves = "0.6"
+# 0.6.1's `asm` feature is enabled only for aarch64, by the crates that depend
+# on this package. That backend has no CPU fallback: on non-Apple x86-64 it
+# uses BMI2 and ADX and will fault on older CPUs, so it stays off unless a
+# crate opts in. aarch64 compiles the baseline instructions. wasm32 and other
+# targets keep the portable field arithmetic.
+pasta_curves = "0.6.1"
 
 # - Transparent
 bip32 = { version = "0.6", default-features = false, features = ["alloc"] }
