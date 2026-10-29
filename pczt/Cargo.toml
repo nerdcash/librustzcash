@@ -57,6 +57,10 @@ getset.workspace = true
 # - Documentation
 document-features = { workspace = true, optional = true }
 
+# Assembly field arithmetic is aarch64-only. See the workspace `pasta_curves` note.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+pasta_curves = { workspace = true, optional = true, features = ["asm"] }
+
 [dev-dependencies]
 hex.workspace = true
 incrementalmerkletree.workspace = true
