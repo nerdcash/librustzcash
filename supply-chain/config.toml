@@ -49,7 +49,7 @@ audit-as-crates-io = true
 [policy.zcash_client_sqlite]
 audit-as-crates-io = true
 
-[policy.zcash_encoding]
+[policy."zcash_encoding:0.5.1"]
 audit-as-crates-io = true
 
 [policy.zcash_history]
@@ -1602,10 +1602,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.walkdir]]
 version = "2.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.want]]
-version = "0.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.wasi]]

@@ -7605,9 +7605,10 @@ dependencies = [
 
 [[package]]
 name = "zcash_encoding"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "corez",
+ "criterion",
  "hex",
  "nonempty",
  "proptest",
@@ -7716,7 +7717,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_primitives"
-version = "0.31.0"
+version = "0.31.1"
 dependencies = [
  "assert_matches",
  "blake2b_simd",
