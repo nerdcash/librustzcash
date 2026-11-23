@@ -1,6 +1,10 @@
 
 # cargo-vet imports lock
 
+[[unpublished.equihash]]
+version = "0.3.1"
+audited_as = "0.3.0"
+
 [[unpublished.zcash_encoding]]
 version = "0.5.1"
 audited_as = "0.5.0"
